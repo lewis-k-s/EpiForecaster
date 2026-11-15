@@ -89,6 +89,17 @@ _RELEVANT_SOURCE_OUTPUT_KEYS = {
     "infection_flow": "infection_flow",
     "D": "D_trajectory",
 }
+# Stored true value of a relevant source; the admission and infection flows have
+# no stored truth.
+_RELEVANT_SOURCE_TARGET_KEYS = {
+    "H": "H_target",
+    "I": "I_target",
+    "death_flow": "death_flow_target",
+    "D": "D_target",
+}
+# Heads observed as weekly totals dated on the week start, by the daily latent
+# flow that the total accumulates.
+_WEEK_TOTAL_FLOW_SOURCES = {"hosp": "hospitalization_flow"}
 _ALLOWED_RELEVANT_SOURCES = {
     "hosp": {"hospitalization_flow", "H"},
     "ww": {"I", "infection_flow"},
@@ -133,15 +144,19 @@ def _update_latent_information(
     accumulator: TorchLatentInformationAccumulator | None,
     *,
     head: str,
+    source: str,
     latent: torch.Tensor | None,
     observed: torch.Tensor,
     prediction: torch.Tensor,
     residual: torch.Tensor | None,
     weights: torch.Tensor,
     nodes: torch.Tensor,
+    targets: dict[str, torch.Tensor | None],
 ) -> None:
     if accumulator is None or latent is None or residual is None:
         return
+    target_key = _RELEVANT_SOURCE_TARGET_KEYS.get(source)
+    true_latent = None if target_key is None else targets.get(target_key)
     accumulator.update(
         head=head,
         latent=latent,
@@ -150,6 +165,11 @@ def _update_latent_information(
         residual=residual,
         weights=weights,
         nodes=nodes,
+        true_latent=(
+            None
+            if true_latent is None
+            else drop_nowcast(true_latent, int(observed.shape[1]))
+        ),
     )
 
 
@@ -556,7 +576,15 @@ def evaluate_loader(
         for protocol in ("oracle_x0", "teacher_forced_one_step")
     }
     latent_information_metrics = (
-        TorchLatentInformationAccumulator() if latent_information else None
+        TorchLatentInformationAccumulator(
+            week_total_heads=[
+                head
+                for head, source in _WEEK_TOTAL_FLOW_SOURCES.items()
+                if resolved_relevant_sources[head] == source
+            ]
+        )
+        if latent_information
+        else None
     )
     loss_ww_sum = torch.tensor(0.0, device=device)
     loss_hosp_sum = torch.tensor(0.0, device=device)
@@ -828,6 +856,8 @@ def evaluate_loader(
                     _update_latent_information(
                         latent_information_metrics,
                         head="hosp",
+                        source=hosp_relevant_source_name,
+                        targets=targets_dict,
                         latent=hosp_relevant_source,
                         observed=hosp_targets,
                         prediction=pred_hosp,
@@ -948,6 +978,8 @@ def evaluate_loader(
                     _update_latent_information(
                         latent_information_metrics,
                         head="ww",
+                        source=ww_relevant_source_name,
+                        targets=targets_dict,
                         latent=ww_relevant_source,
                         observed=ww_targets,
                         prediction=pred_ww,
@@ -1068,6 +1100,8 @@ def evaluate_loader(
                     _update_latent_information(
                         latent_information_metrics,
                         head="cases",
+                        source=cases_relevant_source_name,
+                        targets=targets_dict,
                         latent=cases_relevant_source,
                         observed=cases_targets,
                         prediction=pred_cases,
@@ -1188,6 +1222,8 @@ def evaluate_loader(
                     _update_latent_information(
                         latent_information_metrics,
                         head="deaths",
+                        source=deaths_relevant_source_name,
+                        targets=targets_dict,
                         latent=deaths_relevant_source,
                         observed=deaths_targets,
                         prediction=pred_deaths,

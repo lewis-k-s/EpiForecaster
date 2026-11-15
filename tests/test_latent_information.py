@@ -37,8 +37,10 @@ def _accumulate(
     residual: torch.Tensor,
     weights: torch.Tensor,
     batches: int = 3,
+    week_total_heads: tuple[str, ...] = (),
+    true_log: torch.Tensor | None = None,
 ) -> dict[str, float | int]:
-    accumulator = TorchLatentInformationAccumulator()
+    accumulator = TorchLatentInformationAccumulator(week_total_heads=week_total_heads)
     nodes = torch.arange(WINDOWS) % NODES
     for rows in torch.arange(WINDOWS).chunk(batches):
         accumulator.update(
@@ -49,6 +51,9 @@ def _accumulate(
             residual=residual[rows],
             weights=weights[rows],
             nodes=nodes[rows],
+            true_latent=(
+                None if true_log is None else _latent_fraction(true_log[rows])
+            ),
         )
     return accumulator.finalize()
 
@@ -233,6 +238,129 @@ def test_heads_without_updates_report_zero_windows_only() -> None:
         "latent_info_cases_window_count": 0,
         "latent_info_deaths_window_count": 0,
     }
+
+
+@pytest.mark.parametrize(("first_day", "kept_per_window"), [(0, 4), (3, 3)])
+def test_week_total_matches_weekly_totals_dated_on_week_start(
+    first_day: int, kept_per_window: int
+) -> None:
+    generator = torch.Generator().manual_seed(7)
+    # Independent daily admissions: one day says little about its week's total.
+    daily = 6.0 + torch.randn(
+        WINDOWS, HORIZON, generator=generator, dtype=torch.float64
+    )
+    weekly_total = _latent_fraction(daily).unfold(1, 7, 1).sum(dim=2)
+    observed = torch.zeros(WINDOWS, HORIZON, dtype=torch.float64)
+    observed[:, : HORIZON - 6] = torch.log1p(weekly_total * 1e5)
+    weights = torch.zeros(WINDOWS, HORIZON)
+    weights[:, first_day::7] = 1.0
+
+    metrics = _accumulate(
+        head="hosp",
+        latent_log=daily,
+        observed=observed,
+        prediction=observed.clone(),
+        residual=torch.zeros(WINDOWS, HORIZON, dtype=torch.float64),
+        weights=weights,
+        week_total_heads=("hosp",),
+    )
+
+    # A week that starts after day H - 7 leaves the horizon and is dropped.
+    assert metrics["latent_info_hosp_observation_count"] == WINDOWS * 4
+    assert (
+        metrics["latent_info_hosp_week_total_observation_count"]
+        == WINDOWS * kept_per_window
+    )
+    assert metrics["latent_info_hosp_r2_lat_obs_week_total"] == pytest.approx(1.0)
+    assert metrics["latent_info_hosp_r2_lat_pred_week_total"] == pytest.approx(1.0)
+    assert metrics["latent_info_hosp_r2_lat_obs"] < 0.5
+    assert (
+        metrics["latent_info_hosp_r2_lat_obs_week_total"]
+        > 10 * metrics["latent_info_hosp_r2_lat_obs_week_total_null95"]
+    )
+    assert metrics["latent_info_hosp_week_total_resample_window_count"] == WINDOWS
+
+
+def test_week_total_metrics_need_a_declared_head() -> None:
+    series = torch.ones(WINDOWS, HORIZON, dtype=torch.float64)
+    metrics = _accumulate(
+        head="hosp",
+        latent_log=series,
+        observed=series,
+        prediction=series,
+        residual=series,
+        weights=torch.ones(WINDOWS, HORIZON),
+    )
+
+    assert not any("week_total" in key for key in metrics)
+    with pytest.raises(ValueError, match="Unknown latent-information heads"):
+        TorchLatentInformationAccumulator(week_total_heads=("icu",))
+
+
+def test_true_latent_gives_ceiling_and_latent_recovery() -> None:
+    generator = torch.Generator().manual_seed(8)
+    truth = _random_walks(generator)
+    noise = torch.randn(WINDOWS, HORIZON, generator=generator, dtype=torch.float64)
+    observed = 2.0 + truth + 0.2 * noise
+    # The model latent recovers the truth only in part.
+    inferred = truth + _random_walks(generator) - 10.0
+
+    metrics = _accumulate(
+        head="cases",
+        latent_log=inferred,
+        observed=observed,
+        prediction=observed.clone(),
+        residual=torch.zeros(WINDOWS, HORIZON, dtype=torch.float64),
+        weights=torch.ones(WINDOWS, HORIZON),
+        true_log=truth,
+    )
+
+    ceiling = metrics["latent_info_cases_r2_true_obs"]
+    assert metrics["latent_info_cases_true_window_count"] == WINDOWS
+    assert metrics["latent_info_cases_true_observation_count"] == WINDOWS * HORIZON
+    assert ceiling > 0.8
+    assert metrics["latent_info_cases_r2_lat_obs"] < ceiling
+    assert 0.2 < metrics["latent_info_cases_r2_lat_true"] < 0.8
+    assert ceiling > 10 * metrics["latent_info_cases_r2_true_obs_null95"]
+    assert (
+        metrics["latent_info_cases_mi_true_obs"]
+        > metrics["latent_info_cases_mi_lat_obs"]
+    )
+    assert metrics["latent_info_cases_r2_true_obs_weekly"] > 0.8
+    assert metrics["latent_info_cases_best_lag_true_obs"] == 0.0
+    assert metrics["latent_info_cases_lag_r2_true_obs_p0"] == pytest.approx(ceiling)
+    assert (
+        metrics["latent_info_cases_r2_true_obs_q05"]
+        <= ceiling
+        <= metrics["latent_info_cases_r2_true_obs_q95"]
+    )
+    lo = metrics["latent_info_cases_r2_lat_true_q05"]
+    hi = metrics["latent_info_cases_r2_lat_true_q95"]
+    assert lo <= metrics["latent_info_cases_r2_lat_true"] <= hi
+
+
+def test_true_latent_is_optional_but_all_or_none_per_head() -> None:
+    series = torch.ones(2, HORIZON, dtype=torch.float64)
+    nodes = torch.zeros(2, dtype=torch.long)
+    accumulator = TorchLatentInformationAccumulator()
+    batch = {
+        "head": "deaths",
+        "latent": series,
+        "observed": series,
+        "prediction": series,
+        "residual": series,
+        "weights": series,
+        "nodes": nodes,
+    }
+    accumulator.update(**batch)
+
+    assert not any("true" in key for key in accumulator.finalize())
+    with pytest.raises(ValueError, match="every batch or on none"):
+        accumulator.update(**batch, true_latent=series)
+    with pytest.raises(ValueError, match="one \\[B, H\\] shape"):
+        TorchLatentInformationAccumulator().update(
+            **batch, true_latent=torch.ones(2, HORIZON + 1)
+        )
 
 
 def test_update_rejects_mismatched_shapes_and_unknown_heads() -> None:

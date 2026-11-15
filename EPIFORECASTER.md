@@ -242,12 +242,21 @@ is the head's `relevant_source` compared as $\log(1 + 10^5 x)$.
 |`resid_share`|Within-window variance of the residual contribution over that of the forecast|
 |`r2_lat_obs_weekly`, `resid_share_weekly`|Cases and deaths: the same on 7-day block means, which removes the day-of-week reporting cycle|
 |`lag_r2_lat_obs_<m\|p><d>`, `best_lag_lat_obs`, `best_lag_r2_lat_obs`|Lag scan; `p` means the latent leads (±14 d daily heads, ±21 d in 7-day steps weekly heads)|
+|`<metric>_week_total`|Hospitalizations with `relevant_source_hosp: hospitalization_flow`: the four latent-observation metrics and `r2_lat_pred` with the latent summed over days $h..h+6$, the days a weekly total dated on its week start covers. Weeks leaving the horizon are dropped (`week_total_window_count`, `week_total_observation_count`)|
+|`r2_true_obs`, `mi_true_obs`, `te_true_obs`, `sign_true_obs`, `r2_true_obs_weekly`, `lag_r2_true_obs_<m\|p><d>`, `best_lag_true_obs`, `best_lag_r2_true_obs`|Synthetic corpora: the latent-observation metrics with the stored true latent in place of the inferred one, the ceiling of an exactly recovered latent (`true_window_count`, `true_observation_count`)|
+|`r2_lat_true`|Synthetic corpora: within-window squared correlation of the inferred and the true latent|
 |`<metric>_null95`|95th percentile over 200 permutations pairing each window's observations with another window's latent (latent-observation metrics)|
 |`<metric>_q05`, `<metric>_q95`|Region-bootstrap interval, 200 resamples; region sampling only|
 
 Permutations and bootstraps use at most 20,000 seeded windows
 (`resample_window_count`). Overlapping windows make the effective sample smaller
 than `observation_count`.
+
+True latents exist for the sources `I`, `H`, `D` and `death_flow`. The corpus
+stores no true admission or infection flow, so the default hospitalization
+source has no ceiling; evaluating with
+`model.observation_heads.relevant_source_hosp=H` gives the ceiling of the
+hospital census instead.
 
 ## 4. Model Variants
 

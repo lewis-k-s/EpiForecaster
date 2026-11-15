@@ -1,0 +1,27 @@
+run: {}
+source: {}
+container: {}
+workflow:
+  kind: evaluate
+  target: evaluate
+dvc:
+  targets:
+  - data/files/mobility.zarr.zip.dvc
+  - data/processed/real_with_id.zarr.zip.dvc
+  - outputs/region_embeddings/region_embeddings.pt.dvc
+evaluation:
+  checkpoint: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/tdev-ft-budget025-s43-20261109/outputs/training/transfer-dev-ft-budget025/model/checkpoints/best_model.pt
+  split: test
+  granular: true
+  overrides:
+  - training.val_workers=2
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 60

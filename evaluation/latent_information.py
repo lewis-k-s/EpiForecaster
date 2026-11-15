@@ -41,6 +41,23 @@ Metrics, per head ``<head>`` in hosp, ww, cases, deaths (prefix
 * ``<metric>_q05`` / ``<metric>_q95``: 5th and 95th percentiles over
   ``RESAMPLE_COUNT`` bootstrap resamples of whole regions. They cover region
   sampling only, not training randomness.
+* ``<metric>_week_total`` (heads in ``week_total_heads``, the four
+  latent-observation metrics and ``r2_lat_pred``): the latent is its forward
+  7-day total, days ``h .. h + 6``. A weekly total dated on its week start
+  covers those days, so this compares like with like. Days whose week leaves
+  the horizon are dropped; ``week_total_window_count`` and
+  ``week_total_observation_count`` give the remaining support.
+* ``r2_true_obs``, ``mi_true_obs``, ``te_true_obs``, ``sign_true_obs``,
+  ``r2_true_obs_weekly``, ``lag_r2_true_obs_<lag>``, ``best_lag_true_obs`` and
+  ``best_lag_r2_true_obs`` (only when ``update`` receives ``true_latent``):
+  the latent-observation metrics with the true latent in place of the
+  inferred one. They are the ceiling an exactly recovered latent would reach
+  on this corpus. ``r2_lat_true`` is the within-window squared correlation of
+  the inferred and the true latent. ``true_window_count`` and
+  ``true_observation_count`` give their support.
+* Variant metrics carry the same ``_null95``, ``_q05`` and ``_q95`` suffixes;
+  ``week_total_resample_window_count`` and ``true_resample_window_count``
+  count their resampled windows.
 * ``window_count``, ``node_count``, ``observation_count`` and
   ``resample_window_count`` (windows entering permutations and bootstraps; a
   seeded subsample of at most ``MAX_RESAMPLE_WINDOWS``).
@@ -52,6 +69,7 @@ smaller than the observation count.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Collection
 
 import torch
 import torch.nn.functional as F
@@ -63,8 +81,16 @@ MAX_LAG_DAYS = {"hosp": 21, "ww": 21, "cases": 14, "deaths": 14}
 RESAMPLE_COUNT = 200
 MAX_RESAMPLE_WINDOWS = 20_000
 RESAMPLE_SEED = 0
-_NULL_METRICS = ("r2_lat_obs", "mi_lat_obs", "te_lat_obs", "sign_lat_obs")
 _FIELDS = ("latent", "observed", "prediction", "residual", "weights")
+_SERIES_TENSORS = (
+    "latent_raw",
+    "valid",
+    "latent",
+    "observed",
+    "prediction",
+    "residual",
+    "inferred",
+)
 _NAN = float("nan")
 
 
@@ -190,6 +216,19 @@ def _lag_label(lag: int) -> str:
     return f"p{lag}" if lag >= 0 else f"m{-lag}"
 
 
+def _log_per_100k(fraction: torch.Tensor) -> torch.Tensor:
+    return torch.log1p(fraction.clamp_min(0.0) * 1e5)
+
+
+def _forward_week_total(values: torch.Tensor) -> torch.Tensor:
+    """Sum over days ``h .. h + 6``; NaN where the week leaves the horizon."""
+    horizon = values.shape[1]
+    total = torch.full_like(values, _NAN)
+    if horizon >= 7:
+        total[:, : horizon - 6] = values.unfold(1, 7, 1).sum(dim=2)
+    return total
+
+
 class _HeadSeries:
     """Centred within-window series of one head."""
 
@@ -202,6 +241,7 @@ class _HeadSeries:
         residual: torch.Tensor,
         valid: torch.Tensor,
         step: int,
+        inferred: torch.Tensor | None = None,
     ) -> None:
         self.latent_raw = latent
         self.valid = valid
@@ -210,6 +250,8 @@ class _HeadSeries:
         self.observed = _centre(observed, valid)
         self.prediction = _centre(prediction, valid)
         self.residual = _centre(residual, valid)
+        # Model latent of a series whose ``latent`` is the true latent.
+        self.inferred = None if inferred is None else _centre(inferred, valid)
 
     def _copy(self, **fields: torch.Tensor) -> _HeadSeries:
         clone = object.__new__(_HeadSeries)
@@ -224,15 +266,9 @@ class _HeadSeries:
     def subset(self, rows: torch.Tensor) -> _HeadSeries:
         return self._copy(
             **{
-                name: getattr(self, name)[rows]
-                for name in (
-                    "latent_raw",
-                    "valid",
-                    "latent",
-                    "observed",
-                    "prediction",
-                    "residual",
-                )
+                name: value[rows]
+                for name in _SERIES_TENSORS
+                if (value := getattr(self, name)) is not None
             }
         )
 
@@ -258,6 +294,11 @@ class _HeadSeries:
             "sign_lat_obs": _sign_agreement(lat_change, obs_change),
         }
 
+    def r2_lat_obs_weekly(self) -> float:
+        latent, blocks = _weekly_block_means(self.latent, self.valid)
+        observed, _ = _weekly_block_means(self.observed, self.valid)
+        return _r2(latent[blocks], observed[blocks])
+
     def metrics(self) -> dict[str, float]:
         valid = self.valid
         latent = self.latent[valid]
@@ -278,16 +319,11 @@ class _HeadSeries:
             "resid_share": _variance_share(self.residual[valid], prediction),
         }
         if self.step == 1:
-            weekly = {
-                name: _weekly_block_means(getattr(self, name), valid)
-                for name in ("latent", "observed", "prediction", "residual")
-            }
-            blocks = weekly["latent"][1]
-            metrics["r2_lat_obs_weekly"] = _r2(
-                weekly["latent"][0][blocks], weekly["observed"][0][blocks]
-            )
+            metrics["r2_lat_obs_weekly"] = self.r2_lat_obs_weekly()
+            residual, blocks = _weekly_block_means(self.residual, valid)
+            weekly_prediction, _ = _weekly_block_means(self.prediction, valid)
             metrics["resid_share_weekly"] = _variance_share(
-                weekly["residual"][0][blocks], weekly["prediction"][0][blocks]
+                residual[blocks], weekly_prediction[blocks]
             )
         return metrics
 
@@ -307,16 +343,58 @@ class _HeadSeries:
         return metrics
 
 
+def _week_total_null_metrics(series: _HeadSeries) -> dict[str, float]:
+    return {
+        f"{name}_week_total": value
+        for name, value in series.latent_observation_metrics().items()
+    }
+
+
+def _week_total_metrics(series: _HeadSeries) -> dict[str, float]:
+    valid = series.valid
+    return {
+        **_week_total_null_metrics(series),
+        "r2_lat_pred_week_total": _r2(series.latent[valid], series.prediction[valid]),
+    }
+
+
+def _as_true(metrics: dict[str, float]) -> dict[str, float]:
+    return {name.replace("lat_obs", "true_obs"): v for name, v in metrics.items()}
+
+
+def _true_null_metrics(series: _HeadSeries) -> dict[str, float]:
+    return _as_true(series.latent_observation_metrics())
+
+
+def _true_metrics(series: _HeadSeries) -> dict[str, float]:
+    """Indicators of a series whose latent is the true latent."""
+    metrics = _true_null_metrics(series)
+    if series.step == 1:
+        metrics["r2_true_obs_weekly"] = series.r2_lat_obs_weekly()
+    assert series.inferred is not None
+    valid = series.valid
+    metrics["r2_lat_true"] = _r2(series.inferred[valid], series.latent[valid])
+    return metrics
+
+
 class TorchLatentInformationAccumulator:
     """Collect per-window head series and compute latent-information indicators.
 
     ``update`` moves each batch to CPU float64, so enable this accumulator for
     final evaluations rather than per-epoch validation.
+
+    ``week_total_heads`` names heads whose observation is a weekly total dated
+    on its week start and whose latent is a daily flow; they also get the
+    ``_week_total`` metrics.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, week_total_heads: Collection[str] = ()) -> None:
+        unknown = sorted(set(week_total_heads) - set(LATENT_INFORMATION_HEADS))
+        if unknown:
+            raise ValueError(f"Unknown latent-information heads {unknown}")
+        self.week_total_heads = frozenset(week_total_heads)
         self.chunks: dict[str, dict[str, list[torch.Tensor]]] = {
-            head: {field: [] for field in (*_FIELDS, "nodes")}
+            head: {field: [] for field in (*_FIELDS, "nodes", "true_latent")}
             for head in LATENT_INFORMATION_HEADS
         }
 
@@ -330,11 +408,14 @@ class TorchLatentInformationAccumulator:
         residual: torch.Tensor,
         weights: torch.Tensor,
         nodes: torch.Tensor,
+        true_latent: torch.Tensor | None = None,
     ) -> None:
         """Add one batch of ``[B, H]`` series for ``head``; ``nodes`` is ``[B]``.
 
         ``latent`` is the population-fraction latent that feeds the head; it
-        is compared as ``log1p(latent * 1e5)``.
+        is compared as ``log1p(latent * 1e5)``. ``true_latent`` is the true
+        value of the same quantity when the corpus stores it; a head gets it
+        on every batch or on none.
         """
         if head not in self.chunks:
             raise ValueError(f"Unknown latent-information head {head!r}")
@@ -345,6 +426,8 @@ class TorchLatentInformationAccumulator:
             "residual": residual,
             "weights": weights,
         }
+        if true_latent is not None:
+            series["true_latent"] = true_latent
         shapes = {tuple(value.shape) for value in series.values()}
         if len(shapes) != 1 or len(next(iter(shapes))) != 2:
             raise ValueError(
@@ -356,17 +439,25 @@ class TorchLatentInformationAccumulator:
                 f"nodes must have shape [{latent.shape[0]}], got {tuple(nodes.shape)}"
             )
         target = self.chunks[head]
+        if target["latent"] and bool(target["true_latent"]) != (
+            true_latent is not None
+        ):
+            raise ValueError(
+                f"true_latent for {head!r} must be given on every batch or on none"
+            )
         for name, value in series.items():
             # Copy first, then cast: MPS tensors cannot hold float64.
             target[name].append(value.detach().to("cpu").to(torch.float64))
         target["nodes"].append(nodes.detach().to("cpu").to(torch.long))
 
-    def _series(self, head: str) -> tuple[_HeadSeries, torch.Tensor] | None:
-        chunks = self.chunks[head]
-        if not chunks["latent"]:
-            return None
-        data = {name: torch.cat(values) for name, values in chunks.items()}
-        latent = torch.log1p(data["latent"].clamp_min(0.0) * 1e5)
+    def _series(
+        self,
+        head: str,
+        data: dict[str, torch.Tensor],
+        latent: torch.Tensor,
+        inferred: torch.Tensor | None = None,
+    ) -> tuple[_HeadSeries, torch.Tensor]:
+        """Series of ``head`` with ``latent`` in log per-100k, and its nodes."""
         valid = (
             (data["weights"] > 0)
             & torch.isfinite(data["weights"])
@@ -375,6 +466,8 @@ class TorchLatentInformationAccumulator:
             & torch.isfinite(data["prediction"])
             & torch.isfinite(data["residual"])
         )
+        if inferred is not None:
+            valid &= torch.isfinite(inferred)
         # A window needs two supervised days to have a within-window deviation.
         rows = valid.sum(dim=1) >= 2
         series = _HeadSeries(
@@ -384,6 +477,7 @@ class TorchLatentInformationAccumulator:
             residual=data["residual"][rows],
             valid=valid[rows],
             step=STEP_DAYS[head],
+            inferred=None if inferred is None else inferred[rows],
         )
         return series, data["nodes"][rows]
 
@@ -391,31 +485,112 @@ class TorchLatentInformationAccumulator:
         metrics: dict[str, float | int] = {}
         for head in LATENT_INFORMATION_HEADS:
             prefix = f"{LATENT_INFORMATION_PREFIX}_{head}"
-            resolved = self._series(head)
-            window_count = 0 if resolved is None else int(resolved[1].numel())
-            metrics[f"{prefix}_window_count"] = window_count
-            if resolved is None or window_count == 0:
+            data = {
+                name: torch.cat(values)
+                for name, values in self.chunks[head].items()
+                if values
+            }
+            if not data:
+                metrics[f"{prefix}_window_count"] = 0
                 continue
-            series, nodes = resolved
+            inferred = _log_per_100k(data["latent"])
+            series, nodes = self._series(head, data, inferred)
+            window_count = int(nodes.numel())
+            metrics[f"{prefix}_window_count"] = window_count
+            if window_count == 0:
+                continue
             metrics[f"{prefix}_node_count"] = int(torch.unique(nodes).numel())
             metrics[f"{prefix}_observation_count"] = int(series.valid.sum())
-            point = series.metrics()
-            metrics.update({f"{prefix}_{k}": v for k, v in point.items()})
+            metrics.update({f"{prefix}_{k}": v for k, v in series.metrics().items()})
             metrics.update(
                 {
                     f"{prefix}_{k}": v
                     for k, v in series.lag_metrics(MAX_LAG_DAYS[head]).items()
                 }
             )
-            metrics.update(_resampled(prefix, series, nodes, point))
+            metrics.update(
+                _resampled(
+                    prefix,
+                    series,
+                    nodes,
+                    metrics=_HeadSeries.metrics,
+                    null_metrics=_HeadSeries.latent_observation_metrics,
+                    count_name="resample_window_count",
+                )
+            )
+            if head in self.week_total_heads:
+                total = _log_per_100k(_forward_week_total(data["latent"]))
+                metrics.update(
+                    _variant(
+                        prefix,
+                        "week_total",
+                        *self._series(head, data, total),
+                        metrics=_week_total_metrics,
+                        null_metrics=_week_total_null_metrics,
+                    )
+                )
+            if "true_latent" in data:
+                true_series, true_nodes = self._series(
+                    head, data, _log_per_100k(data["true_latent"]), inferred
+                )
+                metrics.update(
+                    _variant(
+                        prefix,
+                        "true",
+                        true_series,
+                        true_nodes,
+                        metrics=_true_metrics,
+                        null_metrics=_true_null_metrics,
+                    )
+                )
+                if true_nodes.numel() > 0:
+                    lags = true_series.lag_metrics(MAX_LAG_DAYS[head])
+                    metrics.update(
+                        {f"{prefix}_{k}": v for k, v in _as_true(lags).items()}
+                    )
         return metrics
+
+
+_SeriesMetrics = Callable[[_HeadSeries], dict[str, float]]
+
+
+def _variant(
+    prefix: str,
+    name: str,
+    series: _HeadSeries,
+    nodes: torch.Tensor,
+    *,
+    metrics: _SeriesMetrics,
+    null_metrics: _SeriesMetrics,
+) -> dict[str, float | int]:
+    """Point, null and bootstrap metrics of a series with a substituted latent."""
+    window_count = int(nodes.numel())
+    results: dict[str, float | int] = {f"{prefix}_{name}_window_count": window_count}
+    if window_count == 0:
+        return results
+    results[f"{prefix}_{name}_observation_count"] = int(series.valid.sum())
+    results.update({f"{prefix}_{k}": v for k, v in metrics(series).items()})
+    results.update(
+        _resampled(
+            prefix,
+            series,
+            nodes,
+            metrics=metrics,
+            null_metrics=null_metrics,
+            count_name=f"{name}_resample_window_count",
+        )
+    )
+    return results
 
 
 def _resampled(
     prefix: str,
     series: _HeadSeries,
     nodes: torch.Tensor,
-    point: dict[str, float],
+    *,
+    metrics: _SeriesMetrics,
+    null_metrics: _SeriesMetrics,
+    count_name: str,
 ) -> dict[str, float | int]:
     generator = torch.Generator().manual_seed(RESAMPLE_SEED)
     window_count = int(nodes.numel())
@@ -427,16 +602,14 @@ def _resampled(
         )
         series, nodes = series.subset(rows), nodes[rows]
         window_count = MAX_RESAMPLE_WINDOWS
-    results: dict[str, float | int] = {f"{prefix}_resample_window_count": window_count}
+    results: dict[str, float | int] = {f"{prefix}_{count_name}": window_count}
 
-    null_draws: dict[str, list[float]] = {name: [] for name in _NULL_METRICS}
+    null_draws: dict[str, list[float]] = {}
     for _ in range(RESAMPLE_COUNT):
         donors = torch.randperm(window_count, generator=generator)
-        draw = series.with_latent(
-            series.latent_raw[donors]
-        ).latent_observation_metrics()
-        for name in _NULL_METRICS:
-            null_draws[name].append(draw[name])
+        draw = null_metrics(series.with_latent(series.latent_raw[donors]))
+        for name, value in draw.items():
+            null_draws.setdefault(name, []).append(value)
     for name, values in null_draws.items():
         results[f"{prefix}_{name}_null95"] = _percentile(values, 0.95)
 
@@ -445,15 +618,14 @@ def _resampled(
         torch.nonzero(node_index == i).flatten()
         for i in range(int(node_index.max()) + 1)
     ]
-    boot_draws: dict[str, list[float]] = {name: [] for name in point}
+    boot_draws: dict[str, list[float]] = {}
     for _ in range(RESAMPLE_COUNT):
         picks = torch.randint(
             len(windows_by_node), (len(windows_by_node),), generator=generator
         )
         rows = torch.cat([windows_by_node[int(i)] for i in picks])
-        draw = series.subset(rows).metrics()
-        for name in point:
-            boot_draws[name].append(draw[name])
+        for name, value in metrics(series.subset(rows)).items():
+            boot_draws.setdefault(name, []).append(value)
     for name, values in boot_draws.items():
         results[f"{prefix}_{name}_q05"] = _percentile(values, 0.05)
         results[f"{prefix}_{name}_q95"] = _percentile(values, 0.95)

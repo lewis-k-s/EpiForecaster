@@ -126,6 +126,24 @@ def test_latent_information_indicators_follow_their_flag():
     assert enabled["latent_info_hosp_observation_count"] == 4
 
 
+def test_latent_information_uses_stored_true_latents_of_the_relevant_source():
+    batch = _make_batch(with_residuals=True)
+    # [B, H + 1] state target; index 0 is the forecast origin.
+    batch.targets_dict["I_target"] = torch.tensor(
+        [[0.01, 0.02, 0.04], [0.02, 0.01, 0.03]]
+    )
+    _loss, metrics, _ = _evaluate(batch, latent_information=True)
+
+    # Wastewater and cases read I, which has a stored truth; the admission flow
+    # behind hospitalizations has none.
+    assert metrics["latent_info_ww_true_window_count"] == 2
+    assert metrics["latent_info_ww_true_observation_count"] == 4
+    assert metrics["latent_info_cases_true_window_count"] == 1
+    assert not any(key.startswith("latent_info_hosp_true") for key in metrics)
+    # A two-day horizon holds no complete week.
+    assert metrics["latent_info_hosp_week_total_window_count"] == 0
+
+
 def test_evaluate_loader_emits_cases_and_deaths_metrics():
     _loss, metrics, _node_mae = _evaluate(_make_batch())
 
