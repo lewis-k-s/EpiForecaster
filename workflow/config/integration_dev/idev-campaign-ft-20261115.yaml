@@ -2,6 +2,9 @@
 # 3 conditions x 5 paired seeds = 15 identities, 8 workers on 4 GPUs (2 CUDA MPS
 # clients per GPU) in one acc_debug allocation. Prepare only after both
 # idev-pretrain-*-n400-20261115 runs have published best_model.pt.
+# Sizing: idev-campaign-a-20261115 ran 40 trials in 40 min with this layout;
+# history-reconstruction trials took ~11 min, others 2-6 min. Two waves of
+# hist/combo trials ~25 min; runtime 60 leaves ~2x margin.
 
 run: {}
 source: {}
@@ -22,7 +25,7 @@ ablation:
   campaign: configs/campaigns/integration_dev_ft_v1.yaml
   workers: 8
   closeout_signal_seconds: 900
-  timeout_s: 4500
+  timeout_s: 2700
   sampler_seed: 42
   smoketest: false
   recover_stale_running: true
@@ -38,4 +41,4 @@ resources:
     cpus_per_task: 10
     gres: gpu:4
     mps_clients_per_gpu: 2
-    runtime: 90
+    runtime: 60
