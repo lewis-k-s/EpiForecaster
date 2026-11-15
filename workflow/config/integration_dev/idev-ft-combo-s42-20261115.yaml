@@ -42,4 +42,4 @@ resources:
     tasks: 1
     cpus_per_task: 20
     gres: gpu:1
-    runtime: 60
+    runtime: 25
