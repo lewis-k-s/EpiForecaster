@@ -1,0 +1,38 @@
+run: {}
+source: {}
+container: {}
+workflow:
+  kind: train
+  target: train_evaluate
+dvc:
+  targets:
+  - data/processed/synthetic_sirhd_v1_5a2262d_reactive_n400_holt_damped.zarr.zip.dvc
+  - outputs/region_embeddings/region_embeddings.pt.dvc
+  provenance_targets:
+  - data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip.dvc
+training:
+  base_config: configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n400.yaml
+  experiment_name: synthetic-pretrain-hist-reactive-n400
+  model_id: model
+  max_batches: null
+  overrides:
+  - output.save_checkpoints=true
+  - training.run_final_evaluation=false
+  - output.checkpoint_frequency=1
+  - model.sir_physics.rollforward_history_steps=56
+  - training.loss.joint.history_reconstruction_weight=0.5
+evaluation:
+  split: test
+  granular: true
+  overrides:
+  - training.val_workers=2
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 720
