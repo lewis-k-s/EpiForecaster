@@ -1,0 +1,56 @@
+schema_version: 1
+campaign_id: epiforecaster_integration_dev_ft_v1
+stage: ablation
+hypothesis: Development screen of history roll-forward variants fine-tuned from matching synthetic pretrains on the base-config seed-42 node split. It has no cross-validation folds, so it is development evidence and cannot support model-selection claims.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: ft-base
+fixed_overrides: {}
+smoke_overrides:
+  training:
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
+init_checkpoints:
+  # Reactive n400 SIRHD pretrain, epoch-10 best checkpoint (commit 5a2262d corpus).
+  synth-n400-e10: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/synth-pretrain-5a2262d-n400-e10-20261106/outputs/training/synthetic-pretrain-sirhd-v1-reactive-n400/model/checkpoints/best_model.pt
+  # Reactive n400 pretrain with the 56-day history roll-forward.
+  hist-n400: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/idev-pretrain-hist-n400-20261115/outputs/training/synthetic-pretrain-hist-reactive-n400/model/checkpoints/best_model.pt
+  # Reactive n400 pretrain with the combined integration variants.
+  combo-n400: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/idev-pretrain-combo-n400-20261115/outputs/training/synthetic-pretrain-combo-reactive-n400/model/checkpoints/best_model.pt
+conditions:
+  - name: ft-base
+    hypothesis: The fine-tuned production configuration is the paired reference.
+    init_checkpoint: synth-n400-e10
+    overrides: {}
+    allowed_difference_paths: [training.init_checkpoint_path]
+  - name: ft-hist
+    hypothesis: Rolling the latent forward over 56 history days and reconstructing the observed history anchors the origin state after pretraining.
+    init_checkpoint: hist-n400
+    overrides: {model: {sir_physics: {rollforward_history_steps: 56}}, training: {loss: {joint: {history_reconstruction_weight: 0.5}}}}
+    allowed_difference_paths: [training.init_checkpoint_path, model.sir_physics.rollforward_history_steps, training.loss.joint.history_reconstruction_weight]
+  - name: ft-combo
+    hypothesis: History roll-forward, beta-only rates, weekly hospitalization totals, wastewater incidence, and a residual penalty combine after pretraining.
+    init_checkpoint: combo-n400
+    overrides:
+      model:
+        sir_physics: {rollforward_history_steps: 56, time_varying_rates: beta}
+        observation_heads: {hosp_week_total: true, ww_source: infection_flow, relevant_source_ww: infection_flow}
+      training:
+        loss: {joint: {history_reconstruction_weight: 0.5, beta_smoothness_weight: 10.0, residual_penalty_weight: 0.1}}
+    allowed_difference_paths: [training.init_checkpoint_path, model.sir_physics.rollforward_history_steps, model.sir_physics.time_varying_rates, model.observation_heads.hosp_week_total, model.observation_heads.ww_source, model.observation_heads.relevant_source_ww, training.loss.joint.history_reconstruction_weight, training.loss.joint.beta_smoothness_weight, training.loss.joint.residual_penalty_weight]
+paired_model_seeds: [42, 43, 44, 45, 46]
+metrics:
+  primary: {name: mean_target_wis, direction: minimize}
+  secondary: [mae_median, rmse_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true

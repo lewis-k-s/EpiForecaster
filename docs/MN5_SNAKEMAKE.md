@@ -32,9 +32,13 @@ tasks=N
 gres=gpu:N
 ```
 
-Templates use `acc_bscls`; `acc_debug` is also accepted when its wall-time
-limits fit the run. No `--mem` or `--mem-per-cpu` directive is permitted
-because MN5 derives host memory from the CPU allocation.
+Templates use `acc_bscls`. Use `acc_debug` for any run that fits its two-hour
+limit: its QOS priority is 10000 against 100 for `acc_bscls`, but it holds one
+queued or running job per user. Pack many short runs into one `ablation`
+campaign (with `mps_clients_per_gpu` when trials leave the GPU idle) instead of
+submitting one job per run. Size `runtime` from measured wall time with about a
+twofold margin; a shorter limit backfills sooner. No `--mem` or `--mem-per-cpu`
+directive is permitted because MN5 derives host memory from the CPU allocation.
 
 Single training and evaluation use `N=1`. HPO and ablation use their configured
 worker count. Cross-validation uses up to `N` concurrent folds, with ten folds

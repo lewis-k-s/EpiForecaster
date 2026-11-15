@@ -1,0 +1,41 @@
+# Fine-tune integration dev campaign (configs/campaigns/integration_dev_ft_v1.yaml):
+# 3 conditions x 5 paired seeds = 15 identities, 8 workers on 4 GPUs (2 CUDA MPS
+# clients per GPU) in one acc_debug allocation. Prepare only after both
+# idev-pretrain-*-n400-20261115 runs have published best_model.pt.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: ablation
+  target: ablation
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id.zarr.zip.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+ablation:
+  study_name: epiforecaster_integration_dev_ft_v1
+  campaign: configs/campaigns/integration_dev_ft_v1.yaml
+  workers: 8
+  closeout_signal_seconds: 900
+  timeout_s: 4500
+  sampler_seed: 42
+  smoketest: false
+  recover_stale_running: true
+  requeue_running: false
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 8
+    cpus_per_task: 10
+    gres: gpu:4
+    mps_clients_per_gpu: 2
+    runtime: 90
