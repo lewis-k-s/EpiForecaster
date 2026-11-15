@@ -103,7 +103,7 @@ _WEEK_TOTAL_FLOW_SOURCES = {"hosp": "hospitalization_flow"}
 _ALLOWED_RELEVANT_SOURCES = {
     "hosp": {"hospitalization_flow", "H"},
     "ww": {"I", "infection_flow"},
-    "cases": {"I"},
+    "cases": {"I", "infection_flow"},
     "deaths": {"death_flow", "D"},
 }
 
@@ -596,6 +596,14 @@ def evaluate_loader(
     loss_cases_weighted_sum = torch.tensor(0.0, device=device)
     loss_deaths_weighted_sum = torch.tensor(0.0, device=device)
     loss_sird_supervision_weighted_sum = torch.tensor(0.0, device=device)
+    regularizer_names = (
+        "history_reconstruction",
+        "residual_penalty",
+        "beta_smoothness",
+    )
+    loss_regularizer_sums = {
+        name: torch.tensor(0.0, device=device) for name in regularizer_names
+    }
     loss_latent_s_sum = torch.tensor(0.0, device=device)
     loss_latent_i_sum = torch.tensor(0.0, device=device)
     loss_latent_h_sum = torch.tensor(0.0, device=device)
@@ -738,6 +746,8 @@ def evaluate_loader(
                 loss_sird_supervision_weighted_sum += components[
                     "sird_supervision_weighted"
                 ].detach()
+                for name in regularizer_names:
+                    loss_regularizer_sums[name] += components[name].detach()
                 latent_metrics.update(
                     model_outputs=model_outputs,
                     targets=targets_dict,
@@ -1503,6 +1513,10 @@ def evaluate_loader(
             loss_sird_supervision_weighted_sum / max(1, processed_batches)
         ).item(),
     }
+    for name in regularizer_names:
+        metrics[f"loss_{name}"] = (
+            loss_regularizer_sums[name] / max(1, processed_batches)
+        ).item()
     for task in latent_loss_tasks:
         metrics[f"loss_latent_{task}_raw"] = (
             loss_latent_raw_sums[task] / max(1, processed_batches)

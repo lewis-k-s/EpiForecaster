@@ -273,6 +273,26 @@ residual alone. Disabling every head gives a black-box control with the same
 encoder; a relative residual budget (`training.residual_schedule`) is rejected
 on such heads, and a head cannot disable both paths.
 
+### Mechanistic integration variants
+
+All default to the behaviour described above. With the defaults the
+roll-forward starts at the forecast origin, so each kernel sees only the
+forecast-period latent and the origin admission flow is zero.
+
+|Setting|Effect|
+|---|---|
+|`model.sir_physics.rollforward_history_steps: L`|The initial state is placed $L$ days before the origin and rolled through the history. Forecast-step rates still come from the final hidden state; the rate of history step $k$ comes from a per-day rate head on the encoding of day $k$, initialized stationary ($\beta$ equal to the removal-rate prior). $L$ must be at least the longest observation kernel and below `input_window_length`. Forecast outputs keep their shapes; `observation_source_<head>` covers the whole roll-forward.|
+|`training.loss.joint.history_reconstruction_weight`|Adds the mean over heads of the masked MSE between `mechanistic_history_<head>` and the observed history, in `log1p` space. The history location is the unanchored mechanistic location without residual, from the first day with a full kernel window to the last history day. Requires $L>0$.|
+|`model.sir_physics.time_varying_rates: beta`|$\gamma$, $\mu^I$, $\alpha$, $\rho$ and $\mu^H$ are the horizon mean of their rate head, constant over the window. Checkpoints are interchangeable with `all`.|
+|`training.loss.joint.beta_smoothness_weight`|Adds the mean squared first difference of $\log\beta$ along the roll-forward (random-walk prior).|
+|`training.loss.joint.residual_penalty_weight`|Adds the mean over heads of the mean squared residual contribution to the forecast location over supervised points. Rejected with `mechanistic_disabled_heads`.|
+|`model.observation_heads.hosp_week_total: true`|The hospitalization head predicts the admission flow summed over days $h..h+6$, the days a weekly total dated on its week start covers. The roll-forward runs six days past the horizon with the last rates held.|
+|`model.sir_physics.force_of_infection: renewal`|The $S \to I$ flux is $R_t S_t \sum_{s=1}^{G} g_s\, i_{t-s}$ with $R_t = \beta_t/(\gamma_t+\alpha_t+\mu^I_t)$ and $g$ a discretized Gamma generation interval (`generation_interval_mean`, `generation_interval_sd`, `generation_interval_length`), capped at $S_t$. Days before the roll-forward are seeded with $(\gamma_0+\alpha_0+\mu^I_0) I_0$, so the first flux equals mass action. Compartment bookkeeping is unchanged.|
+|`model.observation_heads.cases_source: infection_flow`|The cases delay kernel convolves incidence instead of prevalence. Set `relevant_source_cases` to the same value.|
+
+Evaluation reports the unweighted regularizers as `loss_history_reconstruction`,
+`loss_residual_penalty` and `loss_beta_smoothness` for every run.
+
 ## 5. Configuration Parameters
 
 ### Temporal Covariates (`model.params.include_day_of_week`, `model.params.include_holidays`)
