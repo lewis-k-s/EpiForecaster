@@ -1,5 +1,5 @@
 schema_version: 1
-campaign_id: epiforecaster_transfer_v1
+campaign_id: epiforecaster_transfer_v2
 stage: ablation
 hypothesis: Synthetic SIRHD pretraining, the mechanistic observation path, wastewater incidence sourcing, and a bounded residual change held-out forecast skill over every valid target region.
 base_config: configs/production_only/train_epifor_mn5_full.yaml
@@ -14,6 +14,9 @@ smoke_overrides:
 init_checkpoints:
   # Reactive n400 SIRHD pretrain, epoch-10 best checkpoint (commit 5a2262d corpus).
   synth-n400-e10: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/synth-pretrain-5a2262d-n400-e10-20261106/outputs/training/synthetic-pretrain-sirhd-v1-reactive-n400/model/checkpoints/best_model.pt
+  # Matched reactive n400 pretrain with every mechanistic observation path disabled
+  # and zero latent supervision (early-stopped after epoch 7).
+  blackbox-n400-e10: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/tdev-bb-pretrain-n400-e10-20261109/outputs/training/synthetic-pretrain-blackbox-reactive-n400/model/checkpoints/best_model.pt
 conditions:
   - name: real-base
     hypothesis: The production configuration trained from scratch on real data is the paired reference.
@@ -28,6 +31,11 @@ conditions:
     init_checkpoint: synth-n400-e10
     overrides: {}
     allowed_difference_paths: [training.init_checkpoint_path]
+  - name: ft-blackbox
+    hypothesis: Synthetic pretraining helps a residual-only network, so the mechanistic path still matters after pretraining.
+    init_checkpoint: blackbox-n400-e10
+    overrides: {model: {observation_heads: {mechanistic_disabled_heads: [ww, hosp, cases, deaths]}}}
+    allowed_difference_paths: [training.init_checkpoint_path, model.observation_heads.mechanistic_disabled_heads]
   - name: ft-wwflow
     hypothesis: Convolving latent incidence rather than prevalence in the wastewater head improves the fine-tuned model.
     init_checkpoint: synth-n400-e10

@@ -1,5 +1,5 @@
-# Transfer campaign (configs/campaigns/transfer_v1.yaml): 5 conditions x 10 folds x
-# 3 paired seeds = 150 identities on one four-GPU allocation.
+# Transfer campaign (configs/campaigns/transfer_v2.yaml): 6 conditions x 10 folds x
+# 3 paired seeds = 180 identities on one four-GPU allocation.
 
 run: {}
 source: {}
@@ -16,8 +16,8 @@ dvc:
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 ablation:
-  study_name: epiforecaster_transfer_v1
-  campaign: configs/campaigns/transfer_v1.yaml
+  study_name: epiforecaster_transfer_v2
+  campaign: configs/campaigns/transfer_v2.yaml
   workers: 4
   # One-hour Slurm close-out is reserved for active trials and finalization.
   closeout_signal_seconds: 3600
