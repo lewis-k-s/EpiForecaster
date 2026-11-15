@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import torch
 from evaluation.aggregate_export import (
     build_main_model_joint_observation_aggregate,
     build_main_model_target_aggregate,
+    write_evaluation_summary,
     write_main_model_aggregate_csvs,
 )
 from training.epiforecaster_trainer import EpiForecasterTrainer
@@ -259,7 +261,13 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
     )
     trainer.test_epoch = lambda **_kwargs: (
         0.6,
-        {"mae": 1.1, "rmse": 2.1, "r2": 0.3},
+        {
+            "mae": 1.1,
+            "rmse": 2.1,
+            "r2": 0.3,
+            "latent_plausibility_i_collapse_fraction": 0.25,
+            "latent_info_hosp_r2_lat_obs": float("nan"),
+        },
         {},
     )
 
@@ -294,4 +302,50 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
         "val_main_model_joint_loss_aggregate",
         "test_main_model_aggregate_metrics",
         "test_main_model_joint_loss_aggregate",
+        "test_summary",
     }
+    # Run-level indicators reach disk only through the test summary.
+    summary = json.loads((tmp_path / "test_summary.json").read_text())
+    assert summary["split"] == "test"
+    assert summary["eval_loss"] == 0.6
+    assert summary["checkpoint"] == str((tmp_path / "best_model.pt").resolve())
+    assert summary["metrics"] == {
+        "mae": 1.1,
+        "rmse": 2.1,
+        "r2": 0.3,
+        "latent_plausibility_i_collapse_fraction": 0.25,
+        "latent_info_hosp_r2_lat_obs": None,
+    }
+
+
+def test_write_evaluation_summary_converts_tensor_and_non_finite_metrics(
+    tmp_path: Path,
+) -> None:
+    path = write_evaluation_summary(
+        tmp_path / "nested/test_summary.json",
+        checkpoint=tmp_path / "best_model.pt",
+        split="test",
+        eval_loss=float("inf"),
+        metrics={
+            "count": torch.tensor(3),
+            "per_horizon": torch.tensor([0.5, float("nan")]),
+            "nested": {"value": 1.5},
+        },
+    )
+
+    summary = json.loads(path.read_text())
+    assert summary["schema_version"] == 1
+    assert summary["eval_loss"] is None
+    assert summary["metrics"] == {
+        "count": 3,
+        "per_horizon": [0.5, None],
+        "nested": {"value": 1.5},
+    }
+    with pytest.raises(TypeError, match="Unsupported evaluation metric value"):
+        write_evaluation_summary(
+            tmp_path / "bad.json",
+            checkpoint=tmp_path / "best_model.pt",
+            split="test",
+            eval_loss=0.0,
+            metrics={"bad": object()},
+        )
