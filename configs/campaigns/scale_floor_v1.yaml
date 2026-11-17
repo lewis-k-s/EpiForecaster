@@ -1,0 +1,84 @@
+schema_version: 1
+campaign_id: epiforecaster_scale_floor_v1
+stage: ablation
+hypothesis: >-
+  A larger predictive scale floor removes the degenerate confident-zero
+  forecasts of the Normal likelihood on zero-heavy series without costing WIS.
+  With the 0.001 floor a zero-anchored forecast with a collapsed scale earns
+  about -6 nats on every observed zero and up to the 1e6 clamp on the next
+  positive day (region_coverage_v1: 4036 case points, 95% observed zeros). All
+  conditions train on the 280 population-floor targets of real_with_id_v2.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: floor-0p001
+fixed_overrides:
+  data:
+    dataset_path: data/processed/real_with_id_v2.zarr.zip
+  # The campaign ran before the production scale floors; pin its reference.
+  model:
+    observation_heads:
+      distribution_scale_floor: 0.001
+      count_step_scale_floor_cases: 0.0
+      censored_location: false
+  # It also ran before the censored WIS objective; pin its Normal NLL.
+  training:
+    loss:
+      joint:
+        observation_loss: nll
+smoke_overrides:
+  training:
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
+conditions:
+  - name: floor-0p001
+    hypothesis: The former 0.001 production scale floor is the paired reference.
+    overrides: {}
+    allowed_difference_paths: []
+  - name: floor-0p05
+    hypothesis: A 0.05 floor bounds the reward of an observed zero at about -2.1 nats.
+    overrides: {model: {observation_heads: {distribution_scale_floor: 0.05}}}
+    allowed_difference_paths: [model.observation_heads.distribution_scale_floor]
+  - name: floor-0p10
+    hypothesis: A 0.1 floor bounds the reward of an observed zero at about -1.4 nats.
+    overrides: {model: {observation_heads: {distribution_scale_floor: 0.1}}}
+    allowed_difference_paths: [model.observation_heads.distribution_scale_floor]
+  - name: floor-0p20
+    hypothesis: A 0.2 floor bounds the reward of an observed zero at about -0.7 nats and widens death intervals.
+    overrides: {model: {observation_heads: {distribution_scale_floor: 0.2}}}
+    allowed_difference_paths: [model.observation_heads.distribution_scale_floor]
+paired_model_seeds: [42, 43]
+cross_validation:
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
+  fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  smoke_fold_indices: [1, 4]
+metrics:
+  primary: {name: mean_target_wis, direction: minimize}
+  secondary: [mae_median, rmse_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+  require_full_manifest_folds: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true
+analysis:
+  kind: probabilistic_full_coverage
+  granular_filename: test_granular.parquet
+  required_heads: [wastewater, hospitalizations, cases, deaths]
+  evaluation_design: spatial
+  temporal_evaluation:
+    scored_role: all_dates
+    calibration_control: C0
+    confirmation: included
+  mobility_context:
+    kind: incoming_flow_raw_tertiles
+    path: data/files/mobility.zarr.zip
+    variable: mobility
+    date_start: "2020-03-01"
+    date_end: "2021-05-09"

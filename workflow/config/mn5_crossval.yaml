@@ -9,13 +9,13 @@ workflow:
 dvc:
   targets:
     - data/files/mobility.zarr.zip.dvc
-    - data/processed/real_with_id.zarr.zip.dvc
+    - data/processed/real_with_id_v2.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 crossval:
-  campaign_id: epiforecaster-representative-10fold-v2
+  campaign_id: epiforecaster-representative-10fold-pop3000-v1
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
   folds: 10
   model_seed: 42
   holdout_role: test

@@ -354,7 +354,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert fallback_row["region_label"] == "08002"
 
     meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
-    assert meta["schema_version"] == "4"
+    assert meta["schema_version"] == "5"
     assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
@@ -585,6 +585,7 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
             batch_size=32,
             prefetch_factor=4,
             pin_memory=True,
+            crossval_manifest_path=None,
         ),
     )
     dataset = _DummyDataset()

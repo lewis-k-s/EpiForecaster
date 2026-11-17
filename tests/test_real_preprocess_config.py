@@ -32,7 +32,7 @@ def test_template_is_a_valid_preprocess_workflow() -> None:
     assert allocation["partition"] == "gpp"
     assert allocation["qos"] == "gp_debug"
     assert allocation["runtime"] <= 120
-    assert preprocessing_dataset_name(template) == "real_with_id"
+    assert preprocessing_dataset_name(template) == "real_with_id_v2"
     assert template["preprocessing"]["expected_run_count"] == 1
     assert (ROOT / template["preprocessing"]["base_config"]) == BASE
     for target in template["dvc"]["targets"]:
@@ -58,7 +58,8 @@ def staged_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def test_base_config_uses_current_production_defaults(staged_config: Path) -> None:
     config = PreprocessingConfig.from_file(staged_config)
-    assert config.dataset_name == "real_with_id"
+    assert config.dataset_name == "real_with_id_v2"
+    assert config.valid_target_min_population == 3000
     assert config.hospitalizations_reporting_lag_days == 7
     assert config.continuous_storage_dtype == "float32"
     assert config.smoothing.parameter_fit_end_date is None

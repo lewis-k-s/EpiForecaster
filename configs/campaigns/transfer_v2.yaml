@@ -55,8 +55,8 @@ conditions:
 # Paired stochastic-training replicates: shared across all conditions within a fold.
 paired_model_seeds: [42, 43, 44]
 cross_validation:
-  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
-  # Every manifest fold: all 161 valid target regions are held out exactly once
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
+  # Every manifest fold: all 280 valid target regions are held out exactly once
   # per condition and model seed.
   fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   # Routing check only; scientifically ineligible.

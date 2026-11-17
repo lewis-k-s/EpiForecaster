@@ -41,7 +41,62 @@ class EDARProcessor:
         self.config = config
         self.validation_options = config.validation_options
 
+    def _fill_gaps(self, daily_data: pd.DataFrame) -> pd.DataFrame:
+        """Fill the days without a sample per ``smoothing.wastewater_method``.
+
+        Each site-variant is filled from its first sample to the configured end
+        date, so a series that stops early keeps a causal fill instead of
+        dropping out.
+        """
+        if self.config.smoothing.wastewater_method == "locf":
+            return self._apply_locf(daily_data)
+        return self._apply_tobit_kalman(daily_data)
+
+    def _daily_to_range_end(self, group: pd.DataFrame) -> pd.DataFrame:
+        """One site-variant on a daily index from its first row to the end date."""
+        series = group.set_index("date").sort_index()
+        days = pd.date_range(
+            series.index[0], self.config.end_date, freq="D", name="date"
+        )
+        return series.reindex(days)
+
+    def _apply_locf(self, daily_data: pd.DataFrame) -> pd.DataFrame:
+        """Carry each reported value forward until the next sample.
+
+        Censor flags: 0 = sampled, 1 = sampled non-detect (value at or below the
+        detection limit), 2 = no sample.
+        """
+        if daily_data.empty:
+            return daily_data
+
+        filled_frames: list[pd.DataFrame] = []
+        for (edar_id, variant), group in daily_data.groupby(["edar_id", "variant"]):
+            series = self._daily_to_range_end(group)
+            values = series["total_covid_flow"].to_numpy()
+            sampled = np.isfinite(values) & (values > 0)
+            censored = np.zeros_like(sampled)
+            if "limit_flow" in series:
+                limits = series["limit_flow"].ffill().to_numpy()
+                censored = (
+                    sampled & np.isfinite(limits) & (limits > 0) & (values <= limits)
+                )
+
+            series["total_covid_flow"] = (
+                series["total_covid_flow"].where(sampled).ffill()
+            )
+            series["censor_flag"] = np.where(censored, 1, np.where(sampled, 0, 2))
+            series["edar_id"] = edar_id
+            series["variant"] = variant
+            filled_frames.append(series.reset_index())
+
+        return pd.concat(filled_frames, ignore_index=True)
+
     def _apply_tobit_kalman(self, daily_data: pd.DataFrame) -> pd.DataFrame:
+        """Fill the days without a sample with a causal Tobit-Kalman level.
+
+        Sample days keep the reported value, which is the detection limit for a
+        non-detect. The filter level is written only on days without a sample.
+        """
         if daily_data.empty:
             return daily_data
 
@@ -57,7 +112,7 @@ class EDARProcessor:
 
         filtered_frames: list[pd.DataFrame] = []
         for (edar_id, variant), group in daily_data.groupby(["edar_id", "variant"]):
-            series = group.set_index("date").sort_index().asfreq("D")
+            series = self._daily_to_range_end(group)
             values = series["total_covid_flow"].to_numpy()
             limits = (
                 series["limit_flow"].ffill().to_numpy()
@@ -80,16 +135,27 @@ class EDARProcessor:
                 except (ValueError, RuntimeError):
                     pass
 
+            smoothing = self.config.smoothing
             filter_model = TobitKalmanSmoother(
                 process_var=process_var,
                 measurement_var=measurement_var,
                 censor_inflation=censor_inflation,
+                missing_policy=smoothing.missing_policy,
+                momentum_decay=smoothing.momentum_decay,
+                momentum_max_steps=smoothing.momentum_max_steps,
+                innovation_clip_sigma=smoothing.innovation_clip_sigma,
+                reentry_gain_cap=smoothing.reentry_gain_cap,
+                reentry_steps=smoothing.reentry_steps,
+                reentry_min_gap=smoothing.reentry_min_gap,
+                process_var_floor=smoothing.process_var_floor,
+                measurement_var_floor=smoothing.measurement_var_floor,
             )
             filtered_log, flags = filter_model.filter_series(values, limits)
 
-            series["total_covid_flow"] = np.exp(filtered_log)
+            sampled = np.isfinite(values) & (values > 0)
+            series["total_covid_flow"] = np.where(sampled, values, np.exp(filtered_log))
             # No observation has arrived before the first finite input.
-            seen = np.maximum.accumulate(np.isfinite(values) & (values > 0))
+            seen = np.maximum.accumulate(sampled)
             series.loc[~seen, "total_covid_flow"] = np.nan
             series["censor_flag"] = flags
             series["process_var"] = process_var
@@ -312,7 +378,7 @@ class EDARProcessor:
 
         # Resample to daily frequency
         daily_data = self._resample_to_daily(flow_data)
-        daily_data = self._apply_tobit_kalman(daily_data)
+        daily_data = self._fill_gaps(daily_data)
 
         # Convert to xarray - include both flow values and censor flags
         daily_data_xr_flow = daily_data.set_index(["date", "edar_id", "variant"])[

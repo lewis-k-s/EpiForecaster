@@ -202,7 +202,7 @@ The 5a2262d n400 corpus uses
 it from the EpiSim.jl DVC store on GPFS into both the `storage` and `cache`
 directories of the EpiForecaster DVC root, as for the a97c812 corpus.
 
-The real dataset `real_with_id` is rebuilt with
+The real dataset `real_with_id_v2` is rebuilt with
 `workflow/config/mn5_preprocess_real.yaml` on one `gp_debug` GPP node (90 minutes,
 48 CPUs). Raw inputs are the DVC pointers
 `data/files/catalonia_real_raw_inputs_v1.dvc` and
@@ -210,9 +210,14 @@ The real dataset `real_with_id` is rebuilt with
 promotion `full-20261104b`; its objects were hard-linked from that project's DVC
 store into `EpiForecaster-DVC/storage`, and preprocessing reads
 `mobility/mobility_catalonia.zarr` (Zarr v3) from it. The run publishes a packed
-`real_with_id.zarr.zip.dvc` pointer, which replaced the old `real_with_id.zarr.dvc`
-directory pointer. After review, copy it to `data/processed/` and repoint the
-consuming templates and `data.dataset_path` (see the template header).
+`real_with_id_v2.zarr.zip.dvc` pointer. After review, copy it to `data/processed/`
+and repoint the consuming templates and `data.dataset_path` (see the template
+header). The production config, the standing templates in `workflow/config/`
+and the campaigns `ablation_default_v2`, `ablation_smoke_v1` and `transfer_v2`
+use `real_with_id_v2` with `configs/crossval/representative_10fold_pop3000.json`.
+The dated run records under `workflow/config/integration_dev/`, `transfer_dev/`
+and `latent_diagnostics/` still stage the 161-target `real_with_id` pointer they
+ran with and need the v2 pointer before reuse.
 
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
@@ -241,7 +246,7 @@ resolved configuration paths (currently `training.epochs` and
 `training.max_batches`) whose values must be identical for every condition.
 
 Production campaigns evaluate every fold in the persisted manifest. The canonical
-10-fold manifest places all 161 valid target regions in the held-out test role
+10-fold manifest places all 280 valid target regions in the held-out test role
 exactly once per condition and paired model seed. `ablation_default_v2.yaml`
 therefore declares folds `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]` and two paired seeds
 `[42, 43]`, giving `28 conditions × 10 folds × 2 seeds = 560` identities. Each
@@ -268,6 +273,36 @@ provenance, but they cannot support model-selection claims. Campaigns are expand
 in memory; the workflow never generates per-run YAML files. A campaign with fold
 indices must declare an existing persisted split manifest, and undeclared
 resolved-config drift fails before a worker starts training.
+
+`configs/campaigns/region_coverage_v1.yaml` (run with
+`workflow/config/mn5_region_coverage.yaml`) compares training populations on the
+population-floor dataset `real_with_id_v2` and its extended manifest
+`representative_10fold_pop3000.json`. The baseline sets
+`training.crossval_region_set: base`, so it trains and selects on the 161 former
+targets; the candidate trains on all 280. Both score every region of each fold,
+so the primary endpoint has identical support, and the manifest region sets give
+the paired effect on the former targets (`base`), the added targets, and each
+population bin.
+
+`configs/campaigns/scale_floor_v1.yaml` (run with
+`workflow/config/mn5_scale_floor.yaml`) varies
+`model.observation_heads.distribution_scale_floor` (0.001, 0.05, 0.1, 0.2) on
+the same 280 targets. The Normal likelihood is unbounded on an observed zero
+when the anchored location sits on the zero clamp, so the floor is the only
+bound on the reward of a collapsed scale; the campaign measures what a larger
+floor costs in WIS and removes from the NLL tail.
+`configs/campaigns/scale_floor_v2.yaml` (`workflow/config/mn5_scale_floor_v2.yaml`)
+keeps the constant 0.05 floor on every head and varies
+`count_step_scale_floor_cases` (0, 0.05, 0.1, 0.2), the cases floor as a fraction
+of one count in the target municipality. The production config adopts the
+constant 0.05 floor with a cases fraction of 0.2; the three campaigns that ran
+before pin their own floors in `fixed_overrides`.
+`configs/campaigns/censored_likelihood_v1.yaml`
+(`workflow/config/mn5_censored_likelihood.yaml`) compares the former production
+Normal NLL with the zero-clipped WIS objective and with
+`model.observation_heads.censored_location`, under both objectives. The
+production config adopts the clipped WIS with the censored location; the four
+campaigns above pin the Normal NLL they ran with in `fixed_overrides`.
 
 Fine-tuning conditions declare their pretrained sources once, in a top-level
 `init_checkpoints` mapping of name to absolute GPFS path, and reference one by

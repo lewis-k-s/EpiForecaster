@@ -141,11 +141,13 @@ def test_deaths_processor_municipality_level(
     assert result.deaths.dims == ("date", "region_id")
     assert result.deaths.sizes["date"] == 15  # full date range (reindexed)
     assert result.deaths.sizes["region_id"] == 2  # 2 municipalities
-    # Kalman smoothing/interpolation should produce finite daily trajectories.
+    # Gap filling should produce finite daily trajectories.
     assert result.deaths.notnull().all()
     assert (result.deaths >= 0).all()
-    # Mask tracks true observations only (3 observed rows from fixture)
-    assert float(result.deaths_mask.sum()) == 3.0
+    # The registry spans Jan 1-2. Abrera has no record on Jan 2, which is an
+    # observed zero: 2 days x 2 municipalities are observed.
+    assert float(result.deaths_mask.sum()) == 4.0
+    assert float(result.deaths.sel(date="2022-01-02", region_id="08021")) == 0.0
     # Age channel should include staleness beyond observation days
     assert float(result.deaths_age.max()) > 1.0
 
@@ -159,7 +161,7 @@ def test_deaths_processor_holt_damped_keeps_mask_age_semantics(
     result = proc.process(temp_data_dir)
 
     assert result.deaths.notnull().all()
-    assert float(result.deaths_mask.sum()) == 3.0
+    assert float(result.deaths_mask.sum()) == 4.0
     assert float(result.deaths_age.max()) > 1.0
 
 
@@ -226,9 +228,9 @@ def test_deaths_leading_missing_days_are_nan(config: PreprocessingConfig, method
             "deaths": [np.nan, np.nan, 3.0, np.nan, 4.0, 2.0],
         }
     )
-    smoothed = proc._apply_kalman_smoothing(daily_df)
+    smoothed = proc._fill_gaps(daily_df)
     assert smoothed["deaths"].iloc[:2].isna().all()
-    assert smoothed["deaths_missing_flag"].iloc[:2].tolist() == [2.0, 2.0]
+    assert smoothed["deaths_observed"].iloc[:2].tolist() == [0.0, 0.0]
     assert np.isfinite(smoothed["deaths"].iloc[2:]).all()
     result = proc._create_mask_and_age_channels(smoothed)
     assert result["deaths_mask"].iloc[:2].tolist() == [0.0, 0.0]

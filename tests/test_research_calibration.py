@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats
 
 from evaluation.research_calibration import (
     HEADS,
@@ -47,6 +48,8 @@ def calibration():
 def test_calibration_artifact_roundtrip_and_out_of_fit_evaluation(
     calibration, manifest
 ):
+    # Targets cannot be negative; shift the frame so no quantile is clipped.
+    calibration[["observed", "distribution_loc"]] += 20.0
     calibration["interval_low_95"] = -999.0
     calibration["interval_high_95"] = 999.0
     artifact = fit_research_calibrators(
@@ -56,7 +59,12 @@ def test_calibration_artifact_roundtrip_and_out_of_fit_evaluation(
     assert artifact["heads"]["cases"]["C1"]["multiplier"] > 1
     selection = calibration.assign(role="selection", target_date="2020-10-29")
     rows, summary = score_research_calibrators(
-        selection, artifact, manifest, role="selection", checkpoint_sha256="a" * 64
+        selection,
+        artifact,
+        manifest,
+        role="selection",
+        checkpoint_sha256="a" * 64,
+        censored=False,
     )
     assert len(rows) == len(selection) * 3
     assert set(summary["controls"]) == {"C0", "C1", "C2"}
@@ -67,7 +75,7 @@ def test_calibration_artifact_roundtrip_and_out_of_fit_evaluation(
     )
     c0 = rows.loc[rows.control.eq("C0")]
     assert np.allclose(c0.calibrated_scale, 1.0)
-    assert (rows.distribution_loc == 0).all()
+    assert (rows.distribution_loc == 20).all()
     assert (rows.crps >= 0).all() and (rows.wis >= 0).all()
     assert rows.pit.between(0, 1).all()
     quantile_columns = sorted(c for c in rows if c.startswith("quantile_"))
@@ -97,6 +105,7 @@ def test_calibration_artifact_roundtrip_and_out_of_fit_evaluation(
             manifest,
             role="calibration",
             checkpoint_sha256="a" * 64,
+            censored=False,
         )
 
 
@@ -111,6 +120,7 @@ def test_student_calibration_scores_remain_finite(calibration, manifest):
         manifest,
         role="selection",
         checkpoint_sha256="a" * 64,
+        censored=False,
     )
     assert np.isfinite(rows[["wis", "crps", "nll", "pit"]].to_numpy()).all()
 
@@ -158,13 +168,23 @@ def test_calibration_rejects_changed_artifacts_and_checkpoint(calibration, manif
     selection = calibration.assign(role="selection", target_date="2020-10-29")
     with pytest.raises(ValueError, match="checkpoint or protocol"):
         score_research_calibrators(
-            selection, artifact, manifest, role="selection", checkpoint_sha256="b" * 64
+            selection,
+            artifact,
+            manifest,
+            role="selection",
+            checkpoint_sha256="b" * 64,
+            censored=False,
         )
     changed = copy.deepcopy(artifact)
     changed["heads"]["cases"]["C1"]["multiplier"] = 100
     with pytest.raises(ValueError, match="integrity"):
         score_research_calibrators(
-            selection, changed, manifest, role="selection", checkpoint_sha256="a" * 64
+            selection,
+            changed,
+            manifest,
+            role="selection",
+            checkpoint_sha256="a" * 64,
+            censored=False,
         )
 
 
@@ -179,7 +199,12 @@ def test_research_event_artifacts_use_fit_thresholds_and_frozen_operating_rules(
     )
     selection = calibration.assign(role="selection", target_date="2020-10-29")
     scored, _ = score_research_calibrators(
-        selection, artifact, manifest, role="selection", checkpoint_sha256="a" * 64
+        selection,
+        artifact,
+        manifest,
+        role="selection",
+        checkpoint_sha256="a" * 64,
+        censored=False,
     )
     fit = pd.DataFrame(
         {
@@ -265,3 +290,53 @@ def test_pipeline_writes_all_canonical_research_artifacts(
     assert set(scores.control) == {"C0", "C1", "C2"}
     events = json.loads((output / "research_events.json").read_text())
     assert events["hospitalizations"]["status"] == "unsupported"
+
+
+def test_censored_calibration_scores_zero_as_probability_mass(calibration, manifest):
+    # Quiet rows hold the latent location below zero and observe zero.
+    quiet = calibration.region_id.astype(int) % 2 == 0
+    calibration["distribution_loc"] = np.where(quiet, -2.0, 1.0)
+    calibration["observed"] = np.where(quiet, 0.0, 1.5)
+    artifact = fit_research_calibrators(
+        calibration, manifest, checkpoint_sha256="a" * 64
+    )
+    # Every clipped interval covers the zeros, so only the positive rows
+    # (0.5 scale units from the location) set the 80% multiplier.
+    assert artifact["heads"]["cases"]["C1"]["multiplier"] == pytest.approx(
+        0.5 / stats.norm.ppf(0.9)
+    )
+    rows, summary = score_research_calibrators(
+        calibration.assign(role="selection", target_date="2020-10-29"),
+        artifact,
+        manifest,
+        role="selection",
+        checkpoint_sha256="a" * 64,
+        censored=True,
+    )
+    assert summary["censored"] is True
+    c0 = rows.loc[rows.control.eq("C0")]
+    zeros, positive = c0.loc[c0.observed.eq(0)], c0.loc[c0.observed.gt(0)]
+    mass = stats.norm.cdf(2.0)
+    assert np.allclose(zeros.nll, -np.log(mass))
+    assert (zeros.prediction == 0).all() and (zeros.absolute_error == 0).all()
+    assert zeros.pit.between(0, mass).all() and zeros.pit.nunique() > 1
+    assert zeros.covered_80.all()
+    assert np.allclose(positive.nll, 0.125 + 0.5 * np.log(2 * np.pi))
+    assert np.allclose(positive.pit, stats.norm.cdf(0.5))
+    assert np.allclose(positive.prediction, 1.0)
+
+
+def test_censored_calibration_rejects_student_t(calibration, manifest):
+    calibration["distribution_family"] = "student_t"
+    artifact = fit_research_calibrators(
+        calibration, manifest, checkpoint_sha256="a" * 64
+    )
+    with pytest.raises(ValueError, match="normal family"):
+        score_research_calibrators(
+            calibration.assign(role="selection", target_date="2020-10-29"),
+            artifact,
+            manifest,
+            role="selection",
+            checkpoint_sha256="a" * 64,
+            censored=True,
+        )

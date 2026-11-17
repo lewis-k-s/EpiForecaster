@@ -2,8 +2,8 @@
 Processor for Catalonia COVID-19 deaths data from pre-aggregated municipality CSV files.
 
 This module handles the conversion of deaths data from municipality-level
-data (pre-aggregated by polygon overlap), including Kalman smoothing on a
-daily grid while preserving an observation mask for true measurement days.
+data (pre-aggregated by polygon overlap) to a daily grid. Days without a
+record inside the registry's date span are observed zeros.
 """
 
 from pathlib import Path
@@ -13,7 +13,7 @@ import pandas as pd
 import xarray as xr
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from ..smoothing import KalmanSmoother, fit_kalman_params
+from ..smoothing import fill_clinical_gaps
 
 
 class DeathsProcessor:
@@ -89,80 +89,26 @@ class DeathsProcessor:
 
         return aggregated
 
-    def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
-        """Filter deaths time series and interpolate missing days per municipality."""
-        print("  Applying Kalman smoothing to deaths...")
-
-        fallback_process = float(
-            self.config.validation_options.get("process_var", 0.05)
+    def _fill_gaps(self, daily_df: pd.DataFrame) -> pd.DataFrame:
+        """Fill unobserved days causally; every finite count is an observation."""
+        method = self.config.smoothing.clinical_method
+        print(f"  Filling unobserved death days (method={method})...")
+        return fill_clinical_gaps(
+            daily_df,
+            "deaths",
+            self.config.smoothing,
+            fallback_process_var=float(
+                self.config.validation_options.get("process_var", 0.05)
+            ),
+            fallback_measurement_var=float(
+                self.config.validation_options.get("measurement_var", 0.5)
+            ),
         )
-        fallback_measure = float(
-            self.config.validation_options.get("measurement_var", 0.5)
-        )
-
-        smoothed_records: list[dict[str, object]] = []
-        for muni_code in daily_df["municipality_code"].unique():
-            muni_data = daily_df[daily_df["municipality_code"] == muni_code].copy()
-            muni_data = muni_data.set_index("date").sort_index()
-
-            # Preserve true observation mask before smoothing/interpolation.
-            observed = muni_data["deaths"].notna().to_numpy()
-            values = muni_data["deaths"].to_numpy()
-
-            fit_series = pd.Series(values, index=muni_data.index).where(lambda s: s > 0)
-            process_var = fallback_process
-            measurement_var = fallback_measure
-            if self.config.smoothing.parameter_fit_mode == "per_series":
-                try:
-                    process_var, measurement_var = fit_kalman_params(
-                        fit_series,
-                        fit_end_date=self.config.smoothing.parameter_fit_end_date,
-                    )
-                except Exception as e:
-                    print(
-                        f"    ! Falling back to configured variances for {muni_code}: {e}"
-                    )
-
-            kf = KalmanSmoother(
-                process_var=process_var,
-                measurement_var=measurement_var,
-            )
-            filtered_values, flags = kf.filter_series(values)
-
-            # Preserve recorded values at observed timesteps; use filtered values for gaps.
-            for i, date in enumerate(muni_data.index):
-                filtered_value = float(np.exp(filtered_values[i]))
-                death_value = float(values[i]) if observed[i] else filtered_value
-                smoothed_records.append(
-                    {
-                        "date": date,
-                        "municipality_code": muni_code,
-                        "deaths": death_value,
-                        "deaths_missing_flag": float(flags[i]),
-                        "deaths_observed": float(observed[i]),
-                    }
-                )
-
-        smoothed_df = pd.DataFrame(smoothed_records)
-        non_finite = (~np.isfinite(smoothed_df["deaths"])).sum()
-        if non_finite > 0:
-            print(f"  Warning: {non_finite} non-finite values after deaths smoothing")
-            smoothed_df["deaths"] = smoothed_df["deaths"].replace(
-                [np.inf, -np.inf], np.nan
-            )
-
-        print(
-            f"  Smoothing complete for {smoothed_df['municipality_code'].nunique()} municipalities"
-        )
-        return smoothed_df
 
     def _create_mask_and_age_channels(self, daily_df: pd.DataFrame) -> pd.DataFrame:
         """Create deaths mask and age channels from observation availability."""
         daily_df = daily_df.copy()
-        if "deaths_observed" in daily_df.columns:
-            daily_df["deaths_mask"] = (daily_df["deaths_observed"] > 0.5).astype(float)
-        else:
-            daily_df["deaths_mask"] = daily_df["deaths"].notna().astype(float)
+        daily_df["deaths_mask"] = (daily_df["deaths_observed"] > 0.5).astype(float)
 
         age_series_list = []
         for muni_code in daily_df["municipality_code"].unique():
@@ -239,13 +185,16 @@ class DeathsProcessor:
         # Aggregate to municipality-day
         muni_deaths = self._aggregate_to_municipality_day(deaths_df)
 
-        # Create sparse pivot (NaN where unobserved)
+        # The registry lists deaths only. Inside its date span a day without a
+        # record is an observed zero; days outside the span are unobserved.
         pivot = muni_deaths.pivot_table(
             index="date",
             columns="municipality_code",
             values="deaths",
             aggfunc="first",
         )
+        source_span = pd.date_range(pivot.index.min(), pivot.index.max(), freq="D")
+        pivot = pivot.reindex(source_span).fillna(0.0)
 
         # Reindex to complete date range
         date_range = pd.date_range(
@@ -264,7 +213,7 @@ class DeathsProcessor:
             value_name="deaths",
         )
 
-        daily_df = self._apply_kalman_smoothing(daily_df)
+        daily_df = self._fill_gaps(daily_df)
 
         daily_df = self._create_mask_and_age_channels(daily_df)
 

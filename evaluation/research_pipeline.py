@@ -109,6 +109,7 @@ def write_research_outputs(
         manifest,
         role="selection",
         checkpoint_sha256=checkpoint_sha256,
+        censored=config.model.observation_heads.censored_location,
     )
     events, event_summary = score_research_events(
         fit_cases, calibration, scored, artifact, manifest

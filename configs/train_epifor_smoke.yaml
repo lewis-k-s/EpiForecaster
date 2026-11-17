@@ -2,7 +2,7 @@
 # through the immutable Snakemake workflow.
 
 data:
-  dataset_path: data/processed/real_with_id.zarr.zip
+  dataset_path: data/processed/real_with_id_v2.zarr.zip
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_min_flow_raw: 10.0
@@ -41,6 +41,8 @@ model:
       mortality_min: 0.0001
       mortality_max: 0.05
       residual_clip: 10000.0
+    observation_heads:
+      censored_location: true
 
 output:
   experiment_name: local_smoke
@@ -79,7 +81,7 @@ training:
   loss:
     name: joint_inference
     joint:
-      observation_loss: nll
+      observation_loss: wis
       adaptive_scheme: none
       gradnorm_obs_weight_sum: 0.95
       gradnorm_update_every: 16

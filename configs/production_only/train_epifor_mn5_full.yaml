@@ -1,7 +1,7 @@
 env: "mn5"
 
 data:
-  dataset_path: data/processed/real_with_id.zarr.zip
+  dataset_path: data/processed/real_with_id_v2.zarr.zip
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_min_flow_raw: 10.0
@@ -50,6 +50,13 @@ model:
       residual_clip: 10000.0
     observation_heads:
       delta_forecasting: true
+      #-- scale floors (campaigns scale_floor_v1/v2, runs scale-floor-v*-20261116) --#
+      #-- constant on every head; cases also get 0.2 of one count, log1p(1e5/N) --#
+      distribution_scale_floor: 0.05
+      count_step_scale_floor_cases: 0.2
+      #-- Normal censored at zero, location free below zero, trained on the --#
+      #-- zero-clipped WIS (campaign censored_likelihood_v1, run censored-likelihood-v1-20261116) --#
+      censored_location: true
 
 output:
   experiment_name: mn5_epiforecaster
@@ -122,6 +129,6 @@ training:
   loss:
     name: "joint_inference"
     joint:
-      observation_loss: nll
+      observation_loss: wis
       latent:
         total_weight: 0.0

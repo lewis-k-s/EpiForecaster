@@ -12,10 +12,16 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 import pandas as pd
+import torch
 from scipy import optimize, stats
 from sklearn.metrics import average_precision_score
 
-from evaluation.distribution_scores import WIS_INTERVAL_LEVELS, standard_wis_half_widths
+from evaluation.distribution_scores import (
+    TARGET_LOWER_BOUND,
+    WIS_INTERVAL_LEVELS,
+    distribution_wis,
+    standard_wis_half_widths,
+)
 
 
 @dataclass(frozen=True)
@@ -260,28 +266,27 @@ def fit_scale_multiplier(
         raise ValueError("Scale multiplier bounds must be finite and positive")
     quantiles = np.asarray(standard_wis_half_widths(family, df))
     if objective == "coverage_80":
-        standardized = np.abs(target - loc) / scale
+        # Intervals are clipped at the target lower bound, so a target on the
+        # bound is covered once the lower end reaches it.
+        miss = np.where(
+            target <= TARGET_LOWER_BOUND,
+            np.maximum(loc - TARGET_LOWER_BOUND, 0.0),
+            np.abs(target - loc),
+        )
+        standardized = miss / scale
         raw = float(
             np.quantile(standardized, 0.8, method="higher")
             / quantiles[WIS_INTERVAL_LEVELS.index(0.8)]
         )
         multiplier = float(np.clip(raw, *bounds))
     elif objective == "wis":
-        alpha = 1 - np.asarray(WIS_INTERVAL_LEVELS)
-        errors = np.abs(target - loc)
+        loc_t, scale_t, target_t, widths = (
+            torch.as_tensor(x) for x in (loc, scale, target, quantiles)
+        )
 
         def score(multiplier: float) -> float:
-            width = multiplier * scale[:, None] * quantiles
             return float(
-                np.mean(
-                    (
-                        0.5 * errors
-                        + (alpha * width + np.maximum(errors[:, None] - width, 0)).sum(
-                            1
-                        )
-                    )
-                    / (len(quantiles) + 0.5)
-                )
+                distribution_wis(loc_t, multiplier * scale_t, target_t, widths).mean()
             )
 
         fit = optimize.minimize_scalar(score, bounds=bounds, method="bounded")

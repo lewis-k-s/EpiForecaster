@@ -51,6 +51,7 @@ def evidence(tmp_path):
         manifest,
         role="selection",
         checkpoint_sha256=CHECKPOINT_HASH,
+        censored=False,
     )
     fit = pd.DataFrame(
         {

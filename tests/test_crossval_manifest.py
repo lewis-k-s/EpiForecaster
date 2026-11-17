@@ -58,6 +58,33 @@ def test_load_crossval_manifest_validates_exact_once_coverage(
     assert manifest.split_seed == 42
 
 
+def test_manifest_region_sets_must_be_assigned_regions(tmp_path: Path) -> None:
+    region_ids = ["a", "b", "c", "d"]
+    path = tmp_path / "manifest.json"
+    _write_manifest(path, region_ids=region_ids, folds=[["a", "c"], ["b", "d"]])
+    payload = json.loads(path.read_text())
+    payload["region_sets"] = {"base": ["a", "b"]}
+    path.write_text(json.dumps(payload))
+
+    manifest = load_crossval_fold_manifest(
+        path,
+        valid_region_ids=region_ids,
+        expected_num_folds=2,
+        expected_run_id="real",
+    )
+    assert manifest.region_sets == {"base": frozenset({"a", "b"})}
+
+    payload["region_sets"] = {"base": ["a", "z"]}
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="outside the folds"):
+        load_crossval_fold_manifest(
+            path,
+            valid_region_ids=region_ids,
+            expected_num_folds=2,
+            expected_run_id="real",
+        )
+
+
 def test_load_crossval_manifest_rejects_duplicate_assignment(
     tmp_path: Path,
 ) -> None:

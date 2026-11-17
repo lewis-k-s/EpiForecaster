@@ -137,8 +137,8 @@ class TestResampleWeeklyToDaily:
         # Check both municipalities are present
         assert set(daily_df["municipality_code"].unique()) == {"08019", "08021"}
 
-    def test_resample_gap_between_weeks(self, mock_config):
-        """Test resampling handles gaps between weeks."""
+    def test_resample_marks_weeks_without_rows_as_observed_zero(self, mock_config):
+        """Weeks without a row inside the source span are observed zeros."""
         proc = HospitalizationsProcessor(mock_config)
 
         # Non-consecutive weeks
@@ -153,19 +153,28 @@ class TestResampleWeeklyToDaily:
             }
         )
 
-        daily_df = proc._resample_weekly_to_daily(weekly_data)
+        daily_df = proc._resample_weekly_to_daily(weekly_data).set_index("date")
 
-        # Should have 22 days (Jan 3-23 and Jan 24-30)
+        # Jan 3-24 inclusive
         assert len(daily_df) == 22
 
-        # Only 2 observations
-        assert daily_df["hospitalizations"].notna().sum() == 2
+        observed = daily_df["hospitalizations"].dropna()
+        assert observed.index.tolist() == list(
+            pd.date_range("2022-01-03", "2022-01-24", freq="7D")
+        )
+        assert observed.tolist() == [7.0, 0.0, 0.0, 14.0]
 
-        # Gap days should be NaN
-        gap_days = daily_df[
-            (daily_df["date"] >= "2022-01-10") & (daily_df["date"] <= "2022-01-23")
-        ]
-        assert gap_days["hospitalizations"].isna().all()
+    def test_resample_rejects_report_dates_off_the_weekly_grid(self, mock_config):
+        proc = HospitalizationsProcessor(mock_config)
+        weekly_data = pd.DataFrame(
+            {
+                "week_start": [pd.Timestamp("2022-01-03"), pd.Timestamp("2022-01-12")],
+                "municipality_code": ["08019", "08019"],
+                "hospitalizations": [7.0, 14.0],
+            }
+        )
+        with pytest.raises(ValueError, match="7-day grid"):
+            proc._resample_weekly_to_daily(weekly_data)
 
 
 class TestKalmanSmoothing:
@@ -200,7 +209,7 @@ class TestKalmanSmoothing:
             }
         )
 
-        smoothed = proc._apply_kalman_smoothing(daily_df)
+        smoothed = proc._fill_gaps(daily_df)
 
         # All values should be finite after smoothing
         assert smoothed["hospitalizations"].notna().all()
@@ -238,7 +247,7 @@ class TestKalmanSmoothing:
             }
         )
 
-        smoothed = proc._apply_kalman_smoothing(daily_df)
+        smoothed = proc._fill_gaps(daily_df)
 
         # Smoothed values should follow the trend
         # Gap between 10 and 20 should have intermediate values
@@ -260,14 +269,13 @@ class TestKalmanSmoothing:
             }
         )
 
-        smoothed = proc._apply_kalman_smoothing(daily_df)
+        smoothed = proc._fill_gaps(daily_df)
         enriched = proc._create_mask_and_age_channels(smoothed)
         assert smoothed["hospitalizations"].notna().all()
         assert smoothed.iloc[0]["hospitalizations"] == pytest.approx(10.0)
         assert smoothed.iloc[3]["hospitalizations"] == pytest.approx(12.0)
         assert smoothed.iloc[5]["hospitalizations"] == pytest.approx(14.0)
         assert smoothed.iloc[6]["hospitalizations"] == pytest.approx(15.0)
-        assert "missing_flag" in smoothed.columns
         assert enriched["hospitalizations_mask"].tolist() == [
             1.0,
             0.0,
@@ -294,7 +302,7 @@ class TestKalmanSmoothing:
         )
 
         # Should not raise an error
-        smoothed = proc._apply_kalman_smoothing(daily_df)
+        smoothed = proc._fill_gaps(daily_df)
 
         assert not smoothed.empty
         assert "hospitalizations" in smoothed.columns
@@ -312,7 +320,7 @@ class TestKalmanSmoothing:
             }
         )
 
-        smoothed = proc._apply_kalman_smoothing(daily_df)
+        smoothed = proc._fill_gaps(daily_df)
 
         # Should process both municipalities
         assert smoothed["municipality_code"].nunique() == 2
@@ -465,7 +473,7 @@ class TestFullPipeline:
         assert result["hospitalizations"].sizes["region_id"] == 0
 
 
-@pytest.mark.parametrize("method", ["kalman_v2", "holt_damped"])
+@pytest.mark.parametrize("method", ["locf", "kalman_v2", "holt_damped"])
 def test_hospitalizations_leading_missing_days_are_nan(mock_config, method):
     mock_config.smoothing.clinical_method = method
     proc = HospitalizationsProcessor(mock_config)
@@ -474,9 +482,27 @@ def test_hospitalizations_leading_missing_days_are_nan(mock_config, method):
     daily_df = pd.DataFrame(
         {"date": dates, "municipality_code": "08019", "hospitalizations": values}
     )
-    smoothed = proc._apply_kalman_smoothing(daily_df)
+    smoothed = proc._fill_gaps(daily_df)
     assert smoothed["hospitalizations"].iloc[:5].isna().all()
-    assert smoothed["missing_flag"].iloc[:5].tolist() == [2] * 5
+    assert smoothed["hospitalizations_observed"].iloc[:5].tolist() == [0.0] * 5
     assert np.isfinite(smoothed["hospitalizations"].iloc[5:]).all()
     result = proc._create_mask_and_age_channels(smoothed)
     assert result["hospitalizations_mask"].iloc[:5].tolist() == [0.0] * 5
+
+
+def test_hospitalizations_locf_repeats_the_weekly_total_until_the_next_report(
+    mock_config,
+):
+    mock_config.smoothing.clinical_method = "locf"
+    proc = HospitalizationsProcessor(mock_config)
+    values = [10.0] + [np.nan] * 6 + [0.0] + [np.nan] * 6 + [4.0]
+    daily_df = pd.DataFrame(
+        {
+            "date": pd.date_range("2022-01-03", periods=15),
+            "municipality_code": "08019",
+            "hospitalizations": values,
+        }
+    )
+    filled = proc._fill_gaps(daily_df)
+    assert filled["hospitalizations"].tolist() == [10.0] * 7 + [0.0] * 7 + [4.0]
+    assert filled["hospitalizations_observed"].sum() == 3.0
