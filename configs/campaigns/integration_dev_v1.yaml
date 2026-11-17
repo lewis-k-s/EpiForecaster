@@ -4,7 +4,20 @@ stage: ablation
 hypothesis: Development screen of mechanistic integration variants on the base-config seed-42 node split. It has no cross-validation folds, so it is development evidence and cannot support model-selection claims.
 base_config: configs/production_only/train_epifor_mn5_full.yaml
 baseline_condition: real-base
-fixed_overrides: {}
+# The campaign ran (idev-campaign-a-20261115) before the 280-target dataset,
+# the production scale floors and the censored WIS objective; pin all three.
+fixed_overrides:
+  data:
+    dataset_path: data/processed/real_with_id.zarr.zip
+  model:
+    observation_heads:
+      distribution_scale_floor: 0.001
+      count_step_scale_floor_cases: 0.0
+      censored_location: false
+  training:
+    loss:
+      joint:
+        observation_loss: nll
 smoke_overrides:
   training:
     compile: false
