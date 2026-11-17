@@ -325,6 +325,39 @@ def _two_condition_runs(tmp_path: Path):
     return campaign, {"baseline": baseline, "mobility:off": candidate}
 
 
+def test_manifest_region_sets_add_paired_stratum_tables(tmp_path: Path) -> None:
+    campaign, runs = _two_condition_runs(tmp_path)
+    manifest_path = tmp_path / "splits.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["region_sets"] = {"base": ["r0"], "added": ["r1"]}
+    manifest_path.write_text(json.dumps(manifest))
+    for condition, condition_runs in runs.items():
+        offset = 0.0 if condition == "baseline" else 0.25
+        for run in condition_runs:
+            path = run.run_dir / "test_main_model_aggregate_metrics.csv"
+            table = pd.read_csv(path)
+            # Each fold holds one region, so the other set has no support.
+            holds_base = run.fold == 0
+            table["region_set_base_mean_target_wis"] = (
+                1.0 + offset if holds_base else np.nan
+            )
+            table["region_set_added_mean_target_wis"] = (
+                np.nan if holds_base else 2.0 + 2 * offset
+            )
+            table.to_csv(path, index=False)
+
+    outputs = build_probabilistic_campaign_outputs(campaign, runs)
+
+    summary = outputs["region_set_summary"].set_index("region_set")
+    assert summary.loc["base", "mean_target_wis_delta_mean"] == pytest.approx(0.25)
+    assert summary.loc["added", "mean_target_wis_delta_mean"] == pytest.approx(0.5)
+    assert summary.loc["base", "fold_seed_pairs"] == 1
+    assert summary.loc["base", "fold_seed_pairs_without_support"] == 1
+    assert summary.loc["added", "region_seed_pairs"] == 1
+    assert summary.loc["added", "worsened_region_fraction"] == 1.0
+    assert len(outputs["paired_fold_seed_region_set_deltas"]) == 4
+
+
 @pytest.mark.parametrize(
     ("column", "bad_value"),
     [

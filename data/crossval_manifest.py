@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,13 +12,57 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class CrossvalFoldManifest:
-    """Validated, exactly-once region membership for cross-validation folds."""
+    """Validated, exactly-once region membership for cross-validation folds.
+
+    ``region_sets`` are named, static subsets of the assigned regions. They
+    stratify held-out evaluation and can limit the training population.
+    """
 
     path: Path
     folds: tuple[tuple[str, ...], ...]
     region_id_hash: str
     run_id: str
     split_seed: int
+    region_sets: dict[str, frozenset[str]]
+
+
+_REGION_SET_NAME = re.compile(r"[a-z0-9][a-z0-9_]*")
+
+
+def parse_region_sets(
+    payload: dict, *, assigned_region_ids: set[str]
+) -> dict[str, frozenset[str]]:
+    """Validate a manifest's optional ``region_sets`` mapping."""
+    raw = payload.get("region_sets", {})
+    if not isinstance(raw, dict):
+        raise ValueError("Cross-validation manifest 'region_sets' must be a mapping")
+    region_sets: dict[str, frozenset[str]] = {}
+    for name, members in raw.items():
+        if not isinstance(name, str) or _REGION_SET_NAME.fullmatch(name) is None:
+            raise ValueError(f"Invalid region set name: {name!r}")
+        if not isinstance(members, list) or not members:
+            raise ValueError(f"Region set {name!r} must be a non-empty list")
+        member_ids = [str(region_id) for region_id in members]
+        if len(set(member_ids)) != len(member_ids):
+            raise ValueError(f"Region set {name!r} repeats a region")
+        unknown = sorted(set(member_ids) - assigned_region_ids)
+        if unknown:
+            raise ValueError(
+                f"Region set {name!r} has regions outside the folds: {unknown[:5]}"
+            )
+        region_sets[name] = frozenset(member_ids)
+    return region_sets
+
+
+def load_manifest_region_sets(path: Path) -> dict[str, frozenset[str]]:
+    """Read the validated region sets of a persisted manifest."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assigned = {
+        str(region_id)
+        for entry in payload.get("folds", [])
+        for region_id in entry["region_ids"]
+    }
+    return parse_region_sets(payload, assigned_region_ids=assigned)
 
 
 def hash_region_ids(region_ids: list[str]) -> str:
@@ -121,4 +166,5 @@ def load_crossval_fold_manifest(
         region_id_hash=manifest_hash,
         run_id=run_id,
         split_seed=int(payload["split_seed"]),
+        region_sets=parse_region_sets(payload, assigned_region_ids=assigned_set),
     )

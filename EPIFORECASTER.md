@@ -82,8 +82,10 @@ current batch. The observation weights \(\alpha_h\) sum to
 Each observation head emits a predictive location \(\mu\) and positive scale
 \(\sigma\). Clinical targets use `log1p(per-100k)`; wastewater uses
 `log1p(concentration)`. Existing wastewater metric keys retain the legacy
-`log1p_per_100k` suffix. Production training uses Normal
-negative log likelihood:
+`log1p_per_100k` suffix. Production training uses the zero-clipped WIS on a
+Normal censored at zero (`observation_loss: wis`, `censored_location: true`;
+campaign `censored_likelihood_v1`). The Normal negative log likelihood is the
+objective of synthetic pretraining and the former production default:
 
 $$
 L_{\mathrm{NLL}}(y,\mu,\sigma)
@@ -124,8 +126,46 @@ Research campaigns set `training.selection_metric=mean_target_wis` and declare
 non-finite required score and invalid observed predictions; it cannot fall back
 to a different metric. General training retains `selection_metric=auto`.
 Canonical per-head aggregates include WIS, CRPS, NLL, interval coverage/width,
-and validity counts. Granular schema 4 retains distribution parameters, WIS,
+and validity counts. Granular schema 5 retains distribution parameters, WIS,
 and observation support for later calibration and event evaluation.
+
+Targets are `log1p` values and cannot be negative, so WIS and the central
+intervals use every forecast quantile clipped at zero, $\max(q, 0)$. This scores
+the forecast censored at zero: interval mass below zero is not counted as
+width, and the point of the WIS median term is $\max(\mu, 0)$. Interval bounds,
+widths and coverage in the summaries and granular rows are the clipped ones
+(granular schema 5; schema 4 and earlier hold unclipped values and are not
+comparable). The WIS training objective uses the same definition. NLL and CRPS
+are the scores of the unclipped distribution unless the head is censored.
+
+`model.observation_heads.censored_location: true` makes every head a Normal
+censored at zero. The anchored location is no longer clamped: `dist_<head>_loc`
+is the latent location and may be negative, which is how a head states a
+probability of zero above one half, and `pred_<head>` is the censored median
+$\max(\mu, 0)$. NLL scores an observed zero by its probability mass,
+$-\log\Phi(-\mu/\sigma)$, and a positive value by the Normal density; CRPS is the
+closed form for a point mass on the lower bound. Both apply to the `nll` and
+`crps` training objectives and to the evaluation summaries, so their values are
+not comparable with an uncensored run; compare such runs on WIS. The setting
+requires the normal family. `mechanistic_<head>` and `residual_<head>` stay the
+decomposition of the point prediction. Research calibration receives the
+setting and scores NLL, CRPS and the point error of the censored distribution;
+the PIT of an observed zero is drawn uniformly on its probability mass (seeded
+randomized PIT). Its 80% coverage multiplier treats a target on the bound as
+covered once the clipped lower end reaches it.
+
+Every head's scale is a softplus plus `model.observation_heads.distribution_scale_floor`.
+The floor is the only bound on the Normal density of an observed zero: an
+anchored location sits exactly on the zero clamp, so a collapsed scale earns
+$\log\sigma$ on each zero and pays $(y/\sigma)^2/2$ on the next count. One count
+in a region of $N$ residents is $\log(1 + 10^5/N)$ in target space (3.5 at
+$N=3000$, 0.7 at $N=10^5$), so
+`count_step_scale_floor_<head>` (`hosp`, `cases`, `deaths`; default 0) raises the
+floor to $\max(\text{floor},\, f \log(1 + 10^5/N))$. A zero forecast then misses a
+single count by at most $1/f$ standard deviations in every region. The setting
+assumes integer counts of the target region: in `real_with_id_v2` only cases
+qualify, because hospitalizations and deaths are allocated fractions. The
+`scale_floor_count_<head>` validity count still refers to the constant floor.
 
 ### Observation weighting and supervision
 
@@ -153,9 +193,9 @@ GradNorm is available only with non-negative observation objectives because its
 relative training-rate calculation assumes non-negative task losses. The
 paired ablation registry therefore compares:
 
-* `baseline`: Normal NLL with fixed weighting;
-* `loss:crps`: Normal CRPS with fixed weighting;
-* `gradnorm:crps`: Normal CRPS with adaptive GradNorm weighting.
+* `baseline`: zero-clipped WIS on the censored Normal with fixed weighting;
+* `loss:crps`: censored Normal CRPS with fixed weighting;
+* `gradnorm:crps`: censored Normal CRPS with adaptive GradNorm weighting.
 
 Synthetic runs may additionally provide dense SIRHD compartment targets.
 `training.loss.joint.latent.total_weight` controls this regularizer. The five
@@ -359,7 +399,8 @@ uv run python -m dataviz.mobility_processing_qc \
 ### Representative cross-validation splits
 
 Production cross-validation uses the persisted, exactly-once 10-fold membership
-in
+in `configs/crossval/representative_10fold_pop3000.json` (280 targets of
+`real_with_id_v2`, see below), which extends the 161-target
 `configs/crossval/representative_10fold_mobility_refined.json`. The manifest
 fixes fold identity independently of `training.seed`; `training.split_seed`
 only controls generated non-manifest splits. Manifest loading rejects version,
@@ -388,6 +429,30 @@ uv run python -m dataviz.split_mobility_cut \
   --balance-audit outputs/reports/split_mobility_cut/balance_audit.csv \
   --output outputs/reports/split_mobility_cut/split_mobility_cut.png
 ```
+
+### Population-floor targets and region sets
+
+`real_with_id_v2` selects target regions by a static population floor
+(`valid_target_min_population: 3000`, 280 municipalities) instead of case
+density, so target membership does not depend on outcomes. Its manifest,
+`configs/crossval/representative_10fold_pop3000.json`, is built by
+`scripts/analysis/extend_crossval_manifest.py`: the 161 former targets keep
+their representative folds, and each added region joins the fold of the
+former targets that share its wastewater plant (comarca mates second), with
+balanced fold sizes. `diagnostics.extension.cross_fold_pairs` counts the twin
+pairs that remain split across folds.
+
+A manifest may declare `region_sets`, named static subsets of its regions
+(`base`, `added`, and population bins `pop_lt_5k`, `pop_5k_20k`,
+`pop_20k_100k`, `pop_ge_100k`). Test evaluation adds
+`region_set_<name>_*` probabilistic metrics and a
+`region_set_<name>_mean_target_wis` endpoint for each set (NaN when a head has
+no support in that set), and the aggregate table carries them per head.
+`training.crossval_region_set: <name>` limits training and validation regions
+to one set while every fold region stays in the test role, so models trained
+on different populations are scored on identical held-out support. Campaign
+analysis reports paired run-level and equal-region deltas per region set
+(`paired_fold_seed_region_set_deltas.csv`, `region_set_summary.csv`).
 
 ## 6. Input/Output Signature
 

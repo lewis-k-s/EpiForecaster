@@ -183,6 +183,66 @@ class TestEpiForecaster:
         with pytest.raises(ValueError, match="ww_source must be"):
             ObservationHeadConfig(ww_source="H", relevant_source_ww="H")
 
+    def test_count_step_scale_floor_applies_to_its_head_only(
+        self, basic_config, dummy_batch
+    ):
+        reference = EpiForecaster(**basic_config)
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            count_step_scale_floor_cases=0.2
+        )
+        model = EpiForecaster(**basic_config)
+        model.load_state_dict(reference.state_dict())
+        batch = dict(dummy_batch)
+        population = torch.linspace(2_000.0, 500_000.0, batch["hosp_hist"].shape[0])
+        batch["population"] = population
+
+        expected = self._forward(reference, batch)
+        out = self._forward(model, batch)
+
+        floor = 0.2 * torch.log1p(100_000.0 / population)
+        default_floor = ObservationHeadConfig().distribution_scale_floor
+        assert torch.allclose(
+            out["dist_cases_scale"],
+            expected["dist_cases_scale"] + (floor - default_floor).unsqueeze(-1),
+            atol=1e-5,
+        )
+        for head in ("hosp", "deaths", "ww"):
+            assert torch.equal(
+                out[f"dist_{head}_scale"], expected[f"dist_{head}_scale"]
+            )
+
+    def test_censored_location_separates_latent_from_point_prediction(
+        self, basic_config, dummy_batch
+    ):
+        reference = EpiForecaster(**basic_config)
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            censored_location=True
+        )
+        model = EpiForecaster(**basic_config)
+        model.load_state_dict(reference.state_dict())
+        # The deaths head is not anchored, so a constant residual moves its
+        # whole latent location below zero.
+        for candidate in (reference.eval(), model.eval()):
+            last = [
+                module
+                for module in candidate.deaths_head.residual_proj.modules()
+                if isinstance(module, torch.nn.Linear)
+            ][-1]
+            with torch.no_grad():
+                last.bias.fill_(-500.0)
+
+        expected = self._forward(reference, dummy_batch)
+        out = self._forward(model, dummy_batch)
+
+        assert (expected["dist_deaths_loc"] < 0).all()
+        assert torch.equal(out["dist_deaths_loc"], expected["dist_deaths_loc"])
+        assert torch.equal(expected["pred_deaths"], expected["dist_deaths_loc"])
+        assert torch.equal(out["pred_deaths"], torch.zeros_like(out["pred_deaths"]))
+        for head in ("ww", "hosp", "cases"):
+            assert torch.equal(
+                out[f"pred_{head}"], out[f"dist_{head}_loc"].clamp_min(0.0)
+            )
+
     def test_forward_basic(self, basic_config, dummy_batch):
         """Test forward pass with minimal features (cases only)."""
         model = EpiForecaster(**basic_config)

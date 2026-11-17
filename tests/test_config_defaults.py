@@ -31,6 +31,12 @@ def test_observation_head_defaults_and_source_validation() -> None:
     assert config.anchor_mode == "last_valid_step"
     assert config.distribution_scale_init == pytest.approx(0.3)
     assert config.distribution_scale_floor == pytest.approx(1e-3)
+    assert (
+        config.count_step_scale_floor_hosp,
+        config.count_step_scale_floor_cases,
+        config.count_step_scale_floor_deaths,
+    ) == (0.0, 0.0, 0.0)
+    assert config.censored_location is False
     assert config.relevant_source_mapping() == {
         "hosp": "hospitalization_flow",
         "ww": "I",
@@ -60,6 +66,13 @@ def test_observation_head_defaults_and_source_validation() -> None:
     ):
         with pytest.raises(ValueError, match=field):
             ObservationHeadConfig(**{field: value})
+    for field in (
+        "count_step_scale_floor_hosp",
+        "count_step_scale_floor_cases",
+        "count_step_scale_floor_deaths",
+    ):
+        with pytest.raises(ValueError, match=field):
+            ObservationHeadConfig(**{field: -0.1})
 
 
 @pytest.mark.epiforecaster

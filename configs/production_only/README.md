@@ -48,7 +48,7 @@
 - Invoked through `workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml`
 
 ### `preprocess_mn5_real.yaml`
-- Rebuilds the production real dataset `real_with_id` from the staged DVC
+- Rebuilds the production real dataset `real_with_id_v2` from the staged DVC
   directory `data/files/catalonia_real_raw_inputs_v1` and the dasymetric_mob
   promotion `data/files/dasymetric_mob_full-20261104b`
   (`mobility/mobility_catalonia.zarr`)

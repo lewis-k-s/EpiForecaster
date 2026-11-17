@@ -127,8 +127,8 @@ conditions:
 # Paired stochastic-training replicates: shared across all conditions within a fold.
 paired_model_seeds: [42, 43]
 cross_validation:
-  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
-  # Production estimates cover every manifest fold, so all 161 valid target regions
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
+  # Production estimates cover every manifest fold, so all 280 valid target regions
   # appear in the held-out test role exactly once per condition and model seed.
   fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   # The smoke subset exercises routing only and is scientifically ineligible.

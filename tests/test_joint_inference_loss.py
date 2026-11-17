@@ -784,6 +784,41 @@ def test_joint_inference_normal_nll_uses_distribution_params() -> None:
     assert components["total"].item() == pytest.approx(expected)
 
 
+def test_joint_inference_censored_nll_scores_zero_as_probability_mass() -> None:
+    loss_fn = JointInferenceLoss(
+        observation_loss="nll",
+        censored=True,
+        obs_weight_sum=1.0,
+        latent_total_weight=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.full((1, 3), 100.0),
+        "dist_ww_loc": torch.tensor([[-9.0, 0.0, 1.0]]),
+        "dist_ww_scale": torch.tensor([[1.0, 1.0, 2.0]]),
+    }
+    targets = {
+        "ww": torch.tensor([[0.0, 3.0]]),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.ones(1, 2),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+
+    # Observed zero: -log P(Y <= 0) = log 2 at loc 0. Observed 3: Normal density.
+    expected = (
+        math.log(2.0) + (0.5 + math.log(2.0) + 0.5 * math.log(2.0 * math.pi))
+    ) / 2.0
+    assert components["ww"].item() == pytest.approx(expected)
+
+
 def test_joint_inference_normal_nll_preserves_negative_values_and_gradient() -> None:
     loss_fn = JointInferenceLoss(
         observation_loss="nll",

@@ -13,7 +13,7 @@ workflow:
 dvc:
   targets:
     - data/files/mobility.zarr.zip.dvc
-    - data/processed/real_with_id.zarr.zip.dvc
+    - data/processed/real_with_id_v2.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 optuna:
