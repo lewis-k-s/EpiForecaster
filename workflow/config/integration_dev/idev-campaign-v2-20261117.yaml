@@ -1,0 +1,47 @@
+# Integration dev campaign v2 (configs/campaigns/integration_dev_v2.yaml): 8
+# conditions x 5 paired seeds = 40 identities on real_with_id_v2 with the
+# production defaults, packed as 8 workers on 4 GPUs (2 CUDA MPS clients per
+# GPU) in one 2 h acc_debug allocation.
+# Sizing: idev-campaign-a-20261115 ran 40 trials on 161 targets in 40 min;
+# history roll-forward trials took ~11 min, others 2-6 min. v2 has 280 targets
+# (~1.7x per epoch) and 20 history roll-forward trials instead of 10: about
+# 520 slot-minutes over 8 slots, ~70-80 min. Trials still running at close-out
+# finish within the 15 min signal lead; resubmitting the same run continues any
+# remaining identities.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: ablation
+  target: ablation
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id_v2.zarr.zip.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+ablation:
+  study_name: epiforecaster_integration_dev_v2
+  campaign: configs/campaigns/integration_dev_v2.yaml
+  workers: 8
+  closeout_signal_seconds: 900
+  timeout_s: 6300
+  sampler_seed: 42
+  smoketest: false
+  recover_stale_running: true
+  requeue_running: false
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 8
+    cpus_per_task: 10
+    gres: gpu:4
+    mps_clients_per_gpu: 2
+    runtime: 120
