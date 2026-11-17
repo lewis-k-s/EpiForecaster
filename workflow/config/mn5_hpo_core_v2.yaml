@@ -1,0 +1,46 @@
+# Core HPO on the v2 production defaults: real_with_id_v2 (280 targets),
+# censored WIS training, scale floors 0.05/0.2, selection on validation
+# mean_target_wis. The production head (d_model 128, 4 layers, dropout 0.162,
+# lr 5.52e-4, wd 5.94e-4) was chosen on the 161-target dataset under NLL
+# (studies epiforecaster_hpo_core_mps_debug_v3/v4) and was never tuned on v2.
+# The "core" space samples only learning rate, weight decay and head capacity;
+# the base config owns the rest.
+#
+# Packing matches idev-campaign-v2-20261117 (job 49134999): 8 workers on
+# 4 GPUs with 2 CUDA MPS clients each, base loaders (4 train, 2 val) on 10 CPUs.
+# There a 50-epoch production trial took ~8.8 min including ~4 min of setup
+# and compilation and the test evaluation that HPO skips; epochs ran at
+# ~4-5 s. Pruned trials stop at epoch 15 or later (~5-6 min). Ten trials per
+# worker fit timeout_s even if few are pruned and larger heads train slower.
+# A worker that times out with trials left fails the run; resubmitting the
+# same run resumes each worker's remaining trials from the journal.
+extends: mn5.yaml
+
+optuna:
+  study_name: epiforecaster_hpo_core_v2_v1
+  workers: 8
+  trials_per_worker: 10
+  # HPO has no close-out signal: stop new trials 15 min before the allocation
+  # ends (7200 - 900 s). A running trial finishes first.
+  timeout_s: 6300
+  epochs: 50
+  pruning_start_epoch: 15
+  # One completed trial per concurrent worker before pruning starts.
+  pruning_startup_trials: 8
+  search_space: core
+
+# Selection uses the validation split only. The test split stays untouched.
+evaluation:
+  split: val
+  granular: false
+
+resources:
+  allocation:
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 8
+    cpus_per_task: 10
+    gres: gpu:4
+    mps_clients_per_gpu: 2
+    runtime: 120
