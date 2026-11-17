@@ -389,6 +389,14 @@ about 0.4 GB/s from GPFS. Other jobs share the disk of an ACC node and can
 leave it nearly full (job 48640552 found 165 of 436 GB free for a 204 GB
 dataset and failed after four minutes of copying), so the copy checks the free
 space first and fails at once unless the large files fit with 16 GiB to spare.
+A check alone does not hold the space: two pretrains that started together on
+one 480 GB node both passed it, and one ran out of space after ten minutes of
+copying (jobs 49064430 and 49064484). Under a per-user node lock
+(`/scratch/tmp/epiforecaster-staging-<user>.lock`), the copy therefore checks
+the space and reserves the blocks of every large file with `posix_fallocate`
+before it copies any data. A job that cannot reserve its space releases what it
+reserved and fails within seconds; the copy of a job that has reserved cannot
+run out of space.
 Resubmit to get another node. The key includes the run config and data manifest. A
 lock protects construction; only a complete copy is published. All ranks and
 later stages mount this copy

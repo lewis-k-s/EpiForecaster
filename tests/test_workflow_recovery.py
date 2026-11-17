@@ -366,6 +366,7 @@ def _cache_environment(tmp_path):
         "SLURM_JOB_ID": "12345",
         "SLURM_PROCID": "0",
         "EPIFORECASTER_NODE_CACHE_ROOT": str(tmp_path / "cache"),
+        "EPIFORECASTER_NODE_STAGING_LOCK": str(tmp_path / "staging.lock"),
         "COPY_LOG": str(tmp_path / "copies"),
         "CAPTURE": str(tmp_path / "binds"),
         "FAIL_COPY": str(tmp_path / "fail-copy"),
