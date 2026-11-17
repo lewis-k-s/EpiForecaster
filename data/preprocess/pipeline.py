@@ -392,7 +392,7 @@ class OfflinePreprocessingPipeline:
         return df.set_index(REGION_COORD)["population"].to_xarray()
 
     def _compute_valid_targets_mask(self, aligned_dataset: xr.Dataset) -> xr.DataArray:
-        """Compute boolean mask for regions that meet minimum density threshold.
+        """Compute the target-region mask from population or case density.
 
         Args:
             aligned_dataset: Aligned dataset with cases data (run_id, date, region_id)
@@ -403,15 +403,39 @@ class OfflinePreprocessingPipeline:
         print("Computing valid_targets mask...")
 
         cases_da = aligned_dataset.cases
+        min_population = self.config.valid_target_min_population
+        if min_population is not None:
+            population = aligned_dataset["population"]
+            valid_mask = (
+                (population.fillna(0) >= min_population)
+                .broadcast_like(cases_da.isel(date=0, drop=True))
+                .transpose("run_id", REGION_COORD)
+            )
+            print(
+                f"  regions with population >= {min_population:g}: "
+                f"{int(valid_mask.sum())}/{valid_mask.size}"
+            )
+            return xr.DataArray(
+                valid_mask.values.astype(np.int32),
+                dims=["run_id", REGION_COORD],
+                coords={
+                    "run_id": cases_da["run_id"].values,
+                    REGION_COORD: cases_da[REGION_COORD].values,
+                },
+            )
         density_threshold = self.config.min_density_threshold
 
-        # Compute observed data density per (run_id, region). The cases value
-        # channel can contain causal smoother predictions in missing periods, so
-        # cases_mask is the source of truth for observed clinical coverage.
+        # Compute data density per (run_id, region). The cases value channel
+        # holds causal fills on unobserved days, so cases_mask is the source of
+        # truth for observed clinical coverage.
         if "cases_mask" in aligned_dataset:
             coverage_source = aligned_dataset["cases_mask"] > 0
         else:
             coverage_source = cases_da.notnull()
+        if self.config.valid_target_density_basis == "positive":
+            # Registry zeros are observations, so coverage alone does not
+            # separate active regions: count the days with a positive count.
+            coverage_source = coverage_source & (cases_da > 0)
 
         valid_count = coverage_source.sum(dim="date")
         total_per_region = cases_da["date"].size

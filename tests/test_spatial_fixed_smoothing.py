@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from data.preprocess import smoothing
 from data.preprocess.config import SmoothingConfig
 from data.preprocess.processors import (
     catalonia_cases_processor,
@@ -20,16 +21,16 @@ from data.preprocess.processors import (
         (
             catalonia_cases_processor,
             "CataloniaCasesProcessor",
-            "_apply_kalman_smoothing",
+            "_fill_gaps",
             "cases",
         ),
         (
             hospitalizations_processor,
             "HospitalizationsProcessor",
-            "_apply_kalman_smoothing",
+            "_fill_gaps",
             "hospitalizations",
         ),
-        (deaths_processor, "DeathsProcessor", "_apply_kalman_smoothing", "deaths"),
+        (deaths_processor, "DeathsProcessor", "_fill_gaps", "deaths"),
         (edar_processor, "EDARProcessor", "_apply_tobit_kalman", "total_covid_flow"),
     ],
 )
@@ -40,12 +41,13 @@ def test_fixed_smoothing_does_not_fit_source_parameters(
     method_name: str,
     value_column: str,
 ) -> None:
+    dates = pd.date_range("2020-05-01", periods=4)
     config = SimpleNamespace(
         smoothing=SmoothingConfig(parameter_fit_mode="fixed"),
         validation_options={"process_var": 0.05, "measurement_var": 0.5},
         censor_inflation=10.0,
+        end_date=dates[-1],
     )
-    dates = pd.date_range("2020-05-01", periods=4)
     data = pd.DataFrame({"date": dates, value_column: [1.0, 2.0, None, 4.0]})
     if module is edar_processor:
         data["edar_id"] = "edar-1"
@@ -57,7 +59,8 @@ def test_fixed_smoothing_does_not_fit_source_parameters(
     def reject_fit(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("fixed mode fitted held-out data")
 
-    monkeypatch.setattr(module, "fit_kalman_params", reject_fit)
+    fit_owner = module if module is edar_processor else smoothing
+    monkeypatch.setattr(fit_owner, "fit_kalman_params", reject_fit)
     processor = getattr(module, processor_name)(config)
     result = getattr(processor, method_name)(data)
     assert len(result) == len(data)

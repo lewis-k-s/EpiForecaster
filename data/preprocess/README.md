@@ -26,24 +26,49 @@ Because `cases` and EDAR biomarkers resolve to `(time, region)` series, the comb
 4. **Validation and storage** – Consistency checks guarantee every batch has identical node/edge counts and no NaNs before persisting via `DatasetStorage.save_dataset()`.
 5. **Reporting** – A JSON report (same directory as the Zarr store) captures configuration, alignment outcomes, statistics, and warnings for reproducibility.
 
-## Causal Smoothing Modes
+## Observations and Causal Gap Filling
 
-The preprocessing pipeline supports configurable **offline but causal** smoothing.
-Each timestep is updated using only current/past observations (no look-ahead over
-future dates).
+Every value channel follows one rule: **an observed day carries the raw
+observation; an unobserved day carries a causal fill.** The mask and age
+channels say which is which, and supervision uses mask days only. Fills use
+current and past observations only (no look-ahead over future dates).
 
 ### Clinical series (`cases`, `hospitalizations`, `deaths`)
 
-| Method | Config key | Behavior |
+The source registries list positive counts only. Inside a source's date span a
+day (or reporting week) without a row is an **observed zero**: mask 1, value 0.
+Days outside the span are unobserved. Weekly hospitalization totals sit on
+their report date; the six days in between are unobserved.
+
+| Method | Config key | Fill on unobserved days |
 | --- | --- | --- |
-| Kalman v2 | `smoothing.clinical_method: "kalman_v2"` | Random-walk Kalman filter with configurable missing policy (`predict` default, optional bounded `momentum`), innovation clipping, and re-entry gain capping to reduce hard jump artifacts after sparse gaps. |
-| Damped Holt | `smoothing.clinical_method: "holt_damped"` | Causal level+trend smoother (log space) with damped trend carry through missing intervals to avoid plateaus and spikes. |
+| LOCF | `smoothing.clinical_method: "locf"` | Last observation carried forward. Represents observed zeros. Used for the real dataset. |
+| Kalman v2 | `smoothing.clinical_method: "kalman_v2"` | Level of a random-walk Kalman filter with configurable missing policy (`predict` default, optional bounded `momentum`), innovation clipping, and re-entry gain capping. |
+| Damped Holt | `smoothing.clinical_method: "holt_damped"` | Level of a causal level+trend smoother with damped trend carry through missing intervals. |
+
+The Kalman and Holt filters work in log space and skip zero observations, so
+their fill after an observed zero is the level of the last positive counts.
+
+Target regions for the real dataset are selected by a static population floor,
+`valid_target_min_population` (3000): case history never decides membership,
+so small regions are not admitted or dropped by their outcomes. Without the
+floor, `min_density_threshold` applies to the share of observed days, or of
+days with a positive count under `valid_target_density_basis: "positive"`.
 
 ### Wastewater series (EDAR variants)
 
-| Method | Config key | Behavior |
+Sample days always keep the reported value: the detection limit for a
+non-detect, flagged in the censor channel.
+
+| Method | Config key | Fill on days between samples |
 | --- | --- | --- |
-| Tobit Kalman v2 | `smoothing.wastewater_method: "tobit_kalman_v2"` | Causal Tobit-Kalman filtering for censored observations (LOD-aware), with the same missing-policy and robust re-entry controls as Kalman v2. |
+| LOCF | `smoothing.wastewater_method: "locf"` | Last sample carried forward. No fitted parameters. Used for the real dataset. |
+| Tobit Kalman v2 | `smoothing.wastewater_method: "tobit_kalman_v2"` | Level of a causal Tobit-Kalman filter (LOD-aware), with the same missing-policy and re-entry controls as Kalman v2. Its variances are fitted per series; set `smoothing.parameter_fit_end_date` for temporal splits. |
+
+The re-entry gain cap is armed after `smoothing.reentry_min_gap` consecutive
+missing days. Set it above the sampling interval of a series that is not
+observed daily (14 for weekly or biweekly wastewater sampling); with the default
+of 1 every weekly sample would be capped.
 
 ## Wastewater (EDAR) Processing Methodology
 
@@ -54,12 +79,12 @@ The wastewater processor (`EDARProcessor`) implements a sophisticated pipeline t
 - **Flow Normalization:** Viral loads (CG/L) can be converted to total flow (CG/day) using daily flow rates ($m^3/day$), or kept as concentrations by setting `wastewater_flow_mode: "concentration"`.
 - **Temporal Aggregation:** Multiple measurements per day are averaged.
 
-### 2. Imputation and Smoothing (Tobit Kalman Filter)
-To address missing data and censored observations (values below the limit of detection), we implement a **Tobit Kalman Filter**:
+### 2. Gap Filling
+Sample days keep the reported measurement. With `wastewater_method: "locf"` the last sample is carried forward. With `"tobit_kalman_v2"` the days between samples carry the level of a **Tobit Kalman Filter** that respects censored observations (values below the limit of detection):
 
 - **State Space Model:** We model the log-transformed viral flow as a local level process (random walk) observed with noise.
 - **Censored Data (Values $\le$ LOD):** Instead of treating these as zeros or missing, we use a Tobit update step. The filter updates the state estimate using the probability mass of the predicted distribution that falls below the LOD. This statistically imputes the most likely value consistent with the "non-detect" observation.
-- **Missing Data:** Days with no samples are handled causally according to `smoothing.missing_policy`. Default `predict` uses one-step prediction only; optional `momentum` enables bounded decayed extrapolation (with configurable max steps). Censor flag remains 2 to indicate imputed values.
+- **Missing Data:** Days with no samples are filled causally according to `smoothing.missing_policy`. Default `predict` uses one-step prediction only; optional `momentum` enables bounded decayed extrapolation (with configurable max steps). Censor flag remains 2 to indicate filled values.
 - **Parameter Estimation:** Process and measurement variances are fitted per-site using Maximum Likelihood Estimation (MLE) on the available non-censored data.
 
 ### 3. Spatial Aggregation
@@ -85,19 +110,19 @@ Running the pipeline always yields a Zarr dataset whose arrays follow this layou
 | Array | Shape | Dtype | Description |
 | --- | --- | --- | --- |
 | `cases` | `(run_id, time, region, 1)` | float16 | Canonical case counts (log1p per-100k transformed). |
-| `cases_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
+| `cases_mask` | `(run_id, time, region)` | bool | True if observed (zero counts included), False if unobserved/filled. |
 | `cases_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). 14 = no prior observation. |
-| `hospitalizations` | `(run_id, time, region, 1)` | float16 | Hospitalization counts (log1p per-100k, Kalman-smoothed). |
-| `hospitalizations_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
+| `hospitalizations` | `(run_id, time, region, 1)` | float16 | Hospitalization counts (log1p per-100k; raw weekly total on report days, causal fill between). |
+| `hospitalizations_mask` | `(run_id, time, region)` | bool | True if observed (zero weeks included), False if unobserved/filled. |
 | `hospitalizations_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). |
-| `deaths` | `(run_id, time, region, 1)` | float16 | Death counts (log1p per-100k, Kalman-smoothed). |
-| `deaths_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
+| `deaths` | `(run_id, time, region, 1)` | float16 | Death counts (log1p per-100k; raw on observed days). |
+| `deaths_mask` | `(run_id, time, region)` | bool | True if observed (zero counts included), False if unobserved/filled. |
 | `deaths_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). |
 | `vaccination_rate` | `(run_id, time, region)` | float16 | Cumulative first-dose vaccination coverage, clipped to `[0, 1]`. |
 | `vaccination_rate_mask` | `(run_id, time, region)` | bool | True if the source had administered first-dose rows for the municipality-date. |
 | `vaccination_rate_age` | `(run_id, time, region)` | uint8 | Days since last source first-dose observation (0-14). |
-| `edar_biomarker_<variant>` | `(run_id, time, region)` | float16 | Per-variant biomarker intensity (log1p, Kalman-filtered). |
-| `edar_biomarker_<variant>_mask` | `(run_id, time, region)` | bool | True if measured (finite and positive), False otherwise. |
+| `edar_biomarker_<variant>` | `(run_id, time, region)` | float16 | Per-variant biomarker intensity (log1p; reported value on sample days, Tobit-Kalman level between samples). |
+| `edar_biomarker_<variant>_mask` | `(run_id, time, region)` | bool | True if sampled (finite and positive, non-detects included), False otherwise. |
 | `edar_biomarker_<variant>_censor` | `(run_id, time, region)` | uint8 | 0=uncensored, 1=censored at LOD, 2=missing/imputed. |
 | `edar_biomarker_<variant>_age` | `(run_id, time, region)` | uint8 | Days since last measurement (0-14). 14 = no EDAR coverage. |
 | `biomarker_data_start` | `(run_id, region)` | int16 | First time index with biomarker data. -1 = no coverage. |
@@ -105,7 +130,7 @@ Running the pipeline always yields a Zarr dataset whose arrays follow this layou
 | `mobility_time_mask` | `(run_id, time)` | bool | True when the mobility tensor has source data for the timestep. False for outer-aligned dates beyond the OD data range. |
 | `population` | `(region,)` | int32 | Static population per region. |
 | `edar_has_source` | `(region,)` | bool | True if region has EDAR site contributions. |
-| `valid_targets` | `(run_id, region)` | bool | True if (run, region) meets minimum data density. |
+| `valid_targets` | `(run_id, region)` | bool | True if the region meets the population floor (`valid_target_min_population`), or else the minimum data density (`valid_target_density_basis`). |
 | `temporal_covariates` | `(time, covariate)` | float16 | Calendar features such as `[dow_sin, dow_cos, is_holiday, lockdown_severity]` when enabled. |
 
 ### Dataset Attributes
