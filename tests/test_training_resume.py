@@ -115,6 +115,7 @@ def test_resume_from_legacy_checkpoint_without_residual_schedule_loads_state(
     trainer = _make_trainer_stub(config)
     trainer.model_id = "run_003"
     trainer.model = torch.nn.Linear(2, 2, dtype=torch.float32)
+    trainer._uncompiled_model = trainer.model
     trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
     trainer.scheduler = None
     trainer.best_val_loss = float("inf")
@@ -138,6 +139,7 @@ def test_resume_from_legacy_checkpoint_without_residual_schedule_loads_state(
             "epoch": 4,
             "global_step": 123,
             "model_state_dict": updated_state,
+            "config": {},
             "optimizer_state_dict": trainer.optimizer.state_dict(),
             "best_val_loss": 0.123,
             "training_history": {
@@ -179,6 +181,7 @@ def test_initialize_model_from_checkpoint_loads_model_only(tmp_path) -> None:
     )
     trainer = _make_trainer_stub(config)
     trainer.model = torch.nn.Linear(2, 2, dtype=torch.float32)
+    trainer._uncompiled_model = trainer.model
     trainer.current_epoch = 7
     trainer.best_val_loss = 9.9
     trainer.training_history = {"train_loss": [5.0]}
@@ -198,6 +201,7 @@ def test_initialize_model_from_checkpoint_loads_model_only(tmp_path) -> None:
         {
             "epoch": 4,
             "model_state_dict": updated_state,
+            "config": {},
             "optimizer_state_dict": {"unused": True},
             "best_val_loss": 0.123,
             "training_history": {"train_loss": [1.0]},

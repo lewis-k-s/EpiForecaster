@@ -125,6 +125,7 @@ def test_checkpoint_saves_patience_and_rng_state(tmp_path) -> None:
     trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
     model = torch.nn.Linear(1, 1)
     trainer.model = model
+    trainer._uncompiled_model = model
     trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     trainer.scheduler = None
     trainer.global_step = 3

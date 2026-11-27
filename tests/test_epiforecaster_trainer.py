@@ -418,7 +418,7 @@ class TestEpiForecasterTrainer:
         assert trainer._is_early_stopping_enabled() is True
 
     @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
+    @patch("training.epiforecaster_trainer.build_model")
     @patch("training.epiforecaster_trainer.wandb")
     @patch("training.dataloader_factory.DataLoader")
     def test_standard_split_reuses_sparse_topology_and_releases(
@@ -443,8 +443,8 @@ class TestEpiForecasterTrainer:
         shared_sparse_topology = object()
 
         train_ds = MagicMock()
-        train_ds.cases_output_dim = 1
-        train_ds.biomarkers_output_dim = 1
+        train_ds.cases_output_dim = minimal_config.model.cases_dim
+        train_ds.biomarkers_output_dim = minimal_config.model.biomarkers_dim
         train_ds.temporal_covariates_dim = 0
         train_ds.target_nodes = [0, 1]
         train_ds.__len__.return_value = 16
@@ -486,7 +486,7 @@ class TestEpiForecasterTrainer:
         test_ds.release_shared_sparse_topology.assert_called_once()
 
     @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
+    @patch("training.epiforecaster_trainer.build_model")
     @patch("training.epiforecaster_trainer.wandb")
     @patch("training.dataloader_factory.DataLoader")
     def test_gradnorm_compiles_adaptive_backward_step(
@@ -501,8 +501,10 @@ class TestEpiForecasterTrainer:
         mock_model_cls.return_value = mock_model_instance
 
         mock_dataset_instance = MagicMock()
-        mock_dataset_instance.cases_output_dim = 1
-        mock_dataset_instance.biomarkers_output_dim = 1
+        mock_dataset_instance.cases_output_dim = minimal_config.model.cases_dim
+        mock_dataset_instance.biomarkers_output_dim = (
+            minimal_config.model.biomarkers_dim
+        )
         mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset_instance.__len__.return_value = 16
         mock_dataset_instance.target_nodes = [0, 1]
@@ -518,7 +520,7 @@ class TestEpiForecasterTrainer:
         assert trainer.gradnorm_optimizer is not None
 
     @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
+    @patch("training.epiforecaster_trainer.build_model")
     @patch("training.epiforecaster_trainer.wandb")
     @patch("training.dataloader_factory.DataLoader")
     def test_checkpoint_includes_gradnorm_state(
@@ -540,8 +542,10 @@ class TestEpiForecasterTrainer:
         mock_model_cls.return_value = mock_model_instance
 
         mock_dataset_instance = MagicMock()
-        mock_dataset_instance.cases_output_dim = 1
-        mock_dataset_instance.biomarkers_output_dim = 1
+        mock_dataset_instance.cases_output_dim = minimal_config.model.cases_dim
+        mock_dataset_instance.biomarkers_output_dim = (
+            minimal_config.model.biomarkers_dim
+        )
         mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset_instance.__len__.return_value = 16
         mock_dataset_instance.target_nodes = [0, 1]

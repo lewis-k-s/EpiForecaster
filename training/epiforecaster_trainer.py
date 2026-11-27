@@ -102,10 +102,11 @@ from utils.console import (
     format_component_gradnorm_status,
     format_train_progress_status,
 )
-from utils.checkpoint_compat import (
-    initialize_missing_distribution_parameters,
-    initialize_missing_frozen_gamma_metadata,
-    migrate_legacy_frozen_clinical_gamma_keys,
+from models.checkpoint_restore import (
+    build_model,
+    read_checkpoint,
+    restore_residual_budget,
+    restore_weights,
 )
 from training.grad_utils import (
     compute_gradient_norms_and_clip,
@@ -266,32 +267,19 @@ class EpiForecasterTrainer:
                 f"Set model.params.include_day_of_week and include_holidays to match your dataset."
             )
 
-        self.model = EpiForecaster(
-            variant_type=self.config.model.type,
-            sir_physics=self.config.model.sir_physics,
-            init_weights=self.config.model.init_weights,
-            observation_heads=self.config.model.observation_heads,
-            temporal_input_dim=train_example_ds.cases_output_dim,
-            biomarkers_dim=train_example_ds.biomarkers_output_dim,
-            region_embedding_dim=self.config.model.region_embedding_dim,
-            mobility_embedding_dim=self.config.model.mobility_embedding_dim,
-            gnn_depth=self.config.model.gnn_depth,
-            sequence_length=self.config.model.input_window_length,
-            forecast_horizon=self.config.model.forecast_horizon,
-            use_population=self.config.model.use_population,
-            population_dim=self.config.model.population_dim,
-            device=self.device,
-            gnn_module=self.config.model.gnn_module,
-            gnn_hidden_dim=self.config.model.gnn_hidden_dim,
-            head_d_model=self.config.model.head_d_model,
-            head_n_heads=self.config.model.head_n_heads,
-            head_num_layers=self.config.model.head_num_layers,
-            head_dropout=self.config.model.head_dropout,
-            head_positional_encoding=self.config.model.head_positional_encoding,
-            temporal_covariates_dim=self.config.model.temporal_covariates_dim,
-            vaccination_dim=self.config.model.vaccination_dim,
-            strict=self.config.model.strict,
-        )
+        if (
+            self.config.model.cases_dim != train_example_ds.cases_output_dim
+            or self.config.model.biomarkers_dim
+            != train_example_ds.biomarkers_output_dim
+        ):
+            raise ValueError(
+                "Config clinical and biomarker dims "
+                f"({self.config.model.cases_dim}, {self.config.model.biomarkers_dim}) "
+                "do not match the dataset "
+                f"({train_example_ds.cases_output_dim}, "
+                f"{train_example_ds.biomarkers_output_dim})."
+            )
+        self.model = build_model(self.config.model, device=self.device)
 
         # Setup data loaders before CUDA initialization when using fork
         loader_bundle = build_dataloaders(
@@ -362,12 +350,11 @@ class EpiForecasterTrainer:
             self.region_embeddings = self.region_embeddings.to(self.device)
 
         self.model.to(self.device)
-        # Raw model reference for runtime controls that must bypass the
-        # torch.compile OptimizedModule wrapper.
-        self._residual_schedule_model = self.model
+        # Uncompiled model reference: checkpoints save and restore its weights
+        # without the torch.compile key prefix, and runtime controls bypass
+        # the OptimizedModule wrapper.
+        self._uncompiled_model: EpiForecaster = self.model
 
-        # Apply torch.compile *before* loading checkpoints so that
-        # compiled-checkpoint keys (_orig_mod.) match the live model.
         if self.config.training.compile:
             compile_kwargs: dict[str, Any] = {}
             if self.config.training.compile_mode != "default":
@@ -1108,61 +1095,26 @@ class EpiForecasterTrainer:
         return f"run_{time.time_ns()}"
 
     def _resume_from_checkpoint(self) -> None:
-        from utils.precision_policy import validate_old_checkpoint_compatible
-
         checkpoint_path = self.config.training.resume_checkpoint_path
         if checkpoint_path is None:
             raise ValueError("resume_checkpoint_path is not set")
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        restored = read_checkpoint(checkpoint_path)
+        checkpoint = restored.payload
         self._validate_checkpoint_selection_contract(checkpoint)
         self.best_val_crps = float(checkpoint.get("best_val_crps", float("inf")))
         self._validate_checkpoint_latent_scale_state(checkpoint)
         self._validate_checkpoint_residual_schedule_state(checkpoint)
+        # Checks the checkpoint's budget provenance; the epoch loop then
+        # applies the configured schedule.
+        restore_residual_budget(self._uncompiled_model, restored)
+        report = restore_weights(self._uncompiled_model, restored)
 
-        # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
-        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
-
-        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
-            state_dict=checkpoint["model_state_dict"],
-            model_state_dict=self.model.state_dict(),
-            saved_config=checkpoint.get("config"),
-        )
-        if migrated_gamma_keys:
-            self._status(
-                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
-                "kernel keys.",
-                logging.INFO,
-            )
-        state_dict, initialized_distribution_keys = (
-            initialize_missing_distribution_parameters(
-                state_dict=state_dict,
-                model_state_dict=self.model.state_dict(),
-            )
-        )
-        state_dict, _initialized_gamma_metadata = (
-            initialize_missing_frozen_gamma_metadata(
-                state_dict=state_dict,
-                model_state_dict=self.model.state_dict(),
-                saved_config=checkpoint.get("config"),
-            )
-        )
-        self.model.load_state_dict(state_dict)
-
-        # Assert resumed model is FP32
-        actual_dtype = next(iter(self.model.parameters())).dtype
-        if actual_dtype != torch.float32:
-            raise ValueError(
-                f"Checkpoint dtype mismatch: model has {actual_dtype}, "
-                f"but only float32 parameters are supported. "
-                "Please retrain with current precision settings."
-            )
-
-        if "optimizer_state_dict" in checkpoint and not initialized_distribution_keys:
+        if "optimizer_state_dict" in checkpoint and report.optimizer_state_compatible:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         elif "optimizer_state_dict" in checkpoint:
             self._status(
-                "Skipped legacy optimizer state because distribution parameters "
-                "were initialized from current defaults.",
+                "Skipped legacy optimizer state because restore padded or "
+                "initialized model parameters.",
                 logging.WARNING,
             )
         gradnorm_controller = getattr(self, "gradnorm_controller", None)
@@ -1270,45 +1222,10 @@ class EpiForecasterTrainer:
             )
 
     def _initialize_model_from_checkpoint(self) -> None:
-        from utils.precision_policy import validate_old_checkpoint_compatible
-
         checkpoint_path = self.config.training.init_checkpoint_path
         if checkpoint_path is None:
             raise ValueError("init_checkpoint_path is not set")
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
-        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
-            state_dict=checkpoint["model_state_dict"],
-            model_state_dict=self.model.state_dict(),
-            saved_config=checkpoint.get("config"),
-        )
-        if migrated_gamma_keys:
-            self._status(
-                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
-                "kernel keys.",
-                logging.INFO,
-            )
-        state_dict, _initialized_distribution_keys = (
-            initialize_missing_distribution_parameters(
-                state_dict=state_dict,
-                model_state_dict=self.model.state_dict(),
-            )
-        )
-        state_dict, _initialized_gamma_metadata = (
-            initialize_missing_frozen_gamma_metadata(
-                state_dict=state_dict,
-                model_state_dict=self.model.state_dict(),
-                saved_config=checkpoint.get("config"),
-            )
-        )
-        self.model.load_state_dict(state_dict)
-
-        actual_dtype = next(iter(self.model.parameters())).dtype
-        if actual_dtype != torch.float32:
-            raise ValueError(
-                f"Checkpoint dtype mismatch: model has {actual_dtype}, "
-                "but only float32 parameters are supported."
-            )
+        restore_weights(self._uncompiled_model, read_checkpoint(checkpoint_path))
         self._status(
             f"Initialized model weights from checkpoint: {checkpoint_path}",
             logging.INFO,
@@ -1852,7 +1769,7 @@ class EpiForecasterTrainer:
         effective_max_log_location_fraction: float | None = (
             None if phase is None else float(phase.max_log_location_fraction)
         )
-        self._residual_schedule_model.set_observation_residual_max_log_location_fraction(
+        self._uncompiled_model.set_observation_residual_max_log_location_fraction(
             effective_max_log_location_fraction
         )
         self._active_residual_schedule_state = {
@@ -1880,12 +1797,13 @@ class EpiForecasterTrainer:
         self,
         checkpoint: dict[str, Any],
     ) -> None:
-        """Reject resume when the residual schedule disagrees with the checkpoint.
+        """Reject a checkpoint whose residual schedule differs from the config.
 
         The schedule is scientific behavior: changing it across a resume
         would silently change the residual policy that produced the checkpoint
-        weights. Legacy checkpoints without any schedule state may only resume
-        into a disabled schedule.
+        weights. Legacy checkpoints without a schedule block may only resume
+        into a disabled schedule. ``restore_residual_budget`` checks the
+        checkpoint's own schedule provenance.
         """
         saved_config = checkpoint.get("config")
         saved_training = (
@@ -1907,17 +1825,7 @@ class EpiForecasterTrainer:
                 for phase in self.config.training.residual_schedule.schedule
             ],
         }
-        # A checkpoint without a schedule block predates this feature. It is
-        # valid only when it also has no schedule provenance and resumes into
-        # the unrestricted legacy path.
-        legacy_checkpoint = saved_schedule is None
-        saved_state = checkpoint.get("residual_schedule_state")
-        if legacy_checkpoint:
-            if saved_state is not None:
-                raise ValueError(
-                    "Legacy checkpoint carries residual schedule provenance "
-                    f"without a residual schedule: {saved_state!r}"
-                )
+        if saved_schedule is None:
             if current_schedule["enabled"]:
                 raise ValueError(
                     "Legacy checkpoint without residual schedule state may only "
@@ -1929,51 +1837,6 @@ class EpiForecasterTrainer:
                 "Checkpoint residual schedule does not match the configured "
                 f"schedule: checkpoint={saved_schedule!r}, "
                 f"configured={current_schedule!r}"
-            )
-        if not self.config.training.residual_schedule.enabled:
-            canonical_disabled = {
-                "enabled": False,
-                "phase_index": None,
-                "phase_start_epoch": None,
-                "phase_end_epoch": None,
-                "effective_max_log_location_fraction": None,
-            }
-            if saved_state is not None and saved_state != canonical_disabled:
-                raise ValueError(
-                    "Checkpoint carries a disabled residual schedule with "
-                    f"contradictory provenance: {saved_state!r}"
-                )
-            return
-        if saved_state is None:
-            raise ValueError(
-                "Residual schedule is enabled but the checkpoint carries no "
-                "residual_schedule_state provenance; refusing to resume."
-            )
-        saved_epoch = int(checkpoint.get("epoch", -1))
-        expected_index, expected_phase = resolve_residual_schedule_phase(
-            self.config.training.residual_schedule,
-            saved_epoch,
-        )
-        expected_state = {
-            "enabled": expected_phase is not None,
-            "phase_index": expected_index,
-            "phase_start_epoch": (
-                None if expected_phase is None else expected_phase.start_epoch
-            ),
-            "phase_end_epoch": (
-                None if expected_phase is None else expected_phase.end_epoch
-            ),
-            "effective_max_log_location_fraction": (
-                None
-                if expected_phase is None
-                else float(expected_phase.max_log_location_fraction)
-            ),
-        }
-        if saved_state != expected_state:
-            raise ValueError(
-                "Checkpoint residual schedule provenance is inconsistent with "
-                f"the saved epoch {saved_epoch}: checkpoint={saved_state!r}, "
-                f"expected={expected_state!r}"
             )
 
     def _training_step_impl(self, batch_data: EpiBatch) -> torch.Tensor:
@@ -3036,54 +2899,15 @@ class EpiForecasterTrainer:
         return checkpoint_path
 
     def _load_best_model_for_final_evaluation(self) -> Path:
-        from utils.precision_policy import validate_old_checkpoint_compatible
-
         checkpoint_path = self._best_checkpoint_path()
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
-        self._validate_checkpoint_latent_scale_state(checkpoint)
+        restored = read_checkpoint(checkpoint_path)
+        self._validate_checkpoint_latent_scale_state(restored.payload)
+        self._validate_checkpoint_residual_schedule_state(restored.payload)
         # The best checkpoint may come from an earlier residual-schedule
         # phase than the final epoch; the budget buffer is non-persistent,
         # so restore it from checkpoint provenance before evaluating.
-        self._validate_checkpoint_residual_schedule_state(checkpoint)
-        residual_state = checkpoint.get("residual_schedule_state")
-        if residual_state is not None:
-            self._residual_schedule_model.set_observation_residual_max_log_location_fraction(
-                residual_state["effective_max_log_location_fraction"]
-            )
-        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
-            state_dict=checkpoint["model_state_dict"],
-            model_state_dict=self.model.state_dict(),
-            saved_config=checkpoint.get("config"),
-        )
-        if migrated_gamma_keys:
-            self._status(
-                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
-                "kernel keys.",
-                logging.INFO,
-            )
-        state_dict, _initialized_distribution_keys = (
-            initialize_missing_distribution_parameters(
-                state_dict=state_dict,
-                model_state_dict=self.model.state_dict(),
-            )
-        )
-        state_dict, _initialized_gamma_metadata = (
-            initialize_missing_frozen_gamma_metadata(
-                state_dict=state_dict,
-                model_state_dict=self.model.state_dict(),
-                saved_config=checkpoint.get("config"),
-            )
-        )
-        self.model.load_state_dict(state_dict)
-
-        actual_dtype = next(iter(self.model.parameters())).dtype
-        if actual_dtype != torch.float32:
-            raise ValueError(
-                f"Best checkpoint dtype mismatch: model has {actual_dtype}, "
-                "but only float32 parameters are supported."
-            )
-
+        restore_residual_budget(self._uncompiled_model, restored)
+        restore_weights(self._uncompiled_model, restored)
         self._status(
             f"Loaded best checkpoint for final evaluation: {checkpoint_path}",
             logging.INFO,
@@ -3518,7 +3342,7 @@ class EpiForecasterTrainer:
         checkpoint = {
             "epoch": epoch,
             "global_step": self.global_step,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self._uncompiled_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,
             "val_selection_score": val_selection_score,

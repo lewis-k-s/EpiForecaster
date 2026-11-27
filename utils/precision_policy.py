@@ -165,15 +165,8 @@ def resolve_precision_policy(
     )
 
 
-def validate_old_checkpoint_compatible(
-    checkpoint: dict,
-    _current_policy: PrecisionPolicy,
-) -> None:
-    """Validate that a checkpoint is compatible with current precision policy.
-
-    Args:
-        checkpoint: Loaded checkpoint dictionary
-        current_policy: Current precision policy
+def validate_old_checkpoint_compatible(checkpoint: dict) -> None:
+    """Reject a checkpoint whose precision settings are no longer supported.
 
     Raises:
         ValueError: If checkpoint uses incompatible precision settings

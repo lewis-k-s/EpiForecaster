@@ -1047,7 +1047,6 @@ def plot_forecasts(
             build_loader_from_config,
             evaluate_loader,
             generate_forecast_plots,
-            load_model_from_checkpoint,
             select_nodes_by_loss,
         )
         from evaluation.selection import (
@@ -1057,6 +1056,7 @@ def plot_forecasts(
         )
         from evaluation.losses import get_loss_from_config
         from data.latent_supervision import latent_scales_from_checkpoint
+        from models.checkpoint_restore import load_model_from_checkpoint
 
         click.echo(f"Loading checkpoint: {checkpoint}")
         overrides = list(override) if override else None
