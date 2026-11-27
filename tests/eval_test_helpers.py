@@ -106,7 +106,7 @@ def install_plot_forecast_harness(
         "utils.run_discovery.extract_run_from_checkpoint_path", lambda _path: None
     )
     monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.load_model_from_checkpoint",
+        "models.checkpoint_restore.load_model_from_checkpoint",
         lambda checkpoint, device="auto", overrides=None: (
             torch.nn.Linear(1, 1),
             SimpleNamespace(

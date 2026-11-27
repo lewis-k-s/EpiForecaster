@@ -399,7 +399,7 @@ class TestModelPropagation:
 
 
 class TestTrainerScheduleContract:
-    """Trainer epoch application and checkpoint provenance."""
+    """Trainer epoch application and checkpoint schedule match."""
 
     def _trainer_stub(self, enabled: bool, phases=None):
         from training.epiforecaster_trainer import EpiForecasterTrainer
@@ -415,7 +415,7 @@ class TestTrainerScheduleContract:
         calls: list[float | None] = []
         object.__setattr__(
             trainer,
-            "_residual_schedule_model",
+            "_uncompiled_model",
             SimpleNamespace(
                 set_observation_residual_max_log_location_fraction=calls.append
             ),
@@ -482,77 +482,6 @@ class TestTrainerScheduleContract:
         with pytest.raises(ValueError, match="does not match"):
             trainer._validate_checkpoint_residual_schedule_state(checkpoint)
 
-    def test_resume_rejects_contradictory_disabled_provenance(self):
-        trainer, _ = self._trainer_stub(enabled=False)
-        checkpoint = {
-            "epoch": 5,
-            "config": {
-                "training": {"residual_schedule": {"enabled": False, "schedule": []}}
-            },
-            "residual_schedule_state": {
-                "enabled": True,
-                "phase_index": 0,
-                "phase_start_epoch": 0,
-                "phase_end_epoch": 1,
-                "effective_max_log_location_fraction": 0.1,
-            },
-        }
-        with pytest.raises(ValueError, match="contradictory"):
-            trainer._validate_checkpoint_residual_schedule_state(checkpoint)
-
-    def test_resume_rejects_enabled_without_provenance(self):
-        phases = [ResidualSchedulePhaseConfig(0, 2, 0.1)]
-        trainer, _ = self._trainer_stub(enabled=True, phases=phases)
-        checkpoint = {
-            "epoch": 0,
-            "config": {
-                "training": {
-                    "residual_schedule": {
-                        "enabled": True,
-                        "schedule": [
-                            {
-                                "start_epoch": 0,
-                                "end_epoch": 2,
-                                "max_log_location_fraction": 0.1,
-                            }
-                        ],
-                    }
-                }
-            },
-        }
-        with pytest.raises(ValueError, match="no residual_schedule_state"):
-            trainer._validate_checkpoint_residual_schedule_state(checkpoint)
-
-    def test_resume_rejects_inconsistent_provenance(self):
-        phases = [ResidualSchedulePhaseConfig(0, 2, 0.1)]
-        trainer, _ = self._trainer_stub(enabled=True, phases=phases)
-        checkpoint = {
-            "epoch": 0,
-            "config": {
-                "training": {
-                    "residual_schedule": {
-                        "enabled": True,
-                        "schedule": [
-                            {
-                                "start_epoch": 0,
-                                "end_epoch": 2,
-                                "max_log_location_fraction": 0.1,
-                            }
-                        ],
-                    }
-                }
-            },
-            "residual_schedule_state": {
-                "enabled": True,
-                "phase_index": 0,
-                "phase_start_epoch": 0,
-                "phase_end_epoch": 2,
-                "effective_max_log_location_fraction": 0.5,
-            },
-        }
-        with pytest.raises(ValueError, match="inconsistent"):
-            trainer._validate_checkpoint_residual_schedule_state(checkpoint)
-
     def test_resume_accepts_consistent_enabled_checkpoint(self):
         phases = [
             ResidualSchedulePhaseConfig(0, 1, 0.0),
@@ -595,22 +524,6 @@ class TestTrainerScheduleContract:
         trainer._validate_checkpoint_residual_schedule_state(
             {"epoch": 5, "model_state_dict": {}}
         )
-
-    def test_legacy_checkpoint_with_schedule_provenance_is_rejected(self):
-        trainer, _ = self._trainer_stub(enabled=False)
-        checkpoint = {
-            "epoch": 5,
-            "model_state_dict": {},
-            "residual_schedule_state": {
-                "enabled": False,
-                "phase_index": None,
-                "phase_start_epoch": None,
-                "phase_end_epoch": None,
-                "effective_max_log_location_fraction": None,
-            },
-        }
-        with pytest.raises(ValueError, match="without a residual schedule"):
-            trainer._validate_checkpoint_residual_schedule_state(checkpoint)
 
 
 class TestEvaluationLoaderBudgetRestore:
@@ -684,21 +597,21 @@ class TestEvaluationLoaderBudgetRestore:
         return path
 
     def test_enabled_checkpoint_without_state_fails_closed(self, tmp_path):
-        from evaluation import loaders
+        from models.checkpoint_restore import load_model_from_checkpoint
 
         path = self._checkpoint(tmp_path, enabled=True)
         with pytest.raises(ValueError, match="no residual_schedule_state"):
-            loaders.load_model_from_checkpoint(path)
+            load_model_from_checkpoint(path)
 
     def test_legacy_checkpoint_without_schedule_stays_unrestricted(self, tmp_path):
-        from evaluation import loaders
+        from models.checkpoint_restore import load_model_from_checkpoint
 
         path = self._checkpoint(
             tmp_path,
             enabled=False,
             include_schedule=False,
         )
-        model, _config, _checkpoint = loaders.load_model_from_checkpoint(path)
+        model, _config, _checkpoint = load_model_from_checkpoint(path)
         assert isinstance(model, EpiForecaster)
         for head in (
             model.ww_head,
@@ -709,7 +622,7 @@ class TestEvaluationLoaderBudgetRestore:
             assert float(head._residual_max_log_location_fraction.item()) < 0.0
 
     def test_enabled_checkpoint_with_mismatched_provenance_fails_closed(self, tmp_path):
-        from evaluation import loaders
+        from models.checkpoint_restore import load_model_from_checkpoint
 
         path = self._checkpoint(
             tmp_path,
@@ -723,10 +636,10 @@ class TestEvaluationLoaderBudgetRestore:
             },
         )
         with pytest.raises(ValueError, match="inconsistent"):
-            loaders.load_model_from_checkpoint(path)
+            load_model_from_checkpoint(path)
 
     def test_legacy_checkpoint_with_schedule_provenance_fails_closed(self, tmp_path):
-        from evaluation import loaders
+        from models.checkpoint_restore import load_model_from_checkpoint
 
         path = self._checkpoint(
             tmp_path,
@@ -741,4 +654,21 @@ class TestEvaluationLoaderBudgetRestore:
             },
         )
         with pytest.raises(ValueError, match="without a residual schedule"):
-            loaders.load_model_from_checkpoint(path)
+            load_model_from_checkpoint(path)
+
+    def test_disabled_checkpoint_with_enabled_provenance_fails_closed(self, tmp_path):
+        from models.checkpoint_restore import load_model_from_checkpoint
+
+        path = self._checkpoint(
+            tmp_path,
+            enabled=False,
+            state={
+                "enabled": True,
+                "phase_index": 0,
+                "phase_start_epoch": 0,
+                "phase_end_epoch": 1,
+                "effective_max_log_location_fraction": 0.1,
+            },
+        )
+        with pytest.raises(ValueError, match="contradictory"):
+            load_model_from_checkpoint(path)

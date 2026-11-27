@@ -14,7 +14,7 @@ Key submodules:
 
 # Core evaluation components
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
-from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
+from evaluation.loaders import build_loader_from_config
 from evaluation.selection import (
     _GLOBAL_RNG,
     select_nodes_by_loss,
@@ -45,7 +45,6 @@ def __getattr__(name: str):
 
 __all__ = [
     # Loaders
-    "load_model_from_checkpoint",
     "build_loader_from_config",
     # Selection
     "select_nodes_by_loss",

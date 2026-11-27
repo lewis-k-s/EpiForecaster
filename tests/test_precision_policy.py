@@ -67,8 +67,8 @@ def test_checkpoint_precision_signature_accepts_supported_state() -> None:
         assert signature["autocast_dtype"] == (
             "bfloat16" if policy.autocast_enabled else None
         )
-        validate_old_checkpoint_compatible({"precision_signature": signature}, policy)
-    validate_old_checkpoint_compatible({}, _policy())
+        validate_old_checkpoint_compatible({"precision_signature": signature})
+    validate_old_checkpoint_compatible({})
 
 
 def test_checkpoint_precision_rejects_unsupported_state() -> None:
@@ -87,4 +87,4 @@ def test_checkpoint_precision_rejects_unsupported_state() -> None:
     ]
     for checkpoint, message in invalid:
         with pytest.raises(ValueError, match=message):
-            validate_old_checkpoint_compatible(checkpoint, _policy())
+            validate_old_checkpoint_compatible(checkpoint)

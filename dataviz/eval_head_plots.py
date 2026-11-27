@@ -23,7 +23,8 @@ from dataviz.granular_comparison import (
     _ordered_targets,
 )
 from dataviz.sparsity_analysis import get_wastewater_sparsity_mask
-from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
+from evaluation.loaders import build_loader_from_config
+from models.checkpoint_restore import load_model_from_checkpoint
 from evaluation.selection import WindowSelectionSpec, select_windows_by_loss
 from plotting.forecast_plots import (
     collect_forecast_samples_for_window_specs,

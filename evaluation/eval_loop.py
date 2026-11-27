@@ -27,7 +27,7 @@ from evaluation.granular_export import (
     write_metadata_sidecar,
     write_granular_metadata_sidecar,
 )
-from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
+from evaluation.loaders import build_loader_from_config
 from evaluation.latent_diagnostics import build_latent_diagnostic_protocols
 from evaluation.latent_information import TorchLatentInformationAccumulator
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
@@ -44,6 +44,7 @@ from evaluation.target_scoring import (
     region_set_members,
 )
 from evaluation.selection_scores import compute_validation_selection_score
+from models.checkpoint_restore import load_model_from_checkpoint
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
 from models.observation_heads import DelayKernel, SheddingConvolution

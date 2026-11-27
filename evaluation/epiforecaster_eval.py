@@ -20,7 +20,8 @@ import wandb
 from data.epi_dataset import EpiDataset
 from data.latent_supervision import latent_scales_from_checkpoint
 from evaluation.eval_loop import _ensure_wandb_run, eval_checkpoint, evaluate_loader
-from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
+from evaluation.loaders import build_loader_from_config
+from models.checkpoint_restore import load_model_from_checkpoint
 from evaluation.losses import get_loss_from_config
 from evaluation.selection import select_nodes_by_loss, topk_target_nodes_by_mae
 from utils.log_keys import CORE_EVAL_METRICS, build_eval_metric_key, build_loss_key
@@ -293,7 +294,6 @@ __all__ = [
     "evaluate_loader",
     "generate_forecast_plots",
     "plot_forecasts_from_csv",
-    "load_model_from_checkpoint",
     "build_loader_from_config",
     "select_nodes_by_loss",
     "topk_target_nodes_by_mae",
