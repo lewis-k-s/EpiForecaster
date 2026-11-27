@@ -317,11 +317,11 @@ def test_getitem_maps_target_and_context_nodes_to_canonical_region_indices(tmp_p
     else:
         assert item["target_region_index"] == 0
 
-    assert torch.equal(item["mob_real_node_idx"], torch.tensor([1, 0]))
+    assert torch.equal(dataset.mob_real_node_idx, torch.tensor([1, 0]))
 
 
 @pytest.mark.epiforecaster
-def test_getitem_reuses_cached_graph_region_indices(tmp_path):
+def test_mob_real_node_idx_reuses_cached_graph_region_indices(tmp_path):
     zarr_path = tmp_path / "cached_region_mapping.zarr"
     _write_tiny_dataset(str(zarr_path), periods=8)
 
@@ -337,8 +337,11 @@ def test_getitem_reuses_cached_graph_region_indices(tmp_path):
         region_embedding_store=store,
     )
 
+    # Workers know no run-dependent placement; the main process attaches it.
     item = dataset[0]
-    assert item["mob_real_node_idx"] is dataset._graph_region_indices
+    assert "mob_real_node_idx" not in item
+    assert "mob_target_node_idx" not in item
+    assert dataset.mob_real_node_idx is dataset._graph_region_indices
 
 
 @pytest.mark.epiforecaster

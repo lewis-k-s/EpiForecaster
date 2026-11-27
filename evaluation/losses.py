@@ -91,6 +91,7 @@ def get_loss_from_config(
         latent_total_weight=joint_cfg.latent.total_weight,
         latent_scaling=joint_cfg.latent.scaling,
         latent_component_weights=joint_cfg.latent.component_weights,
+        latent_asinh_scale_fraction=joint_cfg.latent.asinh_scale_fraction,
         latent_scales=latent_scales,
         latent_require_complete_targets=joint_cfg.latent.require_complete_targets,
         disable_ww=joint_cfg.disable_ww,
@@ -189,6 +190,7 @@ class JointInferenceLoss(nn.Module):
         latent_scaling: str = "none",
         latent_component_weights: dict[str, float] | None = None,
         latent_scales: dict[str, float] | None = None,
+        latent_asinh_scale_fraction: float = 1.0,
         latent_require_complete_targets: bool = False,
         sir_residual_clip: float | None = None,
         disable_ww: bool = False,
@@ -232,6 +234,7 @@ class JointInferenceLoss(nn.Module):
             if latent_scales is None
             else {name: float(value) for name, value in latent_scales.items()}
         )
+        self.latent_asinh_scale_fraction = float(latent_asinh_scale_fraction)
         self.disable_ww = bool(disable_ww)
         self.disable_hosp = bool(disable_hosp)
         self.disable_cases = bool(disable_cases)
@@ -297,6 +300,14 @@ class JointInferenceLoss(nn.Module):
             raise ValueError(
                 "latent_scaling must be one of ['asinh', 'none', 'std'], "
                 f"got {self.latent_scaling!r}"
+            )
+        if (
+            not math.isfinite(self.latent_asinh_scale_fraction)
+            or self.latent_asinh_scale_fraction <= 0
+        ):
+            raise ValueError(
+                "latent_asinh_scale_fraction must be finite and positive, "
+                f"got {self.latent_asinh_scale_fraction}"
             )
         expected_latent_tasks = set(self._LATENT_TASKS)
         if set(self.latent_component_weights) != expected_latent_tasks:
@@ -707,8 +718,11 @@ class JointInferenceLoss(nn.Module):
             return prediction_f32, target_f32
 
         assert self.latent_scales is not None
+        scale_value = self.latent_scales[task_name]
+        if self.latent_scaling == "asinh" and task_name not in {"s", "r"}:
+            scale_value *= self.latent_asinh_scale_fraction
         scale = torch.as_tensor(
-            self.latent_scales[task_name],
+            scale_value,
             dtype=torch.float32,
             device=prediction_f32.device,
         )

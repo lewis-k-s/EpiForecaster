@@ -192,3 +192,126 @@ def test_scale_state_uses_canonical_identity_instead_of_staging_path():
 
     assert first.membership_hash == second.membership_hash
     assert first.state_hash == second.state_hash
+
+
+def _per_window_dates(dataset):
+    """Reference: the original per-sample accumulation of supervised dates."""
+    history = int(dataset.config.model.input_window_length)
+    horizon = int(dataset.config.model.forecast_horizon)
+    nodes = {int(node) for node in dataset.target_nodes}
+    state = {node: set() for node in nodes}
+    flow = {node: set() for node in nodes}
+    for node, window_start in dataset._index_map:
+        if int(node) not in nodes:
+            continue
+        end = int(window_start) + history
+        state[int(node)].update(range(end - 1, end + horizon))
+        flow[int(node)].update(range(end, end + horizon))
+    return (
+        {node: sorted(dates) for node, dates in state.items()},
+        {node: sorted(dates) for node, dates in flow.items()},
+    )
+
+
+def _random_dataset(seed: int):
+    rng = np.random.default_rng(seed)
+    time_count, node_count = 40, 5
+    values = rng.random((time_count, node_count)).astype(np.float32)
+    # Invalid values anywhere: only those inside supervised windows may count.
+    values[rng.random(values.shape) < 0.04] = np.nan
+    values[rng.random(values.shape) < 0.04] = -1.0
+    # 2 + 3 timesteps per window; stride and node subset vary by seed.
+    starts = range(int(rng.integers(0, 3)), time_count - 5, int(rng.integers(1, 6)))
+    index_map = [
+        (int(node), start)
+        for start in starts
+        for node in range(node_count)
+        if rng.random() < 0.7
+    ]
+    target_nodes = [int(n) for n in rng.permutation(node_count)[: rng.integers(1, 5)]]
+    dataset = _dataset(values=values, index_map=index_map, target_nodes=target_nodes)
+    dataset.config = SimpleNamespace(
+        model=SimpleNamespace(input_window_length=2, forecast_horizon=3)
+    )
+    return dataset
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize("seed", range(12))
+def test_vectorized_supervised_dates_match_the_per_window_reference(seed):
+    from data.latent_supervision import _supervised_dates_by_node
+
+    dataset = _random_dataset(seed)
+    expected_state, expected_flow = _per_window_dates(dataset)
+    state, flow = _supervised_dates_by_node(dataset)
+    assert state == expected_state
+    assert flow == expected_flow
+    # Dict order drives the order-dependent float accumulation of the fit.
+    assert list(state) == list({int(n) for n in dataset.target_nodes})
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize("seed", range(12))
+def test_vectorized_completeness_check_matches_the_per_window_reference(seed):
+    dataset = _random_dataset(seed)
+    state_dates, flow_dates = _per_window_dates(dataset)
+    expected_invalid = []
+    for attribute, dates_by_node in (
+        ("precomputed_S_target", state_dates),
+        ("precomputed_I_target", state_dates),
+        ("precomputed_H_target", state_dates),
+        ("precomputed_R_target", state_dates),
+        ("precomputed_death_flow_target", flow_dates),
+    ):
+        values = getattr(dataset, attribute).numpy()
+        for node, dates in dates_by_node.items():
+            window = values[np.asarray(dates, dtype=np.int64), node]
+            if not (np.isfinite(window).all() and (window >= 0).all()):
+                expected_invalid.append(attribute)
+                break
+
+    if expected_invalid:
+        with pytest.raises(ValueError) as error:
+            validate_complete_latent_targets(dataset)
+        assert str(expected_invalid) in str(error.value)
+    else:
+        validate_complete_latent_targets(dataset)
+
+
+@pytest.mark.epiforecaster
+def test_a_node_outside_the_target_dimensions_is_rejected():
+    dataset = _dataset(target_nodes=[0, 7], index_map=[(0, 0), (7, 0)])
+    with pytest.raises(ValueError, match="outside target dimensions"):
+        validate_complete_latent_targets(dataset)
+
+
+@pytest.mark.epiforecaster
+def test_a_window_beyond_the_time_range_is_rejected():
+    dataset = _dataset(index_map=[(0, 4)])  # 4 + 2 + 2 > 5 dates
+    with pytest.raises(ValueError, match="exceeds the temporal coordinate range"):
+        validate_complete_latent_targets(dataset)
+
+
+@pytest.mark.epiforecaster
+def test_scale_state_hashes_match_the_pre_vectorization_fit():
+    """Golden hashes computed with the per-window implementation (HEAD af1b793+1)."""
+    rng = np.random.default_rng(3)
+    values = rng.random((12, 4)).astype(np.float32)
+    values[3, 1] = np.nan
+    dataset = _dataset(
+        values=values,
+        target_nodes=[0, 1, 3],
+        index_map=[(0, 0), (0, 3), (1, 2), (1, 5), (3, 1), (3, 6), (2, 2)],
+    )
+
+    state = fit_latent_scale_state(dataset, floors=FLOORS)
+
+    assert state.supervised_date_hash == (
+        "d5b71485ea9f0a8ac27983f852d79e46856bf386cf38379c8271b0ddd642e53f"
+    )
+    assert state.membership_hash == (
+        "14a6343a99a127ac230821f2bd3f7f4686b0624db8fb9d3dee93e68314509931"
+    )
+    assert state.state_hash == (
+        "e92c221ecb9388cc102ce020f715ed979414f6a116b8589c44db5534a66f12b0"
+    )
