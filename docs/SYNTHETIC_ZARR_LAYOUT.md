@@ -8,7 +8,7 @@ The layout gives parallel writes during preprocessing, fast per-run reads
 during dataset construction, and one DVC object per dataset. The `mobility`
 variable is about 97% of the stored bytes, so its encoding sets the size.
 
-The real dataset (`real_with_id.zarr`) is not in this layout.
+The real dataset (`real_with_id.zarr.zip`) is not in this layout.
 
 ## 1. Why one packed file
 

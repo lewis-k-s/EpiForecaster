@@ -39,7 +39,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--real-dataset-path",
-        default="data/processed/real_with_id.zarr",
+        default="data/processed/real_with_id.zarr.zip",
         help="Real-data Zarr dataset path to evaluate against.",
     )
     parser.add_argument(

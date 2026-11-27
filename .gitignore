@@ -40,6 +40,7 @@ data/files/*.csv
 data/files/*.parquet
 data/files/*.h5
 data/processed/*.zarr
+data/processed/*.zarr.zip
 outputs/
 !outputs/
 outputs/*

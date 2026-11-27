@@ -1,6 +1,6 @@
 """Overview diagnostics for raw OD mobility matrices.
 
-This script reads ``data/files/mobility.zarr`` with xarray and produces a compact
+This script reads ``data/files/mobility.zarr.zip`` with xarray and produces a compact
 set of mobility indicators useful before deeper regime or epidemiological
 coupling analyses.
 """
@@ -23,6 +23,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+from data.preprocess.zarr_layout import open_zarr_store
 
 logger = logging.getLogger("mobility_overview_analysis")
 
@@ -47,7 +49,7 @@ class MobilityOverviewConfig:
 
 def open_mobility_dataset(path: Path) -> xr.Dataset:
     """Open a mobility Zarr dataset and normalize destination naming."""
-    ds = xr.open_zarr(path, chunks={"date": 1})
+    ds = open_zarr_store(path, chunks={"date": 1})
     if "target" in ds.dims:
         ds = ds.rename({"target": "destination"})
     if "mobility" not in ds:
@@ -96,7 +98,9 @@ def compute_daily_metrics(
                 if edge_values.size
                 else 0.0,
                 "edge_gini": gini_coefficient(edge_values),
-                "top_edge_fraction": top_fraction(edge_values, total, top_edge_fraction),
+                "top_edge_fraction": top_fraction(
+                    edge_values, total, top_edge_fraction
+                ),
                 "reciprocity_ratio": reciprocity_ratio(matrix),
                 "origin_strength_gini": gini_coefficient(row_strength),
                 "destination_strength_gini": gini_coefficient(col_strength),
@@ -354,11 +358,13 @@ def gini_coefficient(values: np.ndarray) -> float:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze raw mobility overview metrics")
+    parser = argparse.ArgumentParser(
+        description="Analyze raw mobility overview metrics"
+    )
     parser.add_argument(
         "--mobility-path",
         type=Path,
-        default=Path("data/files/mobility.zarr"),
+        default=Path("data/files/mobility.zarr.zip"),
         help="Path to the mobility Zarr store",
     )
     parser.add_argument(
@@ -405,7 +411,9 @@ def main() -> None:
 
     daily_df.to_csv(config.output_dir / "mobility_daily_indicators.csv")
     region_df.to_csv(config.output_dir / "mobility_top_regions.csv", index=False)
-    period_df.to_csv(config.output_dir / "mobility_lockdown_period_summary.csv", index=False)
+    period_df.to_csv(
+        config.output_dir / "mobility_lockdown_period_summary.csv", index=False
+    )
     generate_plots(daily_df, config.output_dir)
     write_report(daily_df, period_df, region_df, config.output_dir)
     logger.info("Wrote mobility overview outputs to %s", config.output_dir)

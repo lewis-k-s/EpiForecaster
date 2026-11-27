@@ -19,6 +19,7 @@ import pandas as pd
 import xarray as xr
 
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 from utils.logging import setup_logging, suppress_zarr_warnings
 
@@ -329,7 +330,7 @@ def main() -> None:
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    ds = xr.open_zarr(dataset_path)
+    ds = open_zarr_store(dataset_path)
     series = _load_series(ds)
 
     input_window_length = int(cfg.model.input_window_length)

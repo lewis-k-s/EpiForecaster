@@ -30,6 +30,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from data.preprocess.config import REGION_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 from utils.logging import setup_logging, suppress_zarr_warnings
 
@@ -643,12 +644,11 @@ def generate_input_series_plots(
     config = EpiForecasterConfig.from_file(config_path)
 
     # Get all node IDs from dataset
-    import xarray as xr
 
     from data.epi_dataset import EpiDataset
 
     zarr_path = Path(config.data.dataset_path).resolve()
-    dataset = xr.open_zarr(zarr_path)
+    dataset = open_zarr_store(zarr_path)
     all_nodes = list(range(dataset[REGION_COORD].size))
     biomarker_source_nodes: set[int] | None = None
     if biomarker_source_only and "edar_has_source" in dataset:

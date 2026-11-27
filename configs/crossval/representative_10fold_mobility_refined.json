@@ -1,7 +1,7 @@
 {
   "version": 1,
   "strategy": "representative-10fold-mobility-refined",
-  "dataset_path": "data/processed/real_with_id.zarr",
+  "dataset_path": "data/processed/real_with_id.zarr.zip",
   "run_id": "real",
   "split_seed": 42,
   "num_folds": 10,

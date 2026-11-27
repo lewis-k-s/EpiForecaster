@@ -13,6 +13,7 @@ import yaml
 
 from evaluation.granular_export import GRANULAR_KEY_COLUMNS
 from scripts.hpo.ablation_worker import AblationCampaign
+from data.preprocess.zarr_layout import open_zarr_store
 
 REQUIRED_HEADS = ("wastewater", "hospitalizations", "cases", "deaths")
 PROBABILISTIC_METRICS = ("wis", "crps", "nll", "abs_error")
@@ -355,9 +356,8 @@ def _mobility_context(
     if not path.exists():
         raise ValueError(f"mobility context data does not exist: {path}")
 
-    import xarray as xr
 
-    dataset = xr.open_zarr(path)
+    dataset = open_zarr_store(path)
     variable = str(context.get("variable", "mobility"))
     if variable not in dataset:
         raise ValueError(f"mobility context variable is absent: {variable}")

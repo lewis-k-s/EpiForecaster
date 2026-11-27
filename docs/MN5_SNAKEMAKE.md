@@ -191,6 +191,14 @@ run owns the processed dataset, QA record, generated DVC pointer, and publicatio
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
+The real dataset `real_with_id` is rebuilt with
+`workflow/config/mn5_preprocess_real.yaml` on one `acc_debug` node (120 minutes).
+Raw inputs are the DVC pointers `data/files/catalonia_real_raw_inputs_v1.dvc` and
+`data/files/mobility.zarr.zip.dvc`. The run publishes a packed
+`real_with_id.zarr.zip.dvc` pointer, which replaced the old `real_with_id.zarr.dvc`
+directory pointer. After review, copy it to `data/processed/` and repoint the
+consuming templates and `data.dataset_path` (see the template header).
+
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
 composition when both stages are wanted. Training and HPO trials force
