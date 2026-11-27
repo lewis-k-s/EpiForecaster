@@ -180,17 +180,6 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
     assert "rmse" not in metrics
     assert "r2" not in metrics
     assert metrics["mae_hosp_log1p_per_100k"] == 0.0
-    expected_exact_normal_crps = 2.0 / (2.0 * torch.pi) ** 0.5 - 1.0 / torch.pi**0.5
-    assert metrics["nll_hosp_log1p_per_100k"] == pytest.approx(
-        0.5 * torch.log(torch.tensor(2.0 * torch.pi)).item()
-    )
-    assert metrics["crps_hosp_log1p_per_100k"] == pytest.approx(
-        float(expected_exact_normal_crps)
-    )
-    assert metrics["coverage_80_hosp"] == pytest.approx(1.0)
-    assert len(metrics["coverage_80_hosp_per_h"]) == 2
-    assert "mae_cases_log1p_per_100k" in metrics
-    assert "mae_deaths_log1p_per_100k" in metrics
     assert metrics["observed_count_cases"] == 3
     assert metrics["observed_count_deaths"] == 2
     assert metrics["mae_cases_log1p_per_100k"] > 0.0

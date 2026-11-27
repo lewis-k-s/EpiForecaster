@@ -473,7 +473,7 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
         criterion=criterion,
         horizon=2,
         device=torch.device("cpu"),
-        granular_csv_path=granular_csv,
+        granular_output_path=granular_csv,
         granular_eval_format="csv",
     )
 
