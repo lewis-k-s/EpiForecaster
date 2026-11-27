@@ -418,7 +418,7 @@ Reproduce the machine-readable split analysis and plot with:
 
 ```bash
 uv run python scripts/analysis/analyze_split_mobility_cut.py \
-  --dataset data/processed/real_with_id.zarr.zip \
+  --dataset data/processed/real_with_id_v2.zarr.zip \
   --config configs/production_only/train_epifor_mn5_full.yaml \
   --full-coverage-manifest path/to/representative_10fold_manifest.json \
   --output-dir outputs/reports/split_mobility_cut

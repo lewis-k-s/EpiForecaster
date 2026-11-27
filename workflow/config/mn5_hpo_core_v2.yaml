@@ -6,7 +6,7 @@
 # The "core" space samples only learning rate, weight decay and head capacity;
 # the base config owns the rest.
 #
-# Packing matches idev-campaign-v2-20261117 (job 49134999): 8 workers on
+# Packing matches mn5_integration_dev_v2.yaml (job 49134999): 8 workers on
 # 4 GPUs with 2 CUDA MPS clients each, base loaders (4 train, 2 val) on 10 CPUs.
 # There a 50-epoch production trial took ~8.8 min including ~4 min of setup
 # and compilation and the test evaluation that HPO skips; epochs ran at

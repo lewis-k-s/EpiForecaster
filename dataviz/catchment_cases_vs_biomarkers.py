@@ -248,7 +248,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         type=Path,
-        default=Path("data/processed/real_with_id.zarr.zip"),
+        default=Path("data/processed/real_with_id_v2.zarr.zip"),
     )
     parser.add_argument(
         "--config",

@@ -215,9 +215,6 @@ and repoint the consuming templates and `data.dataset_path` (see the template
 header). The production config, the standing templates in `workflow/config/`
 and the campaigns `ablation_default_v2`, `ablation_smoke_v1` and `transfer_v2`
 use `real_with_id_v2` with `configs/crossval/representative_10fold_pop3000.json`.
-The dated run records under `workflow/config/integration_dev/`, `transfer_dev/`
-and `latent_diagnostics/` still stage the 161-target `real_with_id` pointer they
-ran with and need the v2 pointer before reuse.
 
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
@@ -606,18 +603,6 @@ value and alert thresholds, `event_decision_fixed_0_5`, and nullable
 calibration evidence. It is not a negative alert. Summary JSON contains metric
 counts, support reasons, and horizon-band results. Hospitalization event scores
 remain unsupported until source-level aggregation is defined.
-
-## HPO seed replicates
-
-An HPO config may set `optuna.enqueue_trials` with `params` (a list of complete
-parameter mappings) and `seeds` (distinct `training.seed` values). The first
-worker queues every parameter set once per seed, seed by seed, and each queued
-trial overrides `training.seed`. Preparation rejects a config unless
-`workers * trials_per_worker` equals the queue length, so no trial is sampled,
-and unless `pruning_start_epoch >= epochs`, so every replicate trains to the
-end. `workflow/config/mn5_hpo_core_replicates.yaml` replicates the best core
-configurations. The selection stage still promotes the single best trial; compare
-configurations by their WIS across seeds in the journal.
 
 ## CUDA MPS worker packing
 

@@ -131,7 +131,6 @@ def test_reactive_finetune_smoke_matches_from_scratch_smoke() -> None:
     [
         "workflow/config/mn5_synth_pretrain_reactive_n100.yaml",
         "workflow/config/mn5_synth_pretrain_reactive_n100_interactive_debug.yaml",
-        "workflow/config/mn5_synth_pretrain_reactive_n100_sizing.yaml",
     ],
 )
 def test_reactive_pretraining_consumes_reactive_corpus(workflow_path: str) -> None:
