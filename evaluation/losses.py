@@ -688,13 +688,14 @@ class JointInferenceLoss(nn.Module):
             return drop_nowcast(tensor, horizon)
         return tensor
 
-    def _get_head_distribution_params(
+    def head_distribution(
         self,
         model_outputs: dict[str, torch.Tensor],
         *,
         head_name: str,
         horizon: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forecast-aligned location and scale of the distribution the loss scores."""
         pred_key = self._HEAD_PRED_KEY[head_name]
         loc = model_outputs.get(f"dist_{head_name}_loc", model_outputs[pred_key])
         scale = model_outputs.get(f"dist_{head_name}_scale")
@@ -714,7 +715,7 @@ class JointInferenceLoss(nn.Module):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         horizon = int(target.shape[1])
-        loc, scale = self._get_head_distribution_params(
+        loc, scale = self.head_distribution(
             model_outputs, head_name=head_name, horizon=horizon
         )
         if self.observation_loss in {"nll", "crps", "wis"}:
@@ -940,6 +941,9 @@ class JointInferenceLoss(nn.Module):
         model_outputs: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor | None],
         batch_data: EpiBatch | None = None,
+        *,
+        observation_supervision: dict[str, dict[str, torch.Tensor | None]]
+        | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute joint inference loss components.
@@ -959,6 +963,8 @@ class JointInferenceLoss(nn.Module):
                 - S_target/I_target/H_target/R_target: [B, H+1] state targets (optional)
                 - death_flow_target: [B, H] destination-dated flow target (optional)
             batch_data: Batch history masks used for per-head window eligibility.
+            observation_supervision: Result of ``compute_observation_supervision``
+                for the same targets and batch, when the caller already has it.
 
         Returns:
             Dict with unweighted and weighted component losses plus total:
@@ -987,11 +993,13 @@ class JointInferenceLoss(nn.Module):
         latent_weighted_losses = dict(latent_losses)
         sird_supervision_raw_loss = zero_anchor
         sird_supervision_loss = zero_anchor
-        obs_supervision = self.compute_observation_supervision(
-            targets,
-            device=zero_anchor.device,
-            batch_data=batch_data,
-        )
+        obs_supervision = observation_supervision
+        if obs_supervision is None:
+            obs_supervision = self.compute_observation_supervision(
+                targets,
+                device=zero_anchor.device,
+                batch_data=batch_data,
+            )
         obs_active_mask = torch.stack(
             [
                 cast(torch.Tensor, obs_supervision["ww"]["active"]),

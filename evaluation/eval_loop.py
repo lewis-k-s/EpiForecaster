@@ -9,7 +9,7 @@ from __future__ import annotations
 import csv as csv_lib
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -31,20 +31,17 @@ from evaluation.loaders import build_loader_from_config, load_model_from_checkpo
 from evaluation.latent_diagnostics import build_latent_diagnostic_protocols
 from evaluation.latent_information import TorchLatentInformationAccumulator
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
-from evaluation.metrics import (
-    ProbabilisticMetricResult,
-    TorchDistributionMetricAccumulator,
-    TorchMaskedMetricAccumulator,
-)
 from evaluation.pathway_metrics import (
-    ObservationLatentMetricResult,
-    PathwayMetricResult,
     TorchLatentCoherenceAccumulator,
     TorchLatentPlausibilityAccumulator,
     TorchLatentProtocolAccumulator,
-    TorchObservationLatentCoherenceAccumulator,
-    TorchPathwayMetricAccumulator,
-    WindowSpearmanMetricResult,
+)
+from evaluation.target_scoring import (
+    CANONICAL_TARGET_NAMES,
+    NodeStats,
+    TargetScorer,
+    build_target_forecast,
+    region_set_members,
 )
 from evaluation.selection_scores import compute_validation_selection_score
 from models.configs import EpiForecasterConfig
@@ -72,33 +69,11 @@ PER_HEAD_NODE_METRICS_FIELDNAMES = [
     "mae",
     "rmse",
 ]
-_HEAD_CANONICAL_NAMES = {
-    "hosp": "hospitalizations",
-    "ww": "wastewater",
-    "cases": "cases",
-    "deaths": "deaths",
-}
 _DEFAULT_RELEVANT_SOURCE_MAPPING = {
     "hosp": "hospitalization_flow",
     "ww": "I",
     "cases": "I",
     "deaths": "death_flow",
-}
-_RELEVANT_SOURCE_OUTPUT_KEYS = {
-    "hospitalization_flow": "hospitalization_flow",
-    "H": "H_trajectory",
-    "I": "I_trajectory",
-    "death_flow": "death_flow",
-    "infection_flow": "infection_flow",
-    "D": "D_trajectory",
-}
-# Stored true value of a relevant source; the admission and infection flows have
-# no stored truth.
-_RELEVANT_SOURCE_TARGET_KEYS = {
-    "H": "H_target",
-    "I": "I_target",
-    "death_flow": "death_flow_target",
-    "D": "D_target",
 }
 # Heads observed as weekly totals dated on the week start, by the daily latent
 # flow that the total accumulates.
@@ -124,7 +99,7 @@ def _resolve_relevant_source_mapping(
     if relevant_source_mapping is None:
         return dict(_DEFAULT_RELEVANT_SOURCE_MAPPING)
 
-    expected_heads = set(_HEAD_CANONICAL_NAMES)
+    expected_heads = set(CANONICAL_TARGET_NAMES)
     actual_heads = set(relevant_source_mapping)
     if actual_heads != expected_heads:
         raise ValueError(
@@ -143,87 +118,10 @@ def _resolve_relevant_source_mapping(
     return resolved
 
 
-def _update_latent_information(
-    accumulator: TorchLatentInformationAccumulator | None,
-    *,
-    head: str,
-    source: str,
-    latent: torch.Tensor | None,
-    observed: torch.Tensor,
-    prediction: torch.Tensor,
-    residual: torch.Tensor | None,
-    weights: torch.Tensor,
-    nodes: torch.Tensor,
-    targets: dict[str, torch.Tensor | None],
-) -> None:
-    if accumulator is None or latent is None or residual is None:
-        return
-    target_key = _RELEVANT_SOURCE_TARGET_KEYS.get(source)
-    true_latent = None if target_key is None else targets.get(target_key)
-    accumulator.update(
-        head=head,
-        latent=latent,
-        observed=observed,
-        prediction=prediction,
-        residual=residual,
-        weights=weights,
-        nodes=nodes,
-        true_latent=(
-            None
-            if true_latent is None
-            else drop_nowcast(true_latent, int(observed.shape[1]))
-        ),
-    )
-
-
-def _forecast_aligned_output(
-    model_outputs: dict[str, torch.Tensor],
-    key: str,
-    horizon: int,
-) -> torch.Tensor | None:
-    value = model_outputs.get(key)
-    if value is None:
-        return None
-    return drop_nowcast(value, horizon)
-
-
-def _accumulate_per_head_node_metrics(
-    *,
-    accumulator: dict[str, dict[int, dict[str, float]]],
-    target_name: str,
-    target_nodes: torch.Tensor,
-    diff: torch.Tensor,
-    abs_diff: torch.Tensor,
-    weights: torch.Tensor,
-) -> None:
-    target_stats = accumulator.setdefault(target_name, {})
-    target_node_ids = target_nodes.detach().cpu().tolist()
-    per_sample_abs_sum = (abs_diff * weights).sum(dim=1).detach().cpu().tolist()
-    per_sample_sq_sum = ((diff**2) * weights).sum(dim=1).detach().cpu().tolist()
-    per_sample_count = (weights > 0).sum(dim=1).detach().cpu().tolist()
-    for node_id, abs_sum, sq_sum, observed_count in zip(
-        target_node_ids,
-        per_sample_abs_sum,
-        per_sample_sq_sum,
-        per_sample_count,
-        strict=False,
-    ):
-        count_value = int(observed_count)
-        if count_value <= 0:
-            continue
-        node_stats = target_stats.setdefault(
-            int(node_id),
-            {"abs_error_sum": 0.0, "sq_error_sum": 0.0, "observed_count": 0.0},
-        )
-        node_stats["abs_error_sum"] += float(abs_sum)
-        node_stats["sq_error_sum"] += float(sq_sum)
-        node_stats["observed_count"] += float(count_value)
-
-
 def _write_per_head_node_metrics_csv(
     *,
     output_path: Path,
-    per_head_node_metrics: dict[str, dict[int, dict[str, float]]],
+    per_head_node_metrics: Mapping[str, NodeStats],
     region_ids: list[str] | None,
     region_labels: list[str] | None,
     population_by_node: list[float] | None,
@@ -232,7 +130,7 @@ def _write_per_head_node_metrics_csv(
     with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv_lib.DictWriter(f, fieldnames=PER_HEAD_NODE_METRICS_FIELDNAMES)
         writer.writeheader()
-        for target in _HEAD_CANONICAL_NAMES.values():
+        for target in CANONICAL_TARGET_NAMES.values():
             target_stats = per_head_node_metrics.get(target, {})
             for node_id in sorted(target_stats):
                 stats = target_stats[node_id]
@@ -287,186 +185,77 @@ def _format_eval_summary(loss: float, metrics: dict[str, Any]) -> str:
     return "\n".join(table)
 
 
-def _add_probabilistic_metrics(
-    *,
-    metrics: dict[str, Any],
-    head_name: str,
-    summary: ProbabilisticMetricResult,
-) -> None:
-    metrics[f"nll_{head_name}_log1p_per_100k"] = summary.nll
-    metrics[f"crps_{head_name}_log1p_per_100k"] = summary.crps
-    metrics[f"wis_{head_name}_log1p_per_100k"] = summary.wis
-    metrics[f"wis_{head_name}_per_h"] = summary.wis_per_h
-    metrics[f"invalid_prediction_count_{head_name}"] = summary.invalid_prediction_count
-    metrics[f"scale_floor_count_{head_name}"] = summary.scale_floor_count
-    metrics[f"nll_{head_name}_per_h"] = summary.nll_per_h
-    metrics[f"crps_{head_name}_per_h"] = summary.crps_per_h
-    metrics[f"probabilistic_effective_count_{head_name}"] = summary.effective_count
-    for level_name, coverage in summary.coverage_by_level.items():
-        metrics[f"coverage_{level_name}_{head_name}"] = coverage
-        metrics[f"interval_width_{level_name}_{head_name}_log1p_per_100k"] = (
-            summary.interval_width_by_level[level_name]
-        )
-        metrics[f"coverage_{level_name}_{head_name}_per_h"] = (
-            summary.coverage_per_h_by_level[level_name]
-        )
-        metrics[f"interval_width_{level_name}_{head_name}_per_h"] = (
-            summary.interval_width_per_h_by_level[level_name]
-        )
-
-
-def _region_set_members(
-    region_sets: dict[str, frozenset[str]],
-    region_ids: Sequence[Any] | None,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Boolean node-index membership of each named region set."""
-    if region_ids is None:
-        raise ValueError("Region-set metrics need the dataset's region IDs")
-    ids = [str(region_id) for region_id in region_ids]
-    return {
-        name: torch.tensor(
-            [region_id in members for region_id in ids],
-            dtype=torch.bool,
-            device=device,
-        )
-        for name, members in sorted(region_sets.items())
-    }
-
-
-def _update_region_set_metrics(
-    accumulators: dict[str, dict[str, TorchDistributionMetricAccumulator]],
-    members: dict[str, torch.Tensor],
-    *,
-    head_name: str,
-    loc: torch.Tensor,
-    scale: torch.Tensor,
-    targets: torch.Tensor,
-    observed_mask: torch.Tensor | None,
-    sample_weights: torch.Tensor,
-    nodes: torch.Tensor,
-) -> None:
-    """Score one batch again with weights restricted to each region set."""
-    for name, member in members.items():
-        in_set = member[nodes.to(member.device)].to(sample_weights.dtype)
-        in_set = in_set.reshape(-1, *([1] * (sample_weights.dim() - 1)))
-        accumulators[name][head_name].update(
-            loc=loc,
-            scale=scale,
-            targets=targets,
-            observed_mask=observed_mask,
-            sample_weights=sample_weights * in_set,
-        )
-
-
 def _add_region_set_metrics(
     *,
     metrics: dict[str, Any],
-    accumulators: dict[str, dict[str, TorchDistributionMetricAccumulator]],
+    region_set_metrics: dict[str, dict[str, Any]],
 ) -> None:
     """Add ``region_set_<name>_*`` probabilistic metrics and their WIS endpoint.
 
-    The endpoint follows the checkpoint-selection rule: the equal-head mean of
+    ``region_set_metrics`` holds every target's probabilistic keys per set. The
+    endpoint follows the checkpoint-selection rule: the equal-head mean of
     pooled per-head WIS, NaN when a head has no valid support in the set.
     """
-    for name, head_accumulators in accumulators.items():
-        set_metrics: dict[str, Any] = {}
-        for head_name, accumulator in head_accumulators.items():
-            _add_probabilistic_metrics(
-                metrics=set_metrics,
-                head_name=head_name,
-                summary=accumulator.finalize(),
-            )
+    for name, set_metrics in region_set_metrics.items():
         try:
             mean_target_wis, _ = compute_validation_selection_score(
                 set_metrics,
                 observation_loss="wis",
                 selection_metric="mean_target_wis",
-                required_heads=tuple(_HEAD_CANONICAL_NAMES),
+                required_heads=tuple(CANONICAL_TARGET_NAMES),
             )
         except ValueError:
             mean_target_wis = float("nan")
-        set_metrics["mean_target_wis"] = mean_target_wis
         metrics.update(
             {f"region_set_{name}_{key}": value for key, value in set_metrics.items()}
         )
+        metrics[f"region_set_{name}_mean_target_wis"] = mean_target_wis
 
 
-def _add_pathway_metrics(
-    *,
-    metrics: dict[str, Any],
-    head_name: str,
-    summary: PathwayMetricResult,
-    mechanistic_probabilistic_summary: ProbabilisticMetricResult,
-) -> None:
-    prefix = f"pathway_{head_name}"
-    metrics[f"{prefix}_observed_count"] = summary.observed_count
-    metrics[f"{prefix}_effective_count"] = summary.effective_count
-    metrics[f"{prefix}_mean_abs_mechanistic_log1p_per_100k"] = (
-        summary.mean_abs_mechanistic
-    )
-    metrics[f"{prefix}_mean_abs_residual_log1p_per_100k"] = summary.mean_abs_residual
-    metrics[f"{prefix}_residual_abs_fraction"] = summary.residual_abs_fraction
-    metrics[f"{prefix}_residual_to_mechanistic_abs_ratio"] = (
-        summary.residual_to_mechanistic_abs_ratio
-    )
-    metrics[f"{prefix}_mechanistic_variance"] = summary.mechanistic_variance
-    metrics[f"{prefix}_residual_variance"] = summary.residual_variance
-    metrics[f"{prefix}_full_variance"] = summary.full_variance
-    metrics[f"{prefix}_mechanistic_variance_share"] = summary.mechanistic_variance_share
-    metrics[f"{prefix}_residual_variance_share"] = summary.residual_variance_share
-    metrics[f"{prefix}_mechanistic_only_mae_log1p_per_100k"] = (
-        summary.mechanistic_only_mae
-    )
-    metrics[f"{prefix}_mechanistic_only_rmse_log1p_per_100k"] = (
-        summary.mechanistic_only_rmse
-    )
-    metrics[f"{prefix}_mechanistic_only_nll_log1p_per_100k"] = (
-        mechanistic_probabilistic_summary.nll
-    )
-    metrics[f"{prefix}_mechanistic_only_crps_log1p_per_100k"] = (
-        mechanistic_probabilistic_summary.crps
-    )
-    metrics[f"{prefix}_reconstruction_max_abs_error"] = (
-        summary.reconstruction_max_abs_error
-    )
+class _LossLedger:
+    """Device-local running means of named loss components over batches."""
+
+    def __init__(self, names: Sequence[str], device: torch.device) -> None:
+        self._sums = {name: torch.tensor(0.0, device=device) for name in names}
+        self.batch_count = 0
+
+    def update(self, components: Mapping[str, torch.Tensor]) -> None:
+        for name, total in self._sums.items():
+            total += components[name].detach()
+        self.batch_count += 1
+
+    def mean(self, *names: str, factor: float = 1.0) -> float:
+        """Per-batch mean of the sum of ``names``, multiplied by ``factor``."""
+        total = self._sums[names[0]]
+        for name in names[1:]:
+            total = total + self._sums[name]
+        return (factor * total / max(1, self.batch_count)).item()
 
 
-def _add_window_spearman_metrics(
-    *,
-    metrics: dict[str, Any],
-    prefix: str,
-    summary: WindowSpearmanMetricResult,
-) -> None:
-    metrics[f"{prefix}_mean_window_spearman"] = summary.mean
-    metrics[f"{prefix}_window_spearman_total_count"] = summary.total_count
-    metrics[f"{prefix}_window_spearman_candidate_count"] = summary.candidate_count
-    metrics[f"{prefix}_window_spearman_eligible_count"] = summary.eligible_count
-    metrics[f"{prefix}_window_spearman_candidate_fraction"] = summary.candidate_fraction
-    metrics[f"{prefix}_window_spearman_eligible_fraction"] = summary.eligible_fraction
-    metrics[f"{prefix}_window_spearman_eligible_given_candidate_fraction"] = (
-        summary.eligible_given_candidate_fraction
-    )
-
-
-def _add_observation_latent_metrics(
-    *,
-    metrics: dict[str, Any],
-    head_name: str,
-    summary: ObservationLatentMetricResult,
-) -> None:
-    prefix = f"observation_latent_{head_name}"
-    metrics[f"{prefix}_observed_count"] = summary.observed_count
-    _add_window_spearman_metrics(
-        metrics=metrics,
-        prefix=f"{prefix}_full",
-        summary=summary.full_window_spearman,
-    )
-    _add_window_spearman_metrics(
-        metrics=metrics,
-        prefix=f"{prefix}_mechanistic_only",
-        summary=summary.mechanistic_only_window_spearman,
-    )
+_OBSERVATION_LOSS_COMPONENTS = ("ww", "hosp", "cases", "deaths")
+_LATENT_LOSS_TASKS = ("s", "i", "h", "r", "death_flow")
+_REGULARIZER_COMPONENTS = (
+    "history_reconstruction",
+    "residual_penalty",
+    "beta_smoothness",
+)
+# Metric key of each loss component that evaluation reports as a mean.
+_LOSS_METRIC_COMPONENTS = {
+    **{f"loss_{name}": name for name in _OBSERVATION_LOSS_COMPONENTS},
+    "loss_sird_supervision": "sird_supervision",
+    **{f"loss_latent_{task}": f"latent_{task}" for task in _LATENT_LOSS_TASKS},
+    **{
+        f"loss_{name}_weighted": f"{name}_weighted"
+        for name in _OBSERVATION_LOSS_COMPONENTS
+    },
+    "loss_sird_supervision_weighted": "sird_supervision_weighted",
+    **{f"loss_{name}": name for name in _REGULARIZER_COMPONENTS},
+    **{f"loss_latent_{task}_raw": f"latent_{task}_raw" for task in _LATENT_LOSS_TASKS},
+    **{
+        f"loss_latent_{task}_component_weighted": f"latent_{task}_weighted"
+        for task in _LATENT_LOSS_TASKS
+    },
+}
 
 
 def _add_delay_kernel_metrics(
@@ -535,11 +324,9 @@ def evaluate_loader(
     node_metrics_csv_path: Path | None = None,
     per_head_node_metrics_csv_path: Path | None = None,
     granular_output_path: Path | None = None,
-    granular_csv_path: Path | None = None,
     granular_eval_format: str | None = None,
     granular_metadata: dict[str, Any] | None = None,
     relevant_source_mapping: dict[str, str] | None = None,
-    output_csv_path: Path | None = None,
     node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
     latent_information: bool = False,
@@ -561,13 +348,11 @@ def evaluate_loader(
         node_metrics_csv_path: Optional path to save per-node MAE metrics as CSV
         per_head_node_metrics_csv_path: Optional path to save per-head node metrics CSV
         granular_output_path: Optional path to save granular per-example error rows
-        granular_csv_path: Deprecated alias for granular_output_path
         granular_eval_format: Optional output format override ("parquet" or "csv")
         granular_metadata: Optional metadata to write alongside granular output
         relevant_source_mapping: Exact target-to-mechanistic-source mapping used
             for quantitative observation-latent coherence metrics and persisted
             qualitative plot overlays. This does not alter pathway attribution.
-        output_csv_path: Deprecated alias for node_metrics_csv_path
         node_metrics_target: Canonical target name for the legacy node metrics CSV
         log_every: Progress logging cadence in batches
         latent_information: Compute the within-window latent-information
@@ -583,14 +368,10 @@ def evaluate_loader(
         - node_mae_dict: Dictionary mapping target name -> node_id -> average MAE
     """
     logger.info(f"{split_name} evaluation started...")
-    if node_metrics_csv_path is None:
-        node_metrics_csv_path = output_csv_path
-    if granular_output_path is None:
-        granular_output_path = granular_csv_path
-    if node_metrics_target not in _HEAD_CANONICAL_NAMES.values():
+    if node_metrics_target not in CANONICAL_TARGET_NAMES.values():
         raise ValueError(
             f"Unknown node_metrics_target {node_metrics_target!r}; expected one of "
-            f"{tuple(_HEAD_CANONICAL_NAMES.values())}."
+            f"{tuple(CANONICAL_TARGET_NAMES.values())}."
         )
     resolved_relevant_sources = _resolve_relevant_source_mapping(
         relevant_source_mapping
@@ -600,53 +381,9 @@ def evaluate_loader(
     # gets compiled metric steps: eager updates launch hundreds of tiny kernels
     # per batch, which made validation cost more than training.
     compile_metrics = hasattr(model, "_orig_mod") and device.type == "cuda"
-    total_loss = torch.tensor(0.0, device=device)
-    hosp_metrics = TorchMaskedMetricAccumulator(
-        device=device, horizon=horizon, compile_step=compile_metrics
+    loss_ledger = _LossLedger(
+        ("total", *_LOSS_METRIC_COMPONENTS.values()), device=device
     )
-    ww_metrics = TorchMaskedMetricAccumulator(
-        device=device, horizon=horizon, compile_step=compile_metrics
-    )
-    cases_metrics = TorchMaskedMetricAccumulator(
-        device=device, horizon=horizon, compile_step=compile_metrics
-    )
-    deaths_metrics = TorchMaskedMetricAccumulator(
-        device=device, horizon=horizon, compile_step=compile_metrics
-    )
-    distribution_metric_kwargs = {
-        "device": device,
-        "horizon": horizon,
-        "distribution_family": criterion.distribution_family,
-        "distribution_df": criterion.distribution_df,
-        "scale_floor": criterion.distribution_scale_floor,
-        "interval_levels": criterion.interval_levels,
-        "censored": criterion.censored,
-        "compile_step": compile_metrics,
-    }
-    hosp_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
-    ww_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
-    cases_prob_metrics = TorchDistributionMetricAccumulator(
-        **distribution_metric_kwargs
-    )
-    deaths_prob_metrics = TorchDistributionMetricAccumulator(
-        **distribution_metric_kwargs
-    )
-    pathway_metrics = {
-        head_name: TorchPathwayMetricAccumulator(
-            device=device, compile_step=compile_metrics
-        )
-        for head_name in _HEAD_CANONICAL_NAMES
-    }
-    observation_latent_metrics = {
-        head_name: TorchObservationLatentCoherenceAccumulator(
-            device=device, compile_step=compile_metrics
-        )
-        for head_name in _HEAD_CANONICAL_NAMES
-    }
-    mechanistic_prob_metrics = {
-        head_name: TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
-        for head_name in _HEAD_CANONICAL_NAMES
-    }
     latent_metrics = TorchLatentCoherenceAccumulator(
         device=device, compile_step=compile_metrics
     )
@@ -670,55 +407,14 @@ def evaluate_loader(
         if latent_information
         else None
     )
-    loss_ww_sum = torch.tensor(0.0, device=device)
-    loss_hosp_sum = torch.tensor(0.0, device=device)
-    loss_cases_sum = torch.tensor(0.0, device=device)
-    loss_deaths_sum = torch.tensor(0.0, device=device)
-    loss_sird_supervision_sum = torch.tensor(0.0, device=device)
-    loss_ww_weighted_sum = torch.tensor(0.0, device=device)
-    loss_hosp_weighted_sum = torch.tensor(0.0, device=device)
-    loss_cases_weighted_sum = torch.tensor(0.0, device=device)
-    loss_deaths_weighted_sum = torch.tensor(0.0, device=device)
-    loss_sird_supervision_weighted_sum = torch.tensor(0.0, device=device)
-    regularizer_names = (
-        "history_reconstruction",
-        "residual_penalty",
-        "beta_smoothness",
-    )
-    loss_regularizer_sums = {
-        name: torch.tensor(0.0, device=device) for name in regularizer_names
-    }
-    loss_latent_s_sum = torch.tensor(0.0, device=device)
-    loss_latent_i_sum = torch.tensor(0.0, device=device)
-    loss_latent_h_sum = torch.tensor(0.0, device=device)
-    loss_latent_r_sum = torch.tensor(0.0, device=device)
-    loss_latent_death_flow_sum = torch.tensor(0.0, device=device)
-    latent_loss_tasks = ("s", "i", "h", "r", "death_flow")
-    loss_latent_raw_sums = {
-        task: torch.tensor(0.0, device=device) for task in latent_loss_tasks
-    }
-    loss_latent_component_weighted_sums = {
-        task: torch.tensor(0.0, device=device) for task in latent_loss_tasks
-    }
 
-    per_head_node_metrics: dict[str, dict[int, dict[str, float]]] = {}
     num_batches = len(loader)
-    eval_iter = loader
     effective_log_every = max(1, log_every)
     dataset = getattr(loader, "dataset", None)
     temporal_coords = getattr(dataset, "_temporal_coords", None)
     region_ids = getattr(dataset, "_region_ids", None)
     region_labels = getattr(dataset, "_region_labels", None)
-    region_set_members = (
-        _region_set_members(region_sets, region_ids, device) if region_sets else {}
-    )
-    region_set_prob_metrics = {
-        name: {
-            head_name: TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
-            for head_name in _HEAD_CANONICAL_NAMES
-        }
-        for name in region_set_members
-    }
+    members = region_set_members(region_sets, region_ids, device) if region_sets else {}
     resolved_granular_format = (
         infer_granular_eval_format(granular_output_path, granular_eval_format)
         if granular_output_path is not None
@@ -733,6 +429,22 @@ def evaluate_loader(
         if granular_output_path is not None
         else None
     )
+    target_scorers = {
+        head: TargetScorer(
+            head,
+            criterion=criterion,
+            device=device,
+            horizon=horizon,
+            compile_step=compile_metrics,
+            region_set_members=members,
+            latent_information=latent_information_metrics,
+            granular_writer=granular_writer,
+            temporal_coords=temporal_coords,
+            region_ids=region_ids,
+            region_labels=region_labels,
+        )
+        for head in CANONICAL_TARGET_NAMES
+    }
 
     model_was_training = model.training
     model.eval()
@@ -753,7 +465,6 @@ def evaluate_loader(
     )
     current_batch_idx: int | None = None
     current_stage = "init"
-    processed_batches = 0
     try:
         with (
             torch.no_grad(),
@@ -796,52 +507,19 @@ def evaluate_loader(
                         current_stage,
                     )
 
-                # Create sliced model outputs for metric computation
-                sliced_model_outputs = {
-                    k: drop_nowcast(v, horizon)
-                    if k.startswith("pred_") and isinstance(v, torch.Tensor)
-                    else v
-                    for k, v in model_outputs.items()
-                }
-
-                # Compute loss components
                 current_stage = "loss_components"
-                components = criterion.compute_components(
-                    model_outputs, targets_dict, batch_data
-                )
-                metric_supervision = criterion.compute_observation_supervision(
+                supervision = criterion.compute_observation_supervision(
                     targets_dict,
                     device=device,
                     batch_data=batch_data,
                 )
-                loss = components["total"]
-                total_loss += loss.detach()
-                loss_ww_sum += components["ww"].detach()
-                loss_hosp_sum += components["hosp"].detach()
-                loss_cases_sum += components["cases"].detach()
-                loss_deaths_sum += components["deaths"].detach()
-                loss_sird_supervision_sum += components["sird_supervision"].detach()
-                loss_latent_s_sum += components["latent_s"].detach()
-                loss_latent_i_sum += components["latent_i"].detach()
-                loss_latent_h_sum += components["latent_h"].detach()
-                loss_latent_r_sum += components["latent_r"].detach()
-                loss_latent_death_flow_sum += components["latent_death_flow"].detach()
-                for task in latent_loss_tasks:
-                    loss_latent_raw_sums[task] += components[
-                        f"latent_{task}_raw"
-                    ].detach()
-                    loss_latent_component_weighted_sums[task] += components[
-                        f"latent_{task}_weighted"
-                    ].detach()
-                loss_ww_weighted_sum += components["ww_weighted"].detach()
-                loss_hosp_weighted_sum += components["hosp_weighted"].detach()
-                loss_cases_weighted_sum += components["cases_weighted"].detach()
-                loss_deaths_weighted_sum += components["deaths_weighted"].detach()
-                loss_sird_supervision_weighted_sum += components[
-                    "sird_supervision_weighted"
-                ].detach()
-                for name in regularizer_names:
-                    loss_regularizer_sums[name] += components[name].detach()
+                components = criterion.compute_components(
+                    model_outputs,
+                    targets_dict,
+                    batch_data,
+                    observation_supervision=supervision,
+                )
+                loss_ledger.update(components)
                 latent_metrics.update(
                     model_outputs=model_outputs,
                     targets=targets_dict,
@@ -850,8 +528,8 @@ def evaluate_loader(
                 # targets, so they are valid on real data.
                 ascertainment_inputs = {}
                 for head_name, flow_key in _ASCERTAINMENT_LATENT_FLOWS.items():
-                    head_target = metric_supervision[head_name]["target"]
-                    head_weights = metric_supervision[head_name]["weights"]
+                    head_target = supervision[head_name]["target"]
+                    head_weights = supervision[head_name]["weights"]
                     if head_target is None or head_weights is None:
                         continue
                     ascertainment_inputs[head_name] = (
@@ -898,537 +576,19 @@ def evaluate_loader(
                         epoch=0,
                     )
 
-                pred_hosp = sliced_model_outputs.get("pred_hosp")
-                hosp_targets = metric_supervision["hosp"]["target"]
-                hosp_mask = targets_dict.get("hosp_mask")
-                hosp_weights = metric_supervision["hosp"]["weights"]
-                if (
-                    pred_hosp is not None
-                    and hosp_targets is not None
-                    and hosp_weights is not None
-                ):
-                    _unused_diff, abs_diff, weights = hosp_metrics.update(
-                        predictions=pred_hosp,
-                        targets=hosp_targets,
-                        observed_mask=hosp_mask,
-                        sample_weights=hosp_weights,
-                    )
-                    target_nodes = batch_data.target_node
-
-                    _accumulate_per_head_node_metrics(
-                        accumulator=per_head_node_metrics,
-                        target_name=_HEAD_CANONICAL_NAMES["hosp"],
-                        target_nodes=target_nodes,
-                        diff=_unused_diff,
-                        abs_diff=abs_diff,
-                        weights=weights,
-                    )
-                    hosp_loc, hosp_scale = criterion._get_head_distribution_params(
-                        model_outputs,
-                        head_name="hosp",
-                        horizon=int(hosp_targets.shape[1]),
-                    )
-                    hosp_prob_batch = hosp_prob_metrics.update(
-                        loc=hosp_loc,
-                        scale=hosp_scale,
-                        targets=hosp_targets,
-                        observed_mask=hosp_mask,
-                        sample_weights=hosp_weights,
-                    )
-                    _update_region_set_metrics(
-                        region_set_prob_metrics,
-                        region_set_members,
-                        head_name="hosp",
-                        loc=hosp_loc,
-                        scale=hosp_scale,
-                        targets=hosp_targets,
-                        observed_mask=hosp_mask,
-                        sample_weights=hosp_weights,
-                        nodes=batch_data.target_node,
-                    )
-                    hosp_mechanistic = _forecast_aligned_output(
-                        model_outputs,
-                        "mechanistic_hosp",
-                        int(hosp_targets.shape[1]),
-                    )
-                    hosp_residual = _forecast_aligned_output(
-                        model_outputs,
-                        "residual_hosp",
-                        int(hosp_targets.shape[1]),
-                    )
-                    hosp_relevant_source_name = resolved_relevant_sources["hosp"]
-                    hosp_relevant_source = _forecast_aligned_output(
-                        model_outputs,
-                        _RELEVANT_SOURCE_OUTPUT_KEYS[hosp_relevant_source_name],
-                        int(hosp_targets.shape[1]),
-                    )
-                    observation_latent_metrics["hosp"].update(
-                        full_prediction=pred_hosp,
-                        relevant_latent=hosp_relevant_source,
-                        weights=hosp_weights,
-                        mechanistic_projection=hosp_mechanistic,
-                    )
-                    _update_latent_information(
-                        latent_information_metrics,
-                        head="hosp",
-                        source=hosp_relevant_source_name,
+                for head, scorer in target_scorers.items():
+                    forecast = build_target_forecast(
+                        head,
+                        model_outputs=model_outputs,
                         targets=targets_dict,
-                        latent=hosp_relevant_source,
-                        observed=hosp_targets,
-                        prediction=pred_hosp,
-                        residual=hosp_residual,
-                        weights=hosp_weights,
-                        nodes=batch_data.target_node,
+                        supervision=supervision[head],
+                        criterion=criterion,
+                        latent_source=resolved_relevant_sources[head],
+                        horizon=horizon,
                     )
-                    if hosp_mechanistic is not None and hosp_residual is not None:
-                        pathway_metrics["hosp"].update(
-                            full=hosp_loc,
-                            mechanistic=hosp_mechanistic,
-                            residual=hosp_residual,
-                            targets=hosp_targets,
-                            weights=hosp_weights,
-                        )
-                        mechanistic_prob_metrics["hosp"].update(
-                            loc=hosp_mechanistic,
-                            scale=hosp_scale,
-                            targets=hosp_targets,
-                            observed_mask=hosp_mask,
-                            sample_weights=hosp_weights,
-                        )
-
-                    if granular_writer is not None:
-                        granular_writer.write_rows(
-                            batch_data=batch_data,
-                            target_name="hosp",
-                            predictions=pred_hosp,
-                            targets=hosp_targets,
-                            weights=weights,
-                            nll=hosp_prob_batch.nll,
-                            crps=hosp_prob_batch.crps,
-                            wis=hosp_prob_batch.wis,
-                            distribution_loc=hosp_loc,
-                            distribution_scale=hosp_scale,
-                            distribution_family=criterion.distribution_family,
-                            distribution_df=criterion.distribution_df,
-                            intervals=hosp_prob_batch.intervals,
-                            mechanistic_predictions=hosp_mechanistic,
-                            residual_contributions=hosp_residual,
-                            relevant_latent_name=hosp_relevant_source_name,
-                            relevant_latent_values=hosp_relevant_source,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                        )
-                    del (
-                        _unused_diff,
-                        abs_diff,
-                        weights,
-                        target_nodes,
-                        hosp_loc,
-                        hosp_scale,
-                        hosp_prob_batch,
-                        hosp_mechanistic,
-                        hosp_residual,
-                        hosp_relevant_source,
-                    )
-                del pred_hosp, hosp_targets, hosp_mask, hosp_weights
-
-                pred_ww = sliced_model_outputs.get("pred_ww")
-                ww_targets = metric_supervision["ww"]["target"]
-                ww_mask = targets_dict.get("ww_mask")
-                ww_weights = metric_supervision["ww"]["weights"]
-                if (
-                    pred_ww is not None
-                    and ww_targets is not None
-                    and ww_weights is not None
-                ):
-                    ww_diff, ww_abs_diff, ww_effective_weights = ww_metrics.update(
-                        predictions=pred_ww,
-                        targets=ww_targets,
-                        observed_mask=ww_mask,
-                        sample_weights=ww_weights,
-                    )
-                    _accumulate_per_head_node_metrics(
-                        accumulator=per_head_node_metrics,
-                        target_name=_HEAD_CANONICAL_NAMES["ww"],
-                        target_nodes=batch_data.target_node,
-                        diff=ww_diff,
-                        abs_diff=ww_abs_diff,
-                        weights=ww_effective_weights,
-                    )
-                    ww_loc, ww_scale = criterion._get_head_distribution_params(
-                        model_outputs,
-                        head_name="ww",
-                        horizon=int(ww_targets.shape[1]),
-                    )
-                    ww_prob_batch = ww_prob_metrics.update(
-                        loc=ww_loc,
-                        scale=ww_scale,
-                        targets=ww_targets,
-                        observed_mask=ww_mask,
-                        sample_weights=ww_weights,
-                    )
-                    _update_region_set_metrics(
-                        region_set_prob_metrics,
-                        region_set_members,
-                        head_name="ww",
-                        loc=ww_loc,
-                        scale=ww_scale,
-                        targets=ww_targets,
-                        observed_mask=ww_mask,
-                        sample_weights=ww_weights,
-                        nodes=batch_data.target_node,
-                    )
-                    ww_mechanistic = _forecast_aligned_output(
-                        model_outputs,
-                        "mechanistic_ww",
-                        int(ww_targets.shape[1]),
-                    )
-                    ww_residual = _forecast_aligned_output(
-                        model_outputs,
-                        "residual_ww",
-                        int(ww_targets.shape[1]),
-                    )
-                    ww_relevant_source_name = resolved_relevant_sources["ww"]
-                    ww_relevant_source = _forecast_aligned_output(
-                        model_outputs,
-                        _RELEVANT_SOURCE_OUTPUT_KEYS[ww_relevant_source_name],
-                        int(ww_targets.shape[1]),
-                    )
-                    observation_latent_metrics["ww"].update(
-                        full_prediction=pred_ww,
-                        relevant_latent=ww_relevant_source,
-                        weights=ww_weights,
-                        mechanistic_projection=ww_mechanistic,
-                    )
-                    _update_latent_information(
-                        latent_information_metrics,
-                        head="ww",
-                        source=ww_relevant_source_name,
-                        targets=targets_dict,
-                        latent=ww_relevant_source,
-                        observed=ww_targets,
-                        prediction=pred_ww,
-                        residual=ww_residual,
-                        weights=ww_weights,
-                        nodes=batch_data.target_node,
-                    )
-                    if ww_mechanistic is not None and ww_residual is not None:
-                        pathway_metrics["ww"].update(
-                            full=ww_loc,
-                            mechanistic=ww_mechanistic,
-                            residual=ww_residual,
-                            targets=ww_targets,
-                            weights=ww_weights,
-                        )
-                        mechanistic_prob_metrics["ww"].update(
-                            loc=ww_mechanistic,
-                            scale=ww_scale,
-                            targets=ww_targets,
-                            observed_mask=ww_mask,
-                            sample_weights=ww_weights,
-                        )
-                    if granular_writer is not None:
-                        granular_writer.write_rows(
-                            batch_data=batch_data,
-                            target_name="ww",
-                            predictions=pred_ww,
-                            targets=ww_targets,
-                            weights=ww_effective_weights,
-                            nll=ww_prob_batch.nll,
-                            crps=ww_prob_batch.crps,
-                            wis=ww_prob_batch.wis,
-                            distribution_loc=ww_loc,
-                            distribution_scale=ww_scale,
-                            distribution_family=criterion.distribution_family,
-                            distribution_df=criterion.distribution_df,
-                            intervals=ww_prob_batch.intervals,
-                            mechanistic_predictions=ww_mechanistic,
-                            residual_contributions=ww_residual,
-                            relevant_latent_name=ww_relevant_source_name,
-                            relevant_latent_values=ww_relevant_source,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                        )
-                    del (
-                        ww_diff,
-                        ww_abs_diff,
-                        ww_effective_weights,
-                        ww_loc,
-                        ww_scale,
-                        ww_prob_batch,
-                        ww_mechanistic,
-                        ww_residual,
-                        ww_relevant_source,
-                    )
-                del pred_ww, ww_targets, ww_mask, ww_weights
-
-                pred_cases = sliced_model_outputs.get("pred_cases")
-                cases_targets = metric_supervision["cases"]["target"]
-                cases_mask = targets_dict.get("cases_mask")
-                cases_weights = metric_supervision["cases"]["weights"]
-                if (
-                    pred_cases is not None
-                    and cases_targets is not None
-                    and cases_weights is not None
-                ):
-                    cases_diff, cases_abs_diff, cases_effective_weights = (
-                        cases_metrics.update(
-                            predictions=pred_cases,
-                            targets=cases_targets,
-                            observed_mask=cases_mask,
-                            sample_weights=cases_weights,
-                        )
-                    )
-                    _accumulate_per_head_node_metrics(
-                        accumulator=per_head_node_metrics,
-                        target_name=_HEAD_CANONICAL_NAMES["cases"],
-                        target_nodes=batch_data.target_node,
-                        diff=cases_diff,
-                        abs_diff=cases_abs_diff,
-                        weights=cases_effective_weights,
-                    )
-                    cases_loc, cases_scale = criterion._get_head_distribution_params(
-                        model_outputs,
-                        head_name="cases",
-                        horizon=int(cases_targets.shape[1]),
-                    )
-                    cases_prob_batch = cases_prob_metrics.update(
-                        loc=cases_loc,
-                        scale=cases_scale,
-                        targets=cases_targets,
-                        observed_mask=cases_mask,
-                        sample_weights=cases_weights,
-                    )
-                    _update_region_set_metrics(
-                        region_set_prob_metrics,
-                        region_set_members,
-                        head_name="cases",
-                        loc=cases_loc,
-                        scale=cases_scale,
-                        targets=cases_targets,
-                        observed_mask=cases_mask,
-                        sample_weights=cases_weights,
-                        nodes=batch_data.target_node,
-                    )
-                    cases_mechanistic = _forecast_aligned_output(
-                        model_outputs,
-                        "mechanistic_cases",
-                        int(cases_targets.shape[1]),
-                    )
-                    cases_residual = _forecast_aligned_output(
-                        model_outputs,
-                        "residual_cases",
-                        int(cases_targets.shape[1]),
-                    )
-                    cases_relevant_source_name = resolved_relevant_sources["cases"]
-                    cases_relevant_source = _forecast_aligned_output(
-                        model_outputs,
-                        _RELEVANT_SOURCE_OUTPUT_KEYS[cases_relevant_source_name],
-                        int(cases_targets.shape[1]),
-                    )
-                    observation_latent_metrics["cases"].update(
-                        full_prediction=pred_cases,
-                        relevant_latent=cases_relevant_source,
-                        weights=cases_weights,
-                        mechanistic_projection=cases_mechanistic,
-                    )
-                    _update_latent_information(
-                        latent_information_metrics,
-                        head="cases",
-                        source=cases_relevant_source_name,
-                        targets=targets_dict,
-                        latent=cases_relevant_source,
-                        observed=cases_targets,
-                        prediction=pred_cases,
-                        residual=cases_residual,
-                        weights=cases_weights,
-                        nodes=batch_data.target_node,
-                    )
-                    if cases_mechanistic is not None and cases_residual is not None:
-                        pathway_metrics["cases"].update(
-                            full=cases_loc,
-                            mechanistic=cases_mechanistic,
-                            residual=cases_residual,
-                            targets=cases_targets,
-                            weights=cases_weights,
-                        )
-                        mechanistic_prob_metrics["cases"].update(
-                            loc=cases_mechanistic,
-                            scale=cases_scale,
-                            targets=cases_targets,
-                            observed_mask=cases_mask,
-                            sample_weights=cases_weights,
-                        )
-                    if granular_writer is not None:
-                        granular_writer.write_rows(
-                            batch_data=batch_data,
-                            target_name="cases",
-                            predictions=pred_cases,
-                            targets=cases_targets,
-                            weights=cases_effective_weights,
-                            nll=cases_prob_batch.nll,
-                            crps=cases_prob_batch.crps,
-                            wis=cases_prob_batch.wis,
-                            distribution_loc=cases_loc,
-                            distribution_scale=cases_scale,
-                            distribution_family=criterion.distribution_family,
-                            distribution_df=criterion.distribution_df,
-                            intervals=cases_prob_batch.intervals,
-                            mechanistic_predictions=cases_mechanistic,
-                            residual_contributions=cases_residual,
-                            relevant_latent_name=cases_relevant_source_name,
-                            relevant_latent_values=cases_relevant_source,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                        )
-                    del (
-                        cases_diff,
-                        cases_abs_diff,
-                        cases_effective_weights,
-                        cases_loc,
-                        cases_scale,
-                        cases_prob_batch,
-                        cases_mechanistic,
-                        cases_residual,
-                        cases_relevant_source,
-                    )
-                del pred_cases, cases_targets, cases_mask, cases_weights
-
-                pred_deaths = sliced_model_outputs.get("pred_deaths")
-                deaths_targets = metric_supervision["deaths"]["target"]
-                deaths_mask = targets_dict.get("deaths_mask")
-                deaths_weights = metric_supervision["deaths"]["weights"]
-                if (
-                    pred_deaths is not None
-                    and deaths_targets is not None
-                    and deaths_weights is not None
-                ):
-                    deaths_diff, deaths_abs_diff, deaths_effective_weights = (
-                        deaths_metrics.update(
-                            predictions=pred_deaths,
-                            targets=deaths_targets,
-                            observed_mask=deaths_mask,
-                            sample_weights=deaths_weights,
-                        )
-                    )
-                    _accumulate_per_head_node_metrics(
-                        accumulator=per_head_node_metrics,
-                        target_name=_HEAD_CANONICAL_NAMES["deaths"],
-                        target_nodes=batch_data.target_node,
-                        diff=deaths_diff,
-                        abs_diff=deaths_abs_diff,
-                        weights=deaths_effective_weights,
-                    )
-                    deaths_loc, deaths_scale = criterion._get_head_distribution_params(
-                        model_outputs,
-                        head_name="deaths",
-                        horizon=int(deaths_targets.shape[1]),
-                    )
-                    deaths_prob_batch = deaths_prob_metrics.update(
-                        loc=deaths_loc,
-                        scale=deaths_scale,
-                        targets=deaths_targets,
-                        observed_mask=deaths_mask,
-                        sample_weights=deaths_weights,
-                    )
-                    _update_region_set_metrics(
-                        region_set_prob_metrics,
-                        region_set_members,
-                        head_name="deaths",
-                        loc=deaths_loc,
-                        scale=deaths_scale,
-                        targets=deaths_targets,
-                        observed_mask=deaths_mask,
-                        sample_weights=deaths_weights,
-                        nodes=batch_data.target_node,
-                    )
-                    deaths_mechanistic = _forecast_aligned_output(
-                        model_outputs,
-                        "mechanistic_deaths",
-                        int(deaths_targets.shape[1]),
-                    )
-                    deaths_residual = _forecast_aligned_output(
-                        model_outputs,
-                        "residual_deaths",
-                        int(deaths_targets.shape[1]),
-                    )
-                    deaths_relevant_source_name = resolved_relevant_sources["deaths"]
-                    deaths_relevant_source = _forecast_aligned_output(
-                        model_outputs,
-                        _RELEVANT_SOURCE_OUTPUT_KEYS[deaths_relevant_source_name],
-                        int(deaths_targets.shape[1]),
-                    )
-                    observation_latent_metrics["deaths"].update(
-                        full_prediction=pred_deaths,
-                        relevant_latent=deaths_relevant_source,
-                        weights=deaths_weights,
-                        mechanistic_projection=deaths_mechanistic,
-                    )
-                    _update_latent_information(
-                        latent_information_metrics,
-                        head="deaths",
-                        source=deaths_relevant_source_name,
-                        targets=targets_dict,
-                        latent=deaths_relevant_source,
-                        observed=deaths_targets,
-                        prediction=pred_deaths,
-                        residual=deaths_residual,
-                        weights=deaths_weights,
-                        nodes=batch_data.target_node,
-                    )
-                    if deaths_mechanistic is not None and deaths_residual is not None:
-                        pathway_metrics["deaths"].update(
-                            full=deaths_loc,
-                            mechanistic=deaths_mechanistic,
-                            residual=deaths_residual,
-                            targets=deaths_targets,
-                            weights=deaths_weights,
-                        )
-                        mechanistic_prob_metrics["deaths"].update(
-                            loc=deaths_mechanistic,
-                            scale=deaths_scale,
-                            targets=deaths_targets,
-                            observed_mask=deaths_mask,
-                            sample_weights=deaths_weights,
-                        )
-                    if granular_writer is not None:
-                        granular_writer.write_rows(
-                            batch_data=batch_data,
-                            target_name="deaths",
-                            predictions=pred_deaths,
-                            targets=deaths_targets,
-                            weights=deaths_effective_weights,
-                            nll=deaths_prob_batch.nll,
-                            crps=deaths_prob_batch.crps,
-                            wis=deaths_prob_batch.wis,
-                            distribution_loc=deaths_loc,
-                            distribution_scale=deaths_scale,
-                            distribution_family=criterion.distribution_family,
-                            distribution_df=criterion.distribution_df,
-                            intervals=deaths_prob_batch.intervals,
-                            mechanistic_predictions=deaths_mechanistic,
-                            residual_contributions=deaths_residual,
-                            relevant_latent_name=deaths_relevant_source_name,
-                            relevant_latent_values=deaths_relevant_source,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                        )
-                    del (
-                        deaths_diff,
-                        deaths_abs_diff,
-                        deaths_effective_weights,
-                        deaths_loc,
-                        deaths_scale,
-                        deaths_prob_batch,
-                        deaths_mechanistic,
-                        deaths_residual,
-                        deaths_relevant_source,
-                    )
-                del pred_deaths, deaths_targets, deaths_mask, deaths_weights
+                    if forecast is not None:
+                        scorer.update(forecast, batch_data=batch_data)
+                    del forecast
                 current_stage = "granular_write_complete"
                 if should_log_batch:
                     logger.info(
@@ -1438,9 +598,7 @@ def evaluate_loader(
                         num_batches,
                         current_stage,
                     )
-                processed_batches += 1
-                del components, metric_supervision, model_outputs, targets_dict
-                del sliced_model_outputs, batch_data, loss
+                del components, supervision, model_outputs, targets_dict, batch_data
 
     except Exception:
         logger.error(
@@ -1458,35 +616,14 @@ def evaluate_loader(
         if model_was_training:
             model.train()
 
-    mean_loss = (total_loss / max(1, processed_batches)).item()
-    hosp_summary = hosp_metrics.finalize()
-    ww_summary = ww_metrics.finalize()
-    cases_summary = cases_metrics.finalize()
-    deaths_summary = deaths_metrics.finalize()
-    hosp_prob_summary = hosp_prob_metrics.finalize()
-    ww_prob_summary = ww_prob_metrics.finalize()
-    cases_prob_summary = cases_prob_metrics.finalize()
-    deaths_prob_summary = deaths_prob_metrics.finalize()
-    pathway_summaries = {
-        head_name: accumulator.finalize()
-        for head_name, accumulator in pathway_metrics.items()
-    }
-    mechanistic_prob_summaries = {
-        head_name: accumulator.finalize()
-        for head_name, accumulator in mechanistic_prob_metrics.items()
-    }
-    observation_latent_summaries = {
-        head_name: accumulator.finalize()
-        for head_name, accumulator in observation_latent_metrics.items()
-    }
-    latent_summary = latent_metrics.finalize()
-    latent_plausibility_summary = latent_plausibility_metrics.finalize()
-    latent_diagnostic_summary = {
-        key: value
-        for accumulator in latent_diagnostic_metrics.values()
-        for key, value in accumulator.finalize().items()
-    }
+    mean_loss = loss_ledger.mean("total")
+    target_scores = {head: scorer.finalize() for head, scorer in target_scorers.items()}
 
+    per_head_node_metrics = {
+        CANONICAL_TARGET_NAMES[head]: score.node_stats
+        for head, score in target_scores.items()
+        if score.node_stats is not None
+    }
     node_mae_by_target: dict[str, dict[int, float]] = {}
     node_mae_count_by_target: dict[str, dict[int, int]] = {}
     for target_name, target_stats in per_head_node_metrics.items():
@@ -1582,130 +719,37 @@ def evaluate_loader(
             metadata,
         )
 
-    joint_obs_loss_total = float(
-        (
-            loss_ww_weighted_sum
-            + loss_hosp_weighted_sum
-            + loss_cases_weighted_sum
-            + loss_deaths_weighted_sum
-        )
-        / max(1, processed_batches)
+    joint_obs_loss_total = loss_ledger.mean(
+        *(f"{name}_weighted" for name in _OBSERVATION_LOSS_COMPONENTS)
     )
-    metrics = {
+    metrics: dict[str, Any] = {
         # Generic primary metric: aliased joint observation loss
         "mae": joint_obs_loss_total,
         "joint_obs_loss_total": joint_obs_loss_total,
-        # Explicit hospitalization metrics
-        "mae_hosp_per_h": hosp_summary.mae_per_h,
-        "rmse_hosp_per_h": hosp_summary.rmse_per_h,
-        # Hospitalization metrics in log1p(per-100k) space
-        "mae_hosp_log1p_per_100k": hosp_summary.mae,
-        "rmse_hosp_log1p_per_100k": hosp_summary.rmse,
-        "r2_hosp_log1p_per_100k": hosp_summary.r2,
-        "observed_count_hosp": hosp_summary.observed_count,
-        "effective_count_hosp": hosp_summary.effective_count,
-        # Wastewater metrics in log1p(per-100k) space
-        "mae_ww_log1p_per_100k": ww_summary.mae,
-        "rmse_ww_log1p_per_100k": ww_summary.rmse,
-        "r2_ww_log1p_per_100k": ww_summary.r2,
-        "observed_count_ww": ww_summary.observed_count,
-        "effective_count_ww": ww_summary.effective_count,
-        # Cases metrics in log1p(per-100k) space
-        "mae_cases_log1p_per_100k": cases_summary.mae,
-        "rmse_cases_log1p_per_100k": cases_summary.rmse,
-        "r2_cases_log1p_per_100k": cases_summary.r2,
-        "observed_count_cases": cases_summary.observed_count,
-        "effective_count_cases": cases_summary.effective_count,
-        # Deaths metrics in log1p(per-100k) space
-        "mae_deaths_log1p_per_100k": deaths_summary.mae,
-        "rmse_deaths_log1p_per_100k": deaths_summary.rmse,
-        "r2_deaths_log1p_per_100k": deaths_summary.r2,
-        "observed_count_deaths": deaths_summary.observed_count,
-        "effective_count_deaths": deaths_summary.effective_count,
         # Joint loss components (averaged per batch, same reduction as mean_loss)
-        "loss_ww": (loss_ww_sum / max(1, processed_batches)).item(),
-        "loss_hosp": (loss_hosp_sum / max(1, processed_batches)).item(),
-        "loss_cases": (loss_cases_sum / max(1, processed_batches)).item(),
-        "loss_deaths": (loss_deaths_sum / max(1, processed_batches)).item(),
-        "loss_sird_supervision": (
-            loss_sird_supervision_sum / max(1, processed_batches)
-        ).item(),
-        "loss_latent_s": (loss_latent_s_sum / max(1, processed_batches)).item(),
-        "loss_latent_i": (loss_latent_i_sum / max(1, processed_batches)).item(),
-        "loss_latent_h": (loss_latent_h_sum / max(1, processed_batches)).item(),
-        "loss_latent_r": (loss_latent_r_sum / max(1, processed_batches)).item(),
-        "loss_latent_death_flow": (
-            loss_latent_death_flow_sum / max(1, processed_batches)
-        ).item(),
-        "loss_ww_weighted": (loss_ww_weighted_sum / max(1, processed_batches)).item(),
-        "loss_hosp_weighted": (
-            loss_hosp_weighted_sum / max(1, processed_batches)
-        ).item(),
-        "loss_cases_weighted": (
-            loss_cases_weighted_sum / max(1, processed_batches)
-        ).item(),
-        "loss_deaths_weighted": (
-            loss_deaths_weighted_sum / max(1, processed_batches)
-        ).item(),
-        "loss_sird_supervision_weighted": (
-            loss_sird_supervision_weighted_sum / max(1, processed_batches)
-        ).item(),
+        **{
+            key: loss_ledger.mean(component)
+            for key, component in _LOSS_METRIC_COMPONENTS.items()
+        },
+        **{
+            f"loss_latent_{task}_total_weighted": loss_ledger.mean(
+                f"latent_{task}_weighted", factor=criterion.latent_total_weight
+            )
+            for task in _LATENT_LOSS_TASKS
+        },
     }
-    for name in regularizer_names:
-        metrics[f"loss_{name}"] = (
-            loss_regularizer_sums[name] / max(1, processed_batches)
-        ).item()
-    for task in latent_loss_tasks:
-        metrics[f"loss_latent_{task}_raw"] = (
-            loss_latent_raw_sums[task] / max(1, processed_batches)
-        ).item()
-        metrics[f"loss_latent_{task}_component_weighted"] = (
-            loss_latent_component_weighted_sums[task] / max(1, processed_batches)
-        ).item()
-        metrics[f"loss_latent_{task}_total_weighted"] = (
-            criterion.latent_total_weight
-            * loss_latent_component_weighted_sums[task]
-            / max(1, processed_batches)
-        ).item()
-    _add_probabilistic_metrics(
-        metrics=metrics,
-        head_name="hosp",
-        summary=hosp_prob_summary,
-    )
-    _add_probabilistic_metrics(
-        metrics=metrics,
-        head_name="ww",
-        summary=ww_prob_summary,
-    )
-    _add_probabilistic_metrics(
-        metrics=metrics,
-        head_name="cases",
-        summary=cases_prob_summary,
-    )
-    _add_probabilistic_metrics(
-        metrics=metrics,
-        head_name="deaths",
-        summary=deaths_prob_summary,
-    )
-    _add_region_set_metrics(metrics=metrics, accumulators=region_set_prob_metrics)
-    for head_name in _HEAD_CANONICAL_NAMES:
-        _add_pathway_metrics(
-            metrics=metrics,
-            head_name=head_name,
-            summary=pathway_summaries[head_name],
-            mechanistic_probabilistic_summary=mechanistic_prob_summaries[head_name],
-        )
-    for head_name in _HEAD_CANONICAL_NAMES:
-        _add_observation_latent_metrics(
-            metrics=metrics,
-            head_name=head_name,
-            summary=observation_latent_summaries[head_name],
-        )
-    metrics.update(latent_summary)
-    metrics.update(latent_plausibility_summary)
+    region_set_metrics: dict[str, dict[str, Any]] = {name: {} for name in members}
+    for score in target_scores.values():
+        metrics.update(score.metrics)
+        for name, set_metrics in score.region_set_metrics.items():
+            region_set_metrics[name].update(set_metrics)
+    _add_region_set_metrics(metrics=metrics, region_set_metrics=region_set_metrics)
+    metrics.update(latent_metrics.finalize())
+    metrics.update(latent_plausibility_metrics.finalize())
     if latent_information_metrics is not None:
         metrics.update(latent_information_metrics.finalize())
-    metrics.update(latent_diagnostic_summary)
+    for accumulator in latent_diagnostic_metrics.values():
+        metrics.update(accumulator.finalize())
     _add_delay_kernel_metrics(metrics=metrics, model=model)
 
     logger.info("EVAL COMPLETE")
@@ -1753,9 +797,7 @@ def eval_checkpoint(
     node_metrics_csv_path: Path | None = None,
     per_head_node_metrics_csv_path: Path | None = None,
     granular_output_path: Path | None = None,
-    granular_csv_path: Path | None = None,
     granular_eval_format: str | None = None,
-    output_csv_path: Path | None = None,
     batch_size: int | None = None,
     num_workers: int | None = None,
     pin_memory: bool | None = None,
@@ -1775,9 +817,7 @@ def eval_checkpoint(
         node_metrics_csv_path: Optional path to save node-level metrics CSV
         per_head_node_metrics_csv_path: Optional path to save per-head node metrics CSV
         granular_output_path: Optional path to save granular per-example error rows
-        granular_csv_path: Deprecated alias for granular_output_path
         granular_eval_format: Optional output format override ("parquet" or "csv")
-        output_csv_path: Deprecated alias for node_metrics_csv_path
         batch_size: Optional batch size override
         num_workers: Optional DataLoader worker override
         pin_memory: Optional pin-memory override
@@ -1789,15 +829,9 @@ def eval_checkpoint(
         Dict with: checkpoint, config, model, loader, node_mae_dict,
                    eval_loss, eval_metrics
     """
-    # Extract training.device from overrides if present
-    if node_metrics_csv_path is None:
-        node_metrics_csv_path = output_csv_path
-    explicit_granular_output_path = (
-        granular_output_path is not None or granular_csv_path is not None
-    )
-    if granular_output_path is None:
-        granular_output_path = granular_csv_path
+    explicit_granular_output_path = granular_output_path is not None
 
+    # Extract training.device from overrides if present
     resolved_device = device
     if overrides:
         for ov in overrides:

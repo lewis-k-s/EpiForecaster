@@ -6,19 +6,71 @@ import pytest
 import torch
 
 from evaluation.aggregate_export import build_main_model_target_aggregate
-from evaluation.eval_loop import (
-    _HEAD_CANONICAL_NAMES,
-    _add_region_set_metrics,
-    _region_set_members,
-    _update_region_set_metrics,
-)
+from evaluation.eval_loop import _add_region_set_metrics
+from evaluation.losses import JointInferenceLoss
 from evaluation.metrics import TorchDistributionMetricAccumulator
+from evaluation.target_scoring import (
+    CANONICAL_TARGET_NAMES,
+    TargetForecast,
+    TargetScorer,
+    region_set_members,
+)
 
 pytestmark = pytest.mark.epiforecaster
 
 
-def _accumulator() -> TorchDistributionMetricAccumulator:
-    return TorchDistributionMetricAccumulator(device=torch.device("cpu"), horizon=3)
+def _forecast(
+    head: str,
+    *,
+    loc: torch.Tensor,
+    scale: torch.Tensor,
+    targets: torch.Tensor,
+    weights: torch.Tensor,
+) -> TargetForecast:
+    return TargetForecast(
+        head=head,
+        prediction=loc,
+        loc=loc,
+        scale=scale,
+        observed=targets,
+        observed_mask=None,
+        weights=weights,
+        mechanistic=None,
+        residual=None,
+        latent_source="I",
+        latent=None,
+        true_latent=None,
+    )
+
+
+def _region_set_scores(
+    members: dict[str, torch.Tensor],
+    *,
+    loc: torch.Tensor,
+    scale: torch.Tensor,
+    targets: torch.Tensor,
+    weights: torch.Tensor,
+    nodes: torch.Tensor,
+) -> dict:
+    """Score every target with the same tensors and merge their region sets."""
+    region_set_metrics: dict[str, dict] = {name: {} for name in members}
+    for head in CANONICAL_TARGET_NAMES:
+        scorer = TargetScorer(
+            head,
+            criterion=JointInferenceLoss(),
+            device=torch.device("cpu"),
+            horizon=int(targets.shape[1]),
+            region_set_members=members,
+        )
+        scorer.update(
+            _forecast(head, loc=loc, scale=scale, targets=targets, weights=weights),
+            batch_data=type("Batch", (), {"target_node": nodes})(),
+        )
+        for name, set_metrics in scorer.finalize().region_set_metrics.items():
+            region_set_metrics[name].update(set_metrics)
+    metrics: dict = {}
+    _add_region_set_metrics(metrics=metrics, region_set_metrics=region_set_metrics)
+    return metrics
 
 
 def test_region_set_scores_equal_scoring_only_member_windows() -> None:
@@ -29,26 +81,16 @@ def test_region_set_scores_equal_scoring_only_member_windows() -> None:
     weights = torch.ones(4, 3)
     weights[3, 1] = 0.0  # an unsupervised point stays excluded
     nodes = torch.tensor([0, 2, 1, 2])  # node index into the dataset regions
-    members = _region_set_members(
+    members = region_set_members(
         {"core": frozenset({"r2"})}, ["r0", "r1", "r2"], torch.device("cpu")
     )
-    accumulators = {"core": {head: _accumulator() for head in _HEAD_CANONICAL_NAMES}}
-    for head in _HEAD_CANONICAL_NAMES:
-        _update_region_set_metrics(
-            accumulators,
-            members,
-            head_name=head,
-            loc=loc,
-            scale=scale,
-            targets=targets,
-            observed_mask=None,
-            sample_weights=weights,
-            nodes=nodes,
-        )
-    metrics: dict = {}
-    _add_region_set_metrics(metrics=metrics, accumulators=accumulators)
+    metrics = _region_set_scores(
+        members, loc=loc, scale=scale, targets=targets, weights=weights, nodes=nodes
+    )
 
-    reference = _accumulator()
+    reference = TorchDistributionMetricAccumulator(
+        device=torch.device("cpu"), horizon=3
+    )
     rows = nodes == 2
     reference.update(
         loc=loc[rows],
@@ -66,24 +108,17 @@ def test_region_set_scores_equal_scoring_only_member_windows() -> None:
 
 
 def test_region_set_without_support_has_nan_endpoint_and_export_columns() -> None:
-    members = _region_set_members(
+    members = region_set_members(
         {"empty": frozenset({"r9"})}, ["r0", "r9"], torch.device("cpu")
     )
-    accumulators = {"empty": {head: _accumulator() for head in _HEAD_CANONICAL_NAMES}}
-    for head in _HEAD_CANONICAL_NAMES:
-        _update_region_set_metrics(
-            accumulators,
-            members,
-            head_name=head,
-            loc=torch.zeros(1, 3),
-            scale=torch.ones(1, 3),
-            targets=torch.zeros(1, 3),
-            observed_mask=None,
-            sample_weights=torch.ones(1, 3),
-            nodes=torch.tensor([0]),
-        )
-    metrics: dict = {}
-    _add_region_set_metrics(metrics=metrics, accumulators=accumulators)
+    metrics = _region_set_scores(
+        members,
+        loc=torch.zeros(1, 3),
+        scale=torch.ones(1, 3),
+        targets=torch.zeros(1, 3),
+        weights=torch.ones(1, 3),
+        nodes=torch.tensor([0]),
+    )
     assert math.isnan(metrics["region_set_empty_mean_target_wis"])
 
     table = build_main_model_target_aggregate(metrics)
