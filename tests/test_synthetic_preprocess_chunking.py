@@ -17,6 +17,7 @@ from data.preprocess.zarr_layout import (
     open_zarr_store,
     pack_store,
     with_variable_length_strings,
+    write_dataset,
 )
 from tests.dataset_test_helpers import make_preprocessing_config
 
@@ -65,6 +66,9 @@ def _minimal_synthetic_dataset(
     confined_stock=0.0,
     contract_json=STATE_SPACE_CONTRACT_JSON,
     contract_sha256=STATE_SPACE_CONTRACT_SHA256,
+    schema_version="epiforecaster_sirhd_v1",
+    include_infection_flows=False,
+    initial_death_fraction=0.0,
 ):
     """Build a corpus that starts one day before ``dates``.
 
@@ -118,7 +122,9 @@ def _minimal_synthetic_dataset(
     pop = population_values[:, None, :].astype(np.float64)
     daily_deaths = rng.random(shape)
     daily_deaths[:, 0, :] = 0.0
-    stock_d = np.cumsum(daily_deaths, axis=1).astype(np.float32)
+    stock_d = (np.cumsum(daily_deaths, axis=1) + initial_death_fraction * pop).astype(
+        np.float32
+    )
     stock_i = (rng.random(shape) * 10.0).astype(np.float32)
     stock_h = (rng.random(shape) * 5.0).astype(np.float32)
     stock_r = (rng.random(shape) * pop * 0.2).astype(np.float32)
@@ -174,7 +180,9 @@ def _minimal_synthetic_dataset(
         )
     if include_sirhd and include_death_flow:
         data_vars["sirhd_death_flow"] = xr.DataArray(
-            np.diff(stock_d, axis=1) + np.float32(death_flow_offset),
+            # The generator differences the stored float32 stocks in float64.
+            np.diff(stock_d.astype(np.float64), axis=1).astype(np.float32)
+            + np.float32(death_flow_offset),
             dims=("run_id", "death_interval_date", "region_id"),
             coords={
                 "run_id": run_ids,
@@ -182,12 +190,24 @@ def _minimal_synthetic_dataset(
                 "region_id": region_ids,
             },
         )
+    if include_sirhd and include_infection_flows:
+        # epiforecaster_sirhd_v2 adds infection and hospitalization flows.
+        for name in ("sirhd_infection_flow", "sirhd_hospitalization_flow"):
+            data_vars[name] = xr.DataArray(
+                rng.random((n_runs, n_dates - 1, n_regions)).astype(np.float32),
+                dims=("run_id", "death_interval_date", "region_id"),
+                coords={
+                    "run_id": run_ids,
+                    "death_interval_date": corpus_dates[1:],
+                    "region_id": region_ids,
+                },
+            )
 
     ds = xr.Dataset(data_vars)
     if include_sirhd:
         ds.attrs.update(
             {
-                "state_space_schema_version": "epiforecaster_sirhd_v1",
+                "state_space_schema_version": schema_version,
                 "state_space_contract_json": contract_json,
                 "state_space_contract_sha256": contract_sha256,
             }
@@ -487,6 +507,51 @@ def test_synthetic_processor_rejects_misaligned_death_flow(tmp_path):
         )
 
 
+def _large_death_fraction_corpus(path, **kwargs):
+    # Cumulative deaths are a large share of the population (up to ~15% in the
+    # n400 corpus) while daily deaths stay small. Float32 stock fractions then
+    # carry more rounding error than the fixed atol, with a small flow for the
+    # relative tolerance to scale with.
+    _write_minimal_synthetic_zarr(
+        path,
+        run_ids=np.array(["synth_a", "synth_b"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array([f"r{i}" for i in range(40)], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        initial_death_fraction=0.14,
+        **kwargs,
+    )
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_accepts_exact_death_flow_at_large_death_fraction(
+    tmp_path,
+):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _large_death_fraction_corpus(synthetic_path)
+
+    result = SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+        str(synthetic_path)
+    )
+
+    latent = result["latent_sird"]
+    assert float(latent["latent_D_true"].max()) > 0.05
+    assert latent["latent_death_flow_true"].dtype == np.float32
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_rejects_misaligned_death_flow_at_large_death_fraction(
+    tmp_path,
+):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _large_death_fraction_corpus(synthetic_path, death_flow_offset=0.25)
+
+    with pytest.raises(ValueError, match="destination-dated"):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
+
+
 @pytest.mark.epiforecaster
 def test_synthetic_processor_rejects_date_without_death_interval(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
@@ -575,6 +640,47 @@ def test_synthetic_processor_enforces_state_space_contract(
     config = _make_config(tmp_path, synthetic_path, options=config_options)
     with pytest.raises(ValueError, match=message):
         SyntheticProcessor(config).process(str(synthetic_path))
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_accepts_v2_contract_and_ignores_extra_flows(tmp_path):
+    contract = {
+        **STATE_SPACE_CONTRACT,
+        "state_space_schema_version": "epiforecaster_sirhd_v2",
+        "flow_variables": {
+            "sirhd_infection_flow": {"transition": "sirhd_S -> sirhd_I"},
+            "sirhd_hospitalization_flow": {"transition": "sirhd_I -> sirhd_H"},
+        },
+    }
+    contract_json = json.dumps(
+        contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    contract_sha256 = hashlib.sha256(contract_json.encode()).hexdigest()
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        contract_json=contract_json,
+        contract_sha256=contract_sha256,
+        schema_version="epiforecaster_sirhd_v2",
+        include_infection_flows=True,
+    )
+    options = {
+        "synthetic_state_space_schema_version": "epiforecaster_sirhd_v2",
+        "synthetic_state_space_contract_sha256": contract_sha256,
+    }
+
+    result = SyntheticProcessor(
+        _make_config(tmp_path, synthetic_path, options=options)
+    ).process(str(synthetic_path))
+
+    latent = result["latent_sird"]
+    assert latent["latent_death_flow_true"].dims == ("run_id", "date", "region_id")
+    assert not any("infection_flow" in name for name in latent.data_vars)
+    assert not any("hospitalization_flow" in name for name in latent.data_vars)
 
 
 @pytest.mark.epiforecaster
@@ -868,7 +974,8 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     config = _make_config(tmp_path, synthetic_path=tmp_path / "raw_synth.zarr")
     pipeline = OfflinePreprocessingPipeline(config)
 
-    output_path = pipeline._save_aligned_dataset(aligned_dataset)
+    output_path = tmp_path / "saved.zarr.zip"
+    write_dataset(pipeline._prepare_dataset(aligned_dataset), output_path)
     saved = open_zarr_store(output_path)
 
     # One shard per run, whatever the in-memory run_id chunking.
@@ -951,6 +1058,68 @@ def test_positive_clinical_preservation_rejects_zeroed_positive_value():
 
 
 @pytest.mark.epiforecaster
+@pytest.mark.parametrize("workers", [1, 2])
+def test_per_run_build_matches_whole_corpus_build(tmp_path, workers):
+    """Building each run alone must give the whole-corpus values exactly."""
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    region_metadata_path = tmp_path / "edar_map.nc"
+    run_ids = np.array(["synth_a", "synth_b", "synth_c"], dtype="U50")
+    region_ids = np.array(["r1", "r2", "r3"], dtype="U10")
+    edar_ids = np.array(["e1", "e2"], dtype="U10")
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=run_ids,
+        dates=pd.date_range("2020-01-01", periods=6, freq="D"),
+        region_ids=region_ids,
+        edar_ids=edar_ids,
+    )
+    _write_region_metadata(
+        region_metadata_path, region_ids=region_ids, edar_ids=edar_ids
+    )
+    config = _make_config(tmp_path, synthetic_path)
+    config.region_metadata_file = str(region_metadata_path)
+    config.continuous_storage_dtype = "float32"
+    config.write_workers = workers
+    config.bitround_keepbits = {"mobility": 10}
+
+    per_run = open_zarr_store(OfflinePreprocessingPipeline(config).run())
+
+    pipeline = OfflinePreprocessingPipeline(config)
+    corpus = pipeline.synthetic_processor.open_corpus(str(synthetic_path))
+    whole_path = tmp_path / "whole.zarr.zip"
+    write_dataset(
+        pipeline.build_synthetic_runs(corpus, corpus["run_id"].values),
+        whole_path,
+        bitround_keepbits=config.bitround_keepbits,
+    )
+    whole = open_zarr_store(whole_path)
+
+    assert set(per_run.variables) == set(whole.variables)
+    for name, expected in whole.variables.items():
+        actual = per_run[name]
+        assert actual.dims == expected.dims, name
+        assert actual.dtype == expected.dtype, name
+        assert actual.attrs == expected.attrs, name
+        assert np.array_equal(
+            actual.values, expected.values, equal_nan=expected.dtype.kind == "f"
+        ), name
+    assert per_run.mobility.encoding["shards"] == whole.mobility.encoding["shards"]
+    # The positive-preservation counts are summed over the per-run builds.
+    assert json.loads(per_run.attrs["positive_clinical_preservation_json"]) == (
+        json.loads(whole.attrs["positive_clinical_preservation_json"])
+    )
+    provenance = json.loads(per_run.attrs["synthetic_corpus_provenance_json"])
+    assert "mobility_layout" in provenance
+    for key in set(whole.attrs) - {
+        "positive_clinical_preservation_json",
+        "synthetic_corpus_provenance_json",
+    }:
+        assert per_run.attrs[key] == whole.attrs[key], key
+    per_run.close()
+    whole.close()
+
+
+@pytest.mark.epiforecaster
 def test_save_aligned_dataset_preserves_mobility(tmp_path):
     run_ids = np.array(["r1", "r2"], dtype="U10")
     dates = pd.date_range("2020-01-01", periods=3, freq="D")
@@ -981,7 +1150,8 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     config = _make_config(tmp_path, synthetic_path=tmp_path / "raw_synth.zarr")
     pipeline = OfflinePreprocessingPipeline(config)
 
-    output_path = pipeline._save_aligned_dataset(aligned_dataset)
+    output_path = tmp_path / "saved.zarr.zip"
+    write_dataset(pipeline._prepare_dataset(aligned_dataset), output_path)
     saved = open_zarr_store(output_path)
 
     saved_mob = saved["mobility"].isel(

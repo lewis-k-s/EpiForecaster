@@ -162,8 +162,8 @@ class PreprocessingConfig:
         chunk_sizes: Custom chunk sizes for Zarr arrays
 
         num_workers: Number of parallel workers for processing
-        write_workers: Processes that compute and write runs of the packed
-            Zarr output (one run per task)
+        write_workers: Processes that each build one synthetic run from the raw
+            corpus and write it to the packed Zarr output
         bitround_keepbits: Float32 variables to round before the write, mapped
             to the mantissa bits to keep (1-22). Empty means no rounding.
         chunk_size: Chunk size for processing large files
@@ -253,7 +253,7 @@ class PreprocessingConfig:
     num_workers: int = 4
     chunk_size: int = 1000
     run_id_chunk_size: int = 5  # Chunk size for run_id dimension
-    # Processes that compute and write runs of the packed Zarr output.
+    # Processes that each build and write one synthetic run at a time.
     write_workers: int = 1
     # Mantissa bits to keep per float32 output variable; empty is lossless.
     bitround_keepbits: dict[str, int] = field(default_factory=dict)

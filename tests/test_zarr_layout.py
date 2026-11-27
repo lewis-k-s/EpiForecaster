@@ -67,14 +67,11 @@ def _assert_same_values(actual: xr.Dataset, expected: xr.Dataset) -> None:
     assert actual.attrs["preprocessing_config_yaml"] == "dataset_name: tiny\n"
 
 
-@pytest.mark.parametrize("workers", [1, 3])
-def test_write_dataset_round_trips_values_with_any_worker_count(tmp_path, workers):
+def test_write_dataset_round_trips_values(tmp_path):
     source = _dataset()
     destination = tmp_path / "tiny.zarr.zip"
 
-    results = write_dataset(
-        source.chunk({"run_id": 1, "date": 30}), destination, workers=workers
-    )
+    results = write_dataset(source.chunk({"run_id": 1, "date": 30}), destination)
 
     saved = open_zarr_zip(destination)
     _assert_same_values(saved, source)
@@ -85,33 +82,53 @@ def test_write_dataset_round_trips_values_with_any_worker_count(tmp_path, worker
     assert sorted(p.name for p in tmp_path.iterdir()) == ["tiny.zarr.zip"]
 
 
-def test_parallel_write_reads_a_packed_source_correctly(tmp_path):
-    # The synthetic preprocess opens the packed raw corpus before its workers
-    # fork, so every worker must read through its own archive handle.
+def test_large_run_variables_are_verified_in_date_slabs(tmp_path, monkeypatch):
+    import data.preprocess.zarr_layout as zarr_layout
+
+    # Treat every per-run variable as large: computed into one array and
+    # read back slab by slab across several inner mobility chunks.
+    monkeypatch.setattr(zarr_layout, "LARGE_RUN_VARIABLE_BYTES", 0)
+    source = _dataset(runs=2, dates=140)
+    destination = tmp_path / "tiny.zarr.zip"
+
+    results = write_dataset(source.chunk({"run_id": 1, "date": 30}), destination)
+
+    _assert_same_values(open_zarr_zip(destination), source)
+    assert results[0].non_null["mobility"] == source.mobility[0].size - 1
+
+
+def test_write_run_rejects_a_dataset_with_several_runs(tmp_path):
+    from data.preprocess.zarr_layout import create_store, prepare_for_store, write_run
+
+    prepared = prepare_for_store(_dataset())
+    store = create_store(prepared, tmp_path / "tiny.zarr.zip")
+
+    with pytest.raises(ValueError, match="exactly one run"):
+        write_run(store, 0, prepared.isel(run_id=slice(0, 2)))
+
+
+def test_write_reads_a_packed_source_correctly(tmp_path):
     source = _dataset(runs=8, dates=130, regions=60)
     packed = tmp_path / "source.zarr.zip"
-    write_dataset(source, packed, workers=1)
+    write_dataset(source, packed)
     destination = tmp_path / "copy.zarr.zip"
 
-    write_dataset(open_zarr_zip(packed, chunks={"run_id": 1}), destination, workers=4)
+    write_dataset(open_zarr_zip(packed, chunks={"run_id": 1}), destination)
 
     _assert_same_values(open_zarr_zip(destination), source)
 
 
-def test_parallel_and_serial_outputs_hold_the_same_members(tmp_path):
-    source = _dataset().chunk({"run_id": 1})
-    serial, parallel = tmp_path / "s.zarr.zip", tmp_path / "p.zarr.zip"
-    write_dataset(source, serial, workers=1)
-    write_dataset(source, parallel, workers=2)
+def test_packed_store_holds_root_metadata_first_and_one_shard_per_run(tmp_path):
+    destination = tmp_path / "s.zarr.zip"
+    write_dataset(_dataset().chunk({"run_id": 1}), destination)
 
-    with zipfile.ZipFile(serial) as left, zipfile.ZipFile(parallel) as right:
-        assert left.namelist()[0] == "zarr.json"
-        assert sorted(left.namelist()) == sorted(right.namelist())
-        assert all(info.compress_type == zipfile.ZIP_STORED for info in left.infolist())
-        shards = [name for name in left.namelist() if name.startswith("mobility/c/")]
-        for name in shards:
-            assert left.read(name) == right.read(name), name
-    # One shard per run for each per-run variable.
+    with zipfile.ZipFile(destination) as archive:
+        assert archive.namelist()[0] == "zarr.json"
+        assert all(
+            info.compress_type == zipfile.ZIP_STORED for info in archive.infolist()
+        )
+        assert archive.testzip() is None
+        shards = [name for name in archive.namelist() if name.startswith("mobility/c/")]
     assert len(shards) == 4
 
 
@@ -130,21 +147,42 @@ def test_encoding_uses_one_shard_per_run_and_whole_inner_chunks():
 
 def test_fixed_width_strings_are_stored_as_variable_length(tmp_path):
     destination = tmp_path / "tiny.zarr.zip"
-    write_dataset(_dataset(), destination, workers=1)
+    write_dataset(_dataset(), destination)
 
     saved = open_zarr_zip(destination)
     assert saved.run_id.dtype == object
     assert list(saved.region_id.values) == [f"{i:05d}" for i in range(6)]
 
 
+def test_directory_store_variable_length_strings_open_as_object(tmp_path):
+    store = tmp_path / "ids.zarr"
+    ids = np.array(["08001", "08002"], dtype=object)
+    # A string data variable along the string index dimension, as in the EpiSim
+    # corpus (run_id with per-run string metadata), must not revert the index.
+    xr.Dataset(
+        {
+            "x": ("region_id", [1.0, 2.0]),
+            "kind": ("region_id", np.array(["a", "b"], dtype=object)),
+        },
+        coords={"region_id": ids},
+    ).to_zarr(store, zarr_format=3)
+
+    opened = open_zarr_store(store, chunks={"region_id": 1})
+
+    assert opened.region_id.dtype == object
+    assert opened.kind.dtype == object
+    assert opened.region_id.values.astype(str).tolist() == ["08001", "08002"]
+    assert opened.region_id.values.astype("U").tolist() == ["08001", "08002"]
+
+
 def test_write_dataset_requires_packed_suffix(tmp_path):
     with pytest.raises(ValueError, match=r"\.zarr\.zip"):
-        write_dataset(_dataset(), tmp_path / "tiny.zarr", workers=1)
+        write_dataset(_dataset(), tmp_path / "tiny.zarr")
 
 
 def test_open_zarr_store_dispatches_packed_zarr(tmp_path):
     destination = tmp_path / "tiny.zarr.zip"
-    write_dataset(_dataset(), destination, workers=1)
+    write_dataset(_dataset(), destination)
 
     saved = open_zarr_store(destination)
     assert saved.mobility.encoding["shards"] == (1, 130, 6, 6)
@@ -194,15 +232,13 @@ def test_bitround_rounds_half_to_even():
     assert bitround(three_halves_up, 10)[0] == np.float32(1.0 + 2.0**-9)
 
 
-@pytest.mark.parametrize("workers", [1, 2])
-def test_write_dataset_applies_bitround_and_records_bits(tmp_path, workers):
+def test_write_dataset_applies_bitround_and_records_bits(tmp_path):
     source = _dataset()
     destination = tmp_path / "tiny.zarr.zip"
 
     write_dataset(
         source.chunk({"run_id": 1}),
         destination,
-        workers=workers,
         bitround_keepbits={"mobility": 10},
     )
 
@@ -222,7 +258,6 @@ def test_write_dataset_rejects_bitround_on_non_float32(tmp_path):
         write_dataset(
             _dataset(),
             tmp_path / "tiny.zarr.zip",
-            workers=1,
             bitround_keepbits={"population": 10},
         )
 
