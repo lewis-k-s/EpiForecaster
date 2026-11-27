@@ -40,14 +40,18 @@ The model operates as a three-stage differentiable pipeline:
     $$ \frac{dR}{dt} = \gamma_t I + \rho_t H $$
     $$ \frac{dD}{dt} = \mu^I_t I + \mu^H_t H $$
 *   **Latent Contract**: All states are modeled as **fractions** of the population ($S+I+H+R+D=1.0$). The physics core uses a normalized population $N=1.0$ internally to ensure scale invariance.
-*   **Outputs**: Trajectories for $S, I, H, R, D$, `hospitalization_flow` (flux into $H$), and `death_flow` (flux into $D$).
+*   **Outputs**: Trajectories for $S, I, H, R, D$, `infection_flow` (flux out of $S$, $\beta_t S_t I_t / N$ of each Euler step, reported before the non-negativity clamp and mass rescale), `hospitalization_flow` (flux into $H$), and `death_flow` (flux into $D$).
 
 ### Stage 3: Observation Heads
 Differentiable layers mapping latent states to observable metrics.
 
 1.  **Wastewater Head (`pred_ww`)**:
-    *   **Mechanism**: Convolves latent $I$ trajectory with a shedding kernel.
-    *   **Function**: $I_{t-k:t} \to \text{Viral Load}_t$
+    *   **Mechanism**: Convolves a latent source with a shedding kernel. The source is
+        $I$ (prevalence, default) or, with `model.observation_heads.ww_source:
+        infection_flow`, the S→I incidence, as in renewal-based wastewater models;
+        the origin incidence is the first Euler step's flux. Set
+        `relevant_source_ww` to the same value.
+    *   **Function**: $\text{source}_{t-k:t} \to \text{Viral Load}_t$
 2.  **Hospitalization Head (`pred_hosp`)**:
     *   **Mechanism**: Applies delay kernel and scaling to the latent hospitalization/admission flow.
     *   **Function**: $\text{hospitalization\_flow}_{t-k:t} \to \text{Hospital Admissions}_t$
@@ -165,6 +169,95 @@ collapsed small latent keeps a usable gradient through the initial-state
 softmax and the multiplicative roll-forward. Synthetic pretraining can require
 all five finite, nonnegative targets; other runs use a zero latent weight.
 
+### Latent plausibility indicators (evaluation)
+
+Real data has no latent targets, so evaluation emits ground-truth-free
+indicators of whether the inferred SIRHD latents are epidemiologically
+plausible. They use every forecast window, are computed by
+`TorchLatentPlausibilityAccumulator` in the evaluation loop, and are written to
+`test_summary.json` `metrics` with prefix `latent_plausibility_` next to the
+`latent_*` and `observation_latent_*` metrics. Quantile suffixes are `q05`,
+`q25`, `median`, `q75`, `q95` (exact `torch.quantile` across windows; NaN and
+non-finite windows excluded). All quantities are population fractions ($N=1$).
+
+| Key | Definition |
+| --- | --- |
+| `window_count` | Forecast windows evaluated |
+| `i_origin_<q>` | $I$ at the forecast origin (`I_trajectory[:, 0]`) |
+| `i_peak_<q>` | $\max_h I$ over the trajectory |
+| `i_collapse_fraction` | Fraction of windows with $I$ peak $< 10^{-6}$ (0.1 per 100k) |
+| `s_depletion_origin_<q>` | $1 - S_0$ |
+| `forecast_attack_<q>` | $S_0 - S_H$, fraction infected over the forecast |
+| `rt_origin_<q>` | $\beta_0 S_0 / (\gamma_0 + \alpha_0 + \mu^I_0)$ |
+| `rt_horizon_mean_<q>` | Per-window mean over $h=0..H-1$ of $\beta_h S_h / (\gamma_h + \alpha_h + \mu^I_h)$ |
+| `ascertainment_<head>_<q>` | Per-window implied ascertainment, `head` in `cases`, `hosp`, `deaths` |
+| `ascertainment_<head>_pooled` | Total observed per-100k over total latent per-100k |
+| `ascertainment_<head>_window_count` | Windows entering the ascertainment quantiles |
+| `ascertainment_<head>_zero_latent_window_fraction` | Share of observed windows whose latent flow sums to zero |
+
+$\alpha$ is the $I \to H$ rate (`hospitalization_rate_t`) and $\mu^I$ is the
+direct $I \to D$ mortality (`mortality_t`); hospital mortality is not part of
+the removal rate from $I$. Steps with a non-positive denominator or non-finite
+value are skipped, and a window is excluded only when no step is valid.
+
+Implied ascertainment compares observed counts with the latent flow feeding the
+head: `infection_flow` for cases, `hospitalization_flow` for hospitalizations,
+and `death_flow` for deaths. Supervised targets are absolute
+`log1p(per-100k)` (`delta_forecasting` only anchors predictions), so the
+observed count per 100k is `expm1(target)` and the latent count per 100k is the
+flow times $10^5$, aligned to the forecast targets. Per window the ratio is
+$\sum_t w_t\, y_t / \sum_t w_t\, \ell_t$ over supervised days ($w_t>0$); windows
+need $\sum_t w_t > 0$ and a positive latent sum to enter the quantiles. The
+pooled ratio sums over all windows with supervision and finite sums, including
+zero-latent windows. In the real dataset, cases and deaths are daily counts and
+hospitalizations are weekly totals placed on the week-start date
+(`data/preprocess/processors/hospitalizations_processor.py`), so the `hosp`
+ratio divides a weekly total by one day's latent flow and is about seven times
+an admission ascertainment. Synthetic corpora follow their generator's
+reporting layer. The a97c812 corpus (reporting v2) passes counts through a
+magnitude calibration in `log1p(per 100k)` space that puts observed deaths about
+8-10 times above the latent death flow, so its synthetic `deaths` ratio is not
+an ascertainment.
+
+### Latent information indicators (evaluation)
+
+Plausibility indicators check latent levels; the information indicators check
+whether the latent feeding each head tracks the observed series and drives the
+forecast. `TorchLatentInformationAccumulator`
+(`evaluation/latent_information.py`) runs in final test evaluations (trainer
+test split and `eval_checkpoint`, not per-epoch validation) and writes
+`latent_info_<head>_*` keys, `head` in `hosp`, `ww`, `cases`, `deaths`, to
+`test_summary.json` `metrics`.
+
+Each series is centred within its forecast window over supervised days, so a
+region's level and the delta-forecasting anchor carry no information. The latent
+is the head's `relevant_source` compared as $\log(1 + 10^5 x)$.
+
+|Key|Definition|
+|---|---|
+|`r2_lat_obs`, `r2_lat_pred`|Squared same-day correlation of latent with observation / forecast location|
+|`mi_lat_obs`, `mi_lat_pred`, `mi_pred_obs`|Gaussian-copula mutual information, bits|
+|`te_lat_obs`, `te_pred_obs`|Linear-Gaussian transfer entropy to the observation one reporting step ahead (1 day cases/deaths, 7 days hosp/ww), bits|
+|`sign_lat_obs`, `sign_lat_pred`|Fraction of step changes with the same sign|
+|`resid_share`|Within-window variance of the residual contribution over that of the forecast|
+|`r2_lat_obs_weekly`, `resid_share_weekly`|Cases and deaths: the same on 7-day block means, which removes the day-of-week reporting cycle|
+|`lag_r2_lat_obs_<m\|p><d>`, `best_lag_lat_obs`, `best_lag_r2_lat_obs`|Lag scan; `p` means the latent leads (±14 d daily heads, ±21 d in 7-day steps weekly heads)|
+|`<metric>_week_total`|Hospitalizations with `relevant_source_hosp: hospitalization_flow`: the four latent-observation metrics and `r2_lat_pred` with the latent summed over days $h..h+6$, the days a weekly total dated on its week start covers. Weeks leaving the horizon are dropped (`week_total_window_count`, `week_total_observation_count`)|
+|`r2_true_obs`, `mi_true_obs`, `te_true_obs`, `sign_true_obs`, `r2_true_obs_weekly`, `lag_r2_true_obs_<m\|p><d>`, `best_lag_true_obs`, `best_lag_r2_true_obs`|Synthetic corpora: the latent-observation metrics with the stored true latent in place of the inferred one, the ceiling of an exactly recovered latent (`true_window_count`, `true_observation_count`)|
+|`r2_lat_true`|Synthetic corpora: within-window squared correlation of the inferred and the true latent|
+|`<metric>_null95`|95th percentile over 200 permutations pairing each window's observations with another window's latent (latent-observation metrics)|
+|`<metric>_q05`, `<metric>_q95`|Region-bootstrap interval, 200 resamples; region sampling only|
+
+Permutations and bootstraps use at most 20,000 seeded windows
+(`resample_window_count`). Overlapping windows make the effective sample smaller
+than `observation_count`.
+
+True latents exist for the sources `I`, `H`, `D` and `death_flow`. The corpus
+stores no true admission or infection flow, so the default hospitalization
+source has no ceiling; evaluating with
+`model.observation_heads.relevant_source_hosp=H` gives the ceiling of the
+hospital census instead.
+
 ## 4. Model Variants
 
 The architecture supports ablation studies via `ModelVariant` flags:
@@ -173,6 +266,12 @@ The architecture supports ablation studies via `ModelVariant` flags:
 *   **Mobility**: Enables `MobilityDenseEncoder` to process dynamic mobility graphs.
 *   **Biomarkers**: Enables wastewater inputs.
 *   **Cases**: Enables clinical history inputs.
+
+`model.observation_heads.mechanistic_disabled_heads` sets a head's mechanistic
+log location to an exact zero, so it predicts from the observation-context
+residual alone. Disabling every head gives a black-box control with the same
+encoder; a relative residual budget (`training.residual_schedule`) is rejected
+on such heads, and a head cannot disable both paths.
 
 ## 5. Configuration Parameters
 
@@ -291,7 +390,7 @@ def forward(
 
 **Returns**:
 
-*   `beta_t`, `S_trajectory`, `I_trajectory`, `R_trajectory`: Latent dynamics.
+*   `beta_t`, `S_trajectory`, `I_trajectory`, `R_trajectory`: Latent dynamics; `infection_flow`, `hospitalization_flow`, `death_flow`: per-step latent flows.
 *   `pred_ww`, `pred_hosp`, `pred_cases`, `pred_deaths`: Observation predictions.
 *   `physics_residual`: Deviation from pure SIR dynamics (for $L_{SIR}$).
 

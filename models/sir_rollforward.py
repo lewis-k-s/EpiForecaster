@@ -99,6 +99,8 @@ class SIRRollForward(nn.Module):
                 - R_trajectory: [batch_size, horizon+1] (includes R0)
                 - D_trajectory: [batch_size, horizon+1] (accumulated deaths, starts at 0)
                 - hospitalization_flow: [batch_size, horizon] (new hospitalizations per step)
+                - infection_flow: [batch_size, horizon] (S -> I flow beta*S*I/N of each
+                  Euler step, taken before the non-negativity clamp and mass rescale)
                 - death_flow: [batch_size, horizon] (new deaths per step)
                 - hospital_death_flow: [batch_size, horizon] (H -> D deaths per step)
                 - direct_death_flow: [batch_size, horizon] (I -> D deaths per step)
@@ -171,6 +173,7 @@ class SIRRollForward(nn.Module):
         D_list = [D0]
 
         hospitalization_flow_list = []
+        infection_flow_list = []
         death_flow_list = []
         hospital_death_flow_list = []
         direct_death_flow_list = []
@@ -259,6 +262,7 @@ class SIRRollForward(nn.Module):
 
             # Store flow for observation heads
             hospitalization_flow_list.append(hospitalization_flow)
+            infection_flow_list.append(beta_SI_over_N)
             death_flow_list.append(death_flow)
             hospital_death_flow_list.append(hospital_death_flow)
             direct_death_flow_list.append(direct_death_flow)
@@ -287,6 +291,7 @@ class SIRRollForward(nn.Module):
         hospitalization_flow_traj = torch.stack(
             hospitalization_flow_list, dim=1
         )  # [B, H]
+        infection_flow_traj = torch.stack(infection_flow_list, dim=1)  # [B, H]
         death_flow_traj = torch.stack(death_flow_list, dim=1)  # [B, H]
         hospital_death_flow_traj = torch.stack(
             hospital_death_flow_list, dim=1
@@ -301,6 +306,7 @@ class SIRRollForward(nn.Module):
             "R_trajectory": R_traj,
             "D_trajectory": D_traj,
             "hospitalization_flow": hospitalization_flow_traj,
+            "infection_flow": infection_flow_traj,
             "death_flow": death_flow_traj,
             "hospital_death_flow": hospital_death_flow_traj,
             "direct_death_flow": direct_death_flow_traj,

@@ -131,6 +131,14 @@ def _make_batch() -> SimpleNamespace:
                 dtype=torch.float32,
             ),
             "death_flow": torch.zeros((2, 2), dtype=torch.float32),
+            "infection_flow": torch.tensor(
+                [[0.001, 0.002], [0.003, 0.004]],
+                dtype=torch.float32,
+            ),
+            "beta_t": torch.full((2, 2), 0.3, dtype=torch.float32),
+            "gamma_t": torch.full((2, 2), 0.1, dtype=torch.float32),
+            "mortality_t": torch.full((2, 2), 0.01, dtype=torch.float32),
+            "hospitalization_rate_t": torch.full((2, 2), 0.05, dtype=torch.float32),
             "observation_source_hosp": torch.tensor(
                 [[0.0, 0.02, 0.03], [0.0, 0.04, 0.05]],
                 dtype=torch.float32,

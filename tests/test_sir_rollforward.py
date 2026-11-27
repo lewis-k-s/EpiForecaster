@@ -419,6 +419,7 @@ class TestEdgeCases:
         # Peak should occur in first half (when beta is high)
         assert peak_idx <= 10
 
+
 class TestSIRHDFlows:
     """Tests for hospitalized latent state and H -> D mortality path."""
 
@@ -501,3 +502,43 @@ class TestSIRHDFlows:
         assert torch.allclose(result["death_flow"], expected_hospital_deaths)
         assert torch.allclose(result["D_trajectory"][:, 1], torch.tensor([20.0]))
         assert torch.allclose(result["H_trajectory"][:, 1], torch.tensor([60.0]))
+
+
+class TestInfectionFlow:
+    def test_infection_flow_is_the_s_decrement_when_no_constraint_acts(self):
+        module = SIRRollForward(
+            dt=0.5, enforce_nonnegativity=False, enforce_mass_conservation=False
+        )
+        beta_t = torch.tensor([[0.4, 0.6, 0.2]])
+        result = module(
+            beta_t=beta_t,
+            gamma_t=torch.full((1, 3), 0.1),
+            mortality_t=torch.full((1, 3), 0.01),
+            S0=torch.tensor([800.0]),
+            I0=torch.tensor([100.0]),
+            R0=torch.tensor([100.0]),
+            population=torch.tensor([1000.0]),
+        )
+
+        S = result["S_trajectory"]
+        I = result["I_trajectory"]  # noqa: E741
+        expected = beta_t * S[:, :-1] * I[:, :-1] / 1000.0
+        assert result["infection_flow"].shape == (1, 3)
+        assert torch.allclose(result["infection_flow"], expected)
+        assert torch.allclose(S[:, :-1] - S[:, 1:], 0.5 * result["infection_flow"])
+
+    def test_infection_flow_is_reported_before_the_nonnegativity_clamp(self):
+        module = SIRRollForward(enforce_mass_conservation=False)
+        result = module(
+            beta_t=torch.tensor([[50.0]]),
+            gamma_t=torch.zeros(1, 1),
+            mortality_t=torch.zeros(1, 1),
+            S0=torch.tensor([0.5]),
+            I0=torch.tensor([0.4]),
+            R0=torch.tensor([0.1]),
+            population=torch.tensor([1.0]),
+        )
+
+        # beta * S * I / N = 50 * 0.5 * 0.4 = 10 even though S can only fall by 0.5.
+        assert torch.allclose(result["infection_flow"], torch.tensor([[10.0]]))
+        assert torch.allclose(result["S_trajectory"][:, 1], torch.tensor([0.0]))

@@ -21,6 +21,7 @@ from evaluation.metrics import (
 )
 from evaluation.pathway_metrics import (
     TorchLatentCoherenceAccumulator,
+    TorchLatentPlausibilityAccumulator,
     TorchLatentProtocolAccumulator,
     TorchObservationLatentCoherenceAccumulator,
     TorchPathwayMetricAccumulator,
@@ -228,4 +229,48 @@ def test_latent_protocol_steps_trace_one_graph(
         outputs, targets = _latent_batch(seed, generator, with_targets=True)
         for accumulator in (eager, compiled):
             accumulator.update(predictions=outputs, targets=targets)
+    _assert_same(eager.finalize(), compiled.finalize())
+
+
+@pytest.mark.parametrize("with_ascertainment", [False, True])
+def test_latent_plausibility_step_traces_one_graph(
+    with_ascertainment: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    eager = TorchLatentPlausibilityAccumulator(device=CPU)
+    compiled = TorchLatentPlausibilityAccumulator(device=CPU, compile_step=True)
+    generator = torch.Generator().manual_seed(13)
+    for seed in range(3):
+        _no_recompile_after_first(seed, monkeypatch)
+        rows = _rows(seed)
+        states = torch.rand(2, rows, H + 1, generator=generator)
+        states[0, 0, seed] = float("nan")
+        rates = torch.rand(4, rows, H, generator=generator)
+        rates[1, 1] = 0.0
+        outputs = {
+            "S_trajectory": states[0],
+            "I_trajectory": states[1] * 1.0e-3,
+            "beta_t": rates[0],
+            "gamma_t": rates[1],
+            "mortality_t": rates[2],
+            "hospitalization_rate_t": rates[3],
+        }
+        ascertainment = (
+            {
+                "cases": (
+                    _batch(seed).abs() * 1.0e-4,
+                    _batch(seed, 10),
+                    _weights(seed),
+                ),
+                "hosp": (
+                    _batch(seed, 1).abs() * 1.0e-4,
+                    _batch(seed, 11),
+                    _weights(seed, 3),
+                ),
+                "deaths": None,
+            }
+            if with_ascertainment
+            else {}
+        )
+        for accumulator in (eager, compiled):
+            accumulator.update(model_outputs=outputs, ascertainment=ascertainment)
     _assert_same(eager.finalize(), compiled.finalize())

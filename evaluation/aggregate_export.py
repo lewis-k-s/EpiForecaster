@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -269,3 +270,55 @@ def write_main_model_aggregate_csvs(
         f"{split_key}_main_model_aggregate_metrics": target_path,
         f"{split_key}_main_model_joint_loss_aggregate": joint_path,
     }
+
+
+def json_metric_value(value: object) -> object:
+    """Convert scalar or structured evaluation metrics to JSON-native values."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): json_metric_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_metric_value(item) for item in value]
+
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return json_metric_value(tolist())
+    item = getattr(value, "item", None)
+    if callable(item):
+        return json_metric_value(item())
+    raise TypeError(f"Unsupported evaluation metric value: {type(value).__name__}")
+
+
+def write_evaluation_summary(
+    path: Path,
+    *,
+    checkpoint: Path,
+    split: str,
+    eval_loss: float,
+    metrics: dict[str, Any],
+) -> Path:
+    """Write every run-level metric of one evaluation; non-finite values are null."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checkpoint": str(checkpoint.resolve()),
+                "split": split,
+                "eval_loss": json_metric_value(float(eval_loss)),
+                "metrics": {
+                    str(name): json_metric_value(value)
+                    for name, value in sorted(metrics.items())
+                },
+            },
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
