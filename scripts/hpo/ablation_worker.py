@@ -6,7 +6,6 @@ exactly-once queue coordination; it neither samples nor defines conditions.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import logging
@@ -30,6 +29,7 @@ from optuna.distributions import CategoricalDistribution
 from optuna.trial import create_trial
 
 from models.configs import EpiForecasterConfig
+from scripts.hpo.file_lock import file_lock
 from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
@@ -683,17 +683,6 @@ def expected_trial_identities(
     }
 
 
-@contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 def _mark_running_attempt_failed(study: optuna.Study, trial_number: int) -> None:
     """Terminalize a stale attempt through Optuna's supported public API."""
     study.tell(trial_number, state=optuna.trial.TrialState.FAIL)
@@ -1020,7 +1009,7 @@ def initialize_study_queue(
     """Fill uncompleted identities, optionally replacing stale running attempts."""
     expected_params = build_trial_queue(campaign, smoketest=smoketest)
     expected = expected_trial_identities(campaign, smoketest=smoketest)
-    with _file_lock(lock_path):
+    with file_lock(lock_path):
         recorded_hash = study.user_attrs.get("campaign_sha256")
         if recorded_hash is not None and recorded_hash != campaign.sha256:
             raise ValueError(
@@ -1266,9 +1255,9 @@ def run_queued_trials(
             closeout_requested is not None and closeout_requested.is_set()
         ) or (timeout_s is not None and time.monotonic() - started >= timeout_s)
         if stop_claiming:
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 return _has_waiting_trials(study, expected)
-        with _file_lock(lock_path):
+        with file_lock(lock_path):
             waiting = [
                 trial
                 for trial in study.trials
@@ -1299,23 +1288,23 @@ def run_queued_trials(
                 smoketest=smoketest,
             )
         except optuna.TrialPruned:
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 study.tell(trial, state=optuna.trial.TrialState.PRUNED)
                 _reenqueue_failed_identity(
                     study, identity, attempts_budget=FAILED_ATTEMPT_BUDGET
                 )
         except Exception:
             logger.exception("Campaign trial %d failed", trial.number)
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
                 _reenqueue_failed_identity(
                     study, identity, attempts_budget=FAILED_ATTEMPT_BUDGET
                 )
         else:
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 study.tell(trial, value)
         completed += 1
-    with _file_lock(lock_path):
+    with file_lock(lock_path):
         return _has_waiting_trials(study, expected)
 
 

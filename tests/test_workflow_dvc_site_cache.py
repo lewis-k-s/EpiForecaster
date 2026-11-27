@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -26,14 +27,14 @@ def _write_pointer(path: Path, *, md5: str, output_name: str, size: int = 1) -> 
     )
 
 
-def test_stage_dvc_keeps_site_cache_inside_workspace(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
+def _stage_synthetic(
+    monkeypatch, tmp_path: Path, *, retry: bool = False
+) -> tuple[list[list[str]], Path]:
     run_root = tmp_path / "run"
     source_root = run_root / "source"
     pointer = source_root / "data/processed/synthetic.zarr.dvc"
     _write_pointer(pointer, md5="synthetic.dir", output_name="synthetic.zarr")
+    pointer.chmod(0o444)
 
     config_path = run_root / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,18 +58,41 @@ def test_stage_dvc_keeps_site_cache_inside_workspace(
         if command[1:3] == ["init", "--no-scm"]:
             (cwd / ".dvc").mkdir()
         elif command[1] == "pull":
-            (cwd / "data/processed/synthetic.zarr").mkdir(parents=True)
+            (cwd / "data/processed/synthetic.zarr").mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(run_support, "_run", fake_run)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "node-local"))
+    (tmp_path / "node-local").mkdir()
 
     run_support.stage_dvc(config_path, source_root, run_root)
+    if retry:
+        run_support.stage_dvc(config_path, source_root, run_root)
+    return commands, tmp_path / "node-local"
 
-    assert [
-        "dvc",
-        "config",
-        "core.site_cache_dir",
-        ".dvc/tmp",
-    ] in commands
+
+def test_stage_dvc_keeps_site_cache_on_node_local_temp(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    commands, node_local = _stage_synthetic(monkeypatch, tmp_path)
+
+    site_cache = [
+        command[4]
+        for command in commands
+        if command[1:4] == ["config", "--local", "core.site_cache_dir"]
+    ]
+    assert len(site_cache) == 1
+    assert Path(site_cache[0]).parent == node_local
+    assert Path(site_cache[0]).is_dir()
+
+
+def test_stage_dvc_resumes_over_a_read_only_pointer(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    commands, _ = _stage_synthetic(monkeypatch, tmp_path, retry=True)
+
+    assert sum(command[1] == "pull" for command in commands) == 2
 
 
 def _stage_git_import(

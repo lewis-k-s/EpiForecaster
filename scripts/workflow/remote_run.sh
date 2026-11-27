@@ -35,6 +35,7 @@ QOS=""
 NODES=""
 TASKS=""
 CPUS_PER_TASK=""
+MPS_CLIENTS_PER_GPU=""
 GRES=""
 RUNTIME=""
 CLOSEOUT_SIGNAL_SECONDS=""
@@ -97,6 +98,7 @@ load_dispatch_request() {
       cpus_per_task) CPUS_PER_TASK="$value" ;;
       gres) GRES="$value" ;;
       runtime) RUNTIME="$value" ;;
+      mps_clients_per_gpu) MPS_CLIENTS_PER_GPU="$value" ;;
       closeout_signal_seconds) CLOSEOUT_SIGNAL_SECONDS="$value" ;;
       *)
         echo "Unknown dispatch request field: $field" >&2
@@ -115,7 +117,8 @@ validate_dispatch_request() {
     SOURCE_SNAPSHOT_SHA256 CONFIG_SHA256 CONTAINER_SIF \
     CONTAINER_DIGEST_FILE TOOLING_KEY TOOLING_PYTHON SNAKEMAKE_BIN \
     SNAKEMAKE_VERSION WORKFLOW_KIND WORKFLOW_TARGET ACCOUNT PARTITION QOS \
-    NODES TASKS CPUS_PER_TASK GRES RUNTIME CLOSEOUT_SIGNAL_SECONDS; do
+    NODES TASKS CPUS_PER_TASK GRES RUNTIME MPS_CLIENTS_PER_GPU \
+    CLOSEOUT_SIGNAL_SECONDS; do
     if [ -z "${!field}" ]; then
       echo "Dispatch request is missing $field" >&2
       return 1
@@ -165,9 +168,12 @@ validate_dispatch_request() {
       return 1
     fi
   elif [ "$NODES" != "1" ] \
-    || [[ ! "$TASKS" =~ ^[1-4]$ ]] \
-    || [ "$CPUS_PER_TASK" != "20" ] \
-    || [ "$GRES" != "gpu:$TASKS" ]; then
+    || [[ ! "$TASKS" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "$CPUS_PER_TASK" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "$MPS_CLIENTS_PER_GPU" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "$GRES" =~ ^gpu:[1-4]$ ]] \
+    || [ "$TASKS" != "$((${GRES#gpu:} * MPS_CLIENTS_PER_GPU))" ] \
+    || [ "$((TASKS * CPUS_PER_TASK))" != "$((${GRES#gpu:} * 20))" ]; then
     echo "Dispatch request violates the MN5 single-node allocation contract" >&2
     return 1
   fi
@@ -700,8 +706,8 @@ validate_interactive_allocation() {
   if [[ "$alloc_tres" =~ gres/gpu=([0-9]+) ]]; then
     gpu_count="${BASH_REMATCH[1]}"
   fi
-  if [ "$gpu_count" -lt "$TASKS" ]; then
-    echo "Allocation $job_id has $gpu_count GPUs, expected at least $TASKS" >&2
+  if [ "$gpu_count" -lt "${GRES#gpu:}" ]; then
+    echo "Allocation $job_id has $gpu_count GPUs, expected at least ${GRES#gpu:}" >&2
     return 1
   fi
 

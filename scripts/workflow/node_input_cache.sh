@@ -30,14 +30,25 @@ stage_shared_input_cache() {
   echo "Using allocation-local DVC inputs at $cache_path"
 }
 
+# Files at least this large are copied by parallel_copy.py with concurrent
+# block readers; rsync copies the rest. The copy fails before it starts unless
+# the node-local disk keeps the reserve free afterwards, for the container's
+# /tmp (compile caches, plots). Jobs of this user on one node share the lock
+# under /scratch/tmp (outside every job TMPDIR), which serializes the space
+# check and block reservation of concurrent stagings.
+LARGE_INPUT_BYTES=$((1 << 30))
+NODE_CACHE_RESERVE_BYTES="${EPIFORECASTER_NODE_CACHE_RESERVE_BYTES:-$((16 << 30))}"
+NODE_STAGING_LOCK="${EPIFORECASTER_NODE_STAGING_LOCK:-/scratch/tmp/epiforecaster-staging-$(id -un).lock}"
+
 build_shared_input_cache() {
   local run_root="$1" source_root="$2" cache_path="$3"
-  local temporary bind_root
+  local temporary bind_root script_dir
   [ ! -f "$cache_path/.ready" ] || return 0
   if [ -e "$cache_path" ]; then
     echo "Unsealed input cache exists: $cache_path" >&2
     return 1
   fi
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   temporary="$(mktemp -d "${cache_path%/*}/.staging.XXXXXX")"
   # Failed copies stay separate. Only a complete copy is published.
   while IFS= read -r bind_root; do
@@ -45,7 +56,11 @@ build_shared_input_cache() {
     test -d "$source_root/$bind_root"
     mkdir -p "$temporary/$bind_root"
     rsync -a "$source_root/$bind_root/" "$temporary/$bind_root/"
-    rsync -aL "$run_root/.state/dvc-workspace/$bind_root/" "$temporary/$bind_root/"
+    rsync -aL --max-size=$((LARGE_INPUT_BYTES - 1)) \
+      "$run_root/.state/dvc-workspace/$bind_root/" "$temporary/$bind_root/"
+    python3 "$script_dir/parallel_copy.py" --min-bytes "$LARGE_INPUT_BYTES" \
+      --reserve-bytes "$NODE_CACHE_RESERVE_BYTES" --lock "$NODE_STAGING_LOCK" \
+      "$run_root/.state/dvc-workspace/$bind_root" "$temporary/$bind_root"
   done <"$run_root/.state/dvc_bind_roots.txt"
   touch "$temporary/.ready"
   chmod -R a-w "$temporary"

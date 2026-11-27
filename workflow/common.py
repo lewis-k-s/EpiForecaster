@@ -133,6 +133,7 @@ def launch_parallel_workers_command(
     workers: int,
     cpus_per_task: int,
     worker_group: str,
+    mps_clients_per_gpu: int = 1,
 ) -> str:
     return shlex.join(
         [
@@ -149,6 +150,8 @@ def launch_parallel_workers_command(
             str(cpus_per_task),
             "--worker-group",
             worker_group,
+            "--mps-clients-per-gpu",
+            str(mps_clients_per_gpu),
             "--",
             *[str(value) for value in arguments],
         ]
@@ -206,6 +209,8 @@ def hpo_worker_arguments(config: dict[str, Any]) -> list[object]:
         options["sampler"],
         "--pruning-start-epoch",
         int(options["pruning_start_epoch"]),
+        "--pruning-startup-trials",
+        int(options["pruning_startup_trials"]),
         "--search-space",
         options["search_space"],
     ]

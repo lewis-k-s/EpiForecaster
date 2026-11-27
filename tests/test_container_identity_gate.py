@@ -79,7 +79,7 @@ def test_template_pin_must_be_hex_digest() -> None:
 
 def test_site_default_is_the_digest_named_image() -> None:
     conf = Path(".cluster/mn5.conf").read_text(encoding="utf-8")
-    assert "epiforecaster-runtime-41550b2b5a2e47912950.sif}" in conf
+    assert "epiforecaster-runtime-5e95af3777a498655d42.sif}" in conf
     assert "/epiforecaster-runtime.sif}" not in conf
 
 

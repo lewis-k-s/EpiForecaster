@@ -235,6 +235,7 @@ def _workflow_config(run_root: Path, source_root: Path) -> dict:
             "seed": 42,
             "sampler": "random",
             "pruning_start_epoch": 1,
+            "pruning_startup_trials": 2,
             "search_space": "default",
             "overrides": [],
         },

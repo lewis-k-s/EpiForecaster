@@ -1347,6 +1347,9 @@ class EpiForecasterTrainer:
         try:
             result = self._run_training()
         except Exception as exc:
+            # A pruned or failed trial skips the cleanup at the end of
+            # _run_training; release its persistent loader workers here.
+            self.cleanup_dataloaders()
             status = "pruned" if exc.__class__.__name__ == "TrialPruned" else "failed"
             writer = getattr(self, "training_dynamics_writer", None)
             if writer is not None:
