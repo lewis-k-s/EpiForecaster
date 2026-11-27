@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 
 from evaluation.distribution_scores import (
+    censored_normal_crps,
+    censored_normal_nll,
     distribution_wis,
     standard_wis_half_widths,
     student_t_crps,
@@ -86,13 +88,18 @@ def get_loss_from_config(
         distribution_family=joint_cfg.distribution_family,
         distribution_df=joint_cfg.distribution_df,
         distribution_scale_floor=observation_heads_config.distribution_scale_floor,
+        censored=observation_heads_config.censored_location,
         interval_levels=joint_cfg.interval_levels,
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
         latent_total_weight=joint_cfg.latent.total_weight,
         latent_scaling=joint_cfg.latent.scaling,
         latent_component_weights=joint_cfg.latent.component_weights,
+        latent_asinh_scale_fraction=joint_cfg.latent.asinh_scale_fraction,
         latent_scales=latent_scales,
         latent_require_complete_targets=joint_cfg.latent.require_complete_targets,
+        history_reconstruction_weight=joint_cfg.history_reconstruction_weight,
+        residual_penalty_weight=joint_cfg.residual_penalty_weight,
+        beta_smoothness_weight=joint_cfg.beta_smoothness_weight,
         disable_ww=joint_cfg.disable_ww,
         disable_hosp=joint_cfg.disable_hosp,
         disable_cases=joint_cfg.disable_cases,
@@ -183,12 +190,14 @@ class JointInferenceLoss(nn.Module):
         distribution_family: str = "normal",
         distribution_df: float = 5.0,
         distribution_scale_floor: float = 1.0e-3,
+        censored: bool = False,
         interval_levels: list[float] | tuple[float, ...] | None = None,
         obs_weight_sum: float = 0.95,
         latent_total_weight: float = 0.0,
         latent_scaling: str = "none",
         latent_component_weights: dict[str, float] | None = None,
         latent_scales: dict[str, float] | None = None,
+        latent_asinh_scale_fraction: float = 1.0,
         latent_require_complete_targets: bool = False,
         sir_residual_clip: float | None = None,
         disable_ww: bool = False,
@@ -199,6 +208,9 @@ class JointInferenceLoss(nn.Module):
         mask_input_hosp: bool = False,
         mask_input_cases: bool = False,
         mask_input_deaths: bool = False,
+        history_reconstruction_weight: float = 0.0,
+        residual_penalty_weight: float = 0.0,
+        beta_smoothness_weight: float = 0.0,
         ww_min_history_observed: int = 0,
         hosp_min_history_observed: int = 0,
         cases_min_history_observed: int = 0,
@@ -213,6 +225,7 @@ class JointInferenceLoss(nn.Module):
         self.distribution_family = distribution_family.lower()
         self.distribution_df = float(distribution_df)
         self.distribution_scale_floor = float(distribution_scale_floor)
+        self.censored = censored
         self.interval_levels = tuple(
             float(v) for v in (interval_levels or (0.5, 0.8, 0.95))
         )
@@ -221,6 +234,16 @@ class JointInferenceLoss(nn.Module):
         self.latent_total_weight = float(latent_total_weight)
         self.latent_scaling = latent_scaling.lower()
         self.latent_require_complete_targets = bool(latent_require_complete_targets)
+        self.history_reconstruction_weight = float(history_reconstruction_weight)
+        self.residual_penalty_weight = float(residual_penalty_weight)
+        self.beta_smoothness_weight = float(beta_smoothness_weight)
+        for name, value in [
+            ("history_reconstruction_weight", self.history_reconstruction_weight),
+            ("residual_penalty_weight", self.residual_penalty_weight),
+            ("beta_smoothness_weight", self.beta_smoothness_weight),
+        ]:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
         self.latent_component_weights = {
             name: float(value)
             for name, value in (
@@ -232,6 +255,7 @@ class JointInferenceLoss(nn.Module):
             if latent_scales is None
             else {name: float(value) for name, value in latent_scales.items()}
         )
+        self.latent_asinh_scale_fraction = float(latent_asinh_scale_fraction)
         self.disable_ww = bool(disable_ww)
         self.disable_hosp = bool(disable_hosp)
         self.disable_cases = bool(disable_cases)
@@ -274,6 +298,11 @@ class JointInferenceLoss(nn.Module):
             )
         if not math.isfinite(self.distribution_df):
             raise ValueError("distribution_df must be finite")
+        if self.censored and self.distribution_family != "normal":
+            raise ValueError(
+                "model.observation_heads.censored_location requires "
+                f"distribution_family='normal', got {self.distribution_family!r}"
+            )
         self.register_buffer(
             "wis_half_widths",
             torch.tensor(
@@ -297,6 +326,14 @@ class JointInferenceLoss(nn.Module):
             raise ValueError(
                 "latent_scaling must be one of ['asinh', 'none', 'std'], "
                 f"got {self.latent_scaling!r}"
+            )
+        if (
+            not math.isfinite(self.latent_asinh_scale_fraction)
+            or self.latent_asinh_scale_fraction <= 0
+        ):
+            raise ValueError(
+                "latent_asinh_scale_fraction must be finite and positive, "
+                f"got {self.latent_asinh_scale_fraction}"
             )
         expected_latent_tasks = set(self._LATENT_TASKS)
         if set(self.latent_component_weights) != expected_latent_tasks:
@@ -378,7 +415,19 @@ class JointInferenceLoss(nn.Module):
         sird_supervision_weighted = (
             self.latent_total_weight * components["sird_supervision"]
         )
-        total = obs_total + sird_supervision_weighted
+        # Regularizers enter only with a positive weight, so an unused term
+        # cannot inject a non-finite value into the total.
+        regularization_weighted = torch.zeros_like(obs_total)
+        for weight, component_name in (
+            (self.history_reconstruction_weight, "history_reconstruction"),
+            (self.residual_penalty_weight, "residual_penalty"),
+            (self.beta_smoothness_weight, "beta_smoothness"),
+        ):
+            if weight > 0:
+                regularization_weighted = (
+                    regularization_weighted + weight * components[component_name]
+                )
+        total = obs_total + sird_supervision_weighted + regularization_weighted
         return {
             "obs_weights": obs_weights,
             "obs_total": obs_total,
@@ -388,6 +437,7 @@ class JointInferenceLoss(nn.Module):
             "cases_weighted": obs_weighted[2],
             "deaths_weighted": obs_weighted[3],
             "sird_supervision_weighted": sird_supervision_weighted,
+            "regularization_weighted": regularization_weighted,
         }
 
     @staticmethod
@@ -554,6 +604,8 @@ class JointInferenceLoss(nn.Module):
         target: torch.Tensor,
     ) -> torch.Tensor:
         if self.observation_loss == "nll":
+            if self.censored:
+                return censored_normal_nll(loc, scale, target)
             if self.distribution_family == "normal":
                 z = (target - loc) / scale
                 return 0.5 * z**2 + torch.log(scale) + 0.5 * _LOG_TWO_PI
@@ -567,6 +619,8 @@ class JointInferenceLoss(nn.Module):
             return -dist.log_prob(target)
 
         if self.observation_loss == "crps":
+            if self.censored:
+                return censored_normal_crps(loc, scale, target)
             if self.distribution_family == "student_t":
                 return student_t_crps(loc, scale, target, self.distribution_df)
             return self._normal_crps(loc=loc, scale=scale, target=target)
@@ -707,8 +761,11 @@ class JointInferenceLoss(nn.Module):
             return prediction_f32, target_f32
 
         assert self.latent_scales is not None
+        scale_value = self.latent_scales[task_name]
+        if self.latent_scaling == "asinh" and task_name not in {"s", "r"}:
+            scale_value *= self.latent_asinh_scale_fraction
         scale = torch.as_tensor(
-            self.latent_scales[task_name],
+            scale_value,
             dtype=torch.float32,
             device=prediction_f32.device,
         )
@@ -778,6 +835,96 @@ class JointInferenceLoss(nn.Module):
         if history is None:
             return None
         return history[..., 1]
+
+    @staticmethod
+    def _get_history_observation(
+        batch_data: EpiBatch,
+        head_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """History values and observed mask of a head, [B, L] each."""
+        if head_name == "ww":
+            return batch_data.ww_hist, batch_data.ww_hist_mask
+        history = {
+            "hosp": batch_data.hosp_hist,
+            "cases": batch_data.cases_hist,
+            "deaths": batch_data.deaths_hist,
+        }[head_name]
+        return history[..., 0], history[..., 1]
+
+    def _history_reconstruction_loss(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        batch_data: EpiBatch | None,
+        zero_anchor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean over heads of the masked MSE between the mechanistic location
+        over the rolled history and the observed history.
+
+        ``mechanistic_history_<head>`` ends on the last history day, so it is
+        compared with the same number of trailing history days.
+        """
+        total = zero_anchor
+        active_heads = zero_anchor
+        if batch_data is None:
+            return total
+        for head_name in self._OBS_HEADS:
+            mechanistic = model_outputs.get(f"mechanistic_history_{head_name}")
+            if mechanistic is None or getattr(self, self._HEAD_DISABLE_ATTR[head_name]):
+                continue
+            value, mask = self._get_history_observation(batch_data, head_name)
+            steps = int(mechanistic.shape[1])
+            target = value[:, -steps:].to(mechanistic.device).float()
+            weights = (mask[:, -steps:].to(mechanistic.device).float() > 0.5).float()
+            weights = weights * torch.isfinite(target).float()
+            head_loss = self._weighted_masked_mse_from_weights(
+                prediction=mechanistic,
+                target=target,
+                weights=weights,
+            )
+            active = (weights.sum() > 0).float()
+            total = total + active * head_loss
+            active_heads = active_heads + active
+        return total / active_heads.clamp_min(1.0)
+
+    def _residual_penalty(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        obs_supervision: dict[str, dict[str, torch.Tensor | None]],
+        zero_anchor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean over heads of the mean squared residual contribution to the
+        forecast location over supervised points."""
+        total = zero_anchor
+        active_heads = zero_anchor
+        for head_name in self._OBS_HEADS:
+            residual = model_outputs.get(f"residual_{head_name}")
+            weights = obs_supervision[head_name]["weights"]
+            if residual is None or weights is None:
+                continue
+            residual = self._align_head_tensor(
+                residual, head_name=head_name, horizon=int(weights.shape[1])
+            )
+            head_penalty = self._weighted_masked_mse_from_weights(
+                prediction=residual,
+                target=torch.zeros_like(residual),
+                weights=weights,
+            )
+            active = (weights.sum() > 0).float()
+            total = total + active * head_penalty
+            active_heads = active_heads + active
+        return total / active_heads.clamp_min(1.0)
+
+    @staticmethod
+    def _beta_smoothness(
+        model_outputs: dict[str, torch.Tensor],
+        zero_anchor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean squared first difference of log(beta) along the roll-forward."""
+        beta = model_outputs.get("beta_rollforward")
+        if beta is None or beta.shape[1] < 2:
+            return zero_anchor
+        log_beta = torch.log(beta.float().clamp_min(1.0e-8))
+        return (log_beta[:, 1:] - log_beta[:, :-1]).square().mean()
 
     def forward(
         self,
@@ -979,6 +1126,15 @@ class JointInferenceLoss(nn.Module):
                         sird_supervision_loss + latent_weighted_losses[component_name]
                     )
 
+        regularizers = {
+            "history_reconstruction": self._history_reconstruction_loss(
+                model_outputs, batch_data, zero_anchor
+            ),
+            "residual_penalty": self._residual_penalty(
+                model_outputs, obs_supervision, zero_anchor
+            ),
+            "beta_smoothness": self._beta_smoothness(model_outputs, zero_anchor),
+        }
         components = {
             "ww": ww_loss,
             "hosp": hosp_loss,
@@ -992,6 +1148,7 @@ class JointInferenceLoss(nn.Module):
             },
             "sird_supervision_raw": sird_supervision_raw_loss,
             "sird_supervision": sird_supervision_loss,
+            **regularizers,
         }
         totals = self.compose_total_loss(
             components=components,
@@ -1011,6 +1168,8 @@ class JointInferenceLoss(nn.Module):
             },
             "sird_supervision_raw": sird_supervision_raw_loss,
             "sird_supervision": sird_supervision_loss,
+            **regularizers,
+            "regularization_weighted": totals["regularization_weighted"],
             "ww_weighted": totals["ww_weighted"],
             "hosp_weighted": totals["hosp_weighted"],
             "cases_weighted": totals["cases_weighted"],

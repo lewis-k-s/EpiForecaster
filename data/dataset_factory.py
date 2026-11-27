@@ -16,6 +16,7 @@ from data.curriculum_builder import (
     build_curriculum_datasets,
     discover_runs,
 )
+from data.block_pipeline import RunBlockPipeline
 from data.crossval_manifest import load_crossval_fold_manifest
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
@@ -40,6 +41,8 @@ class DatasetSplits:
     real_run_id: str | None = None
     synth_run_ids: list[str] | None = None
     region_embedding_store: RegionEmbeddingStore | None = None
+    # Per-block heavy-state builder of curriculum synthetic runs (else None).
+    block_pipeline: RunBlockPipeline | None = None
 
 
 @dataclass(frozen=True)
@@ -623,8 +626,13 @@ def _split_nodes_crossval_manifest(
     num_folds: int,
     fold_index: int,
     holdout_role: str,
+    region_set: str | None,
 ) -> tuple[list[int], list[int], list[int]]:
-    """Resolve fold membership from a validated, exactly-once manifest."""
+    """Resolve fold membership from a validated, exactly-once manifest.
+
+    A ``region_set`` limits training and validation to that manifest set; the
+    test fold keeps every assigned region.
+    """
     valid_region_ids = metadata.region_ids[metadata.valid_nodes].tolist()
     manifest = load_crossval_fold_manifest(
         manifest_path,
@@ -652,7 +660,22 @@ def _split_nodes_crossval_manifest(
         if index not in {val_fold, test_fold}
         for node in fold
     ]
-    return train_nodes, list(folds[val_fold]), list(folds[test_fold])
+    val_nodes = list(folds[val_fold])
+    if region_set is not None:
+        if region_set not in manifest.region_sets:
+            raise ValueError(
+                f"crossval_region_set {region_set!r} is not a region set of "
+                f"{manifest_path}"
+            )
+        members = manifest.region_sets[region_set]
+        train_nodes = [n for n in train_nodes if metadata.region_ids[n] in members]
+        val_nodes = [n for n in val_nodes if metadata.region_ids[n] in members]
+        if not train_nodes or not val_nodes:
+            raise ValueError(
+                f"crossval_region_set {region_set!r} leaves no training or "
+                f"validation regions in fold {fold_index}"
+            )
+    return train_nodes, val_nodes, list(folds[test_fold])
 
 
 def _log_split_summary(
@@ -741,6 +764,18 @@ def split_nodes_by_ratio(
             "run_id must be provided either as argument or in config.data.run_id"
         )
 
+    uses_manifest_crossval = (
+        config.training.node_split_strategy != "stratified"
+        and (
+            config.training.node_split_strategy == "crossval"
+            or config.training.crossval_enabled
+        )
+        and bool(config.training.crossval_manifest_path)
+    )
+    if config.training.crossval_region_set is not None and not uses_manifest_crossval:
+        raise ValueError(
+            "training.crossval_region_set requires manifest cross-validation"
+        )
     split_rng = np.random.default_rng(config.training.split_seed)
     metadata = _load_node_split_metadata(
         config=config,
@@ -767,6 +802,7 @@ def split_nodes_by_ratio(
                 num_folds=config.training.crossval_num_folds,
                 fold_index=config.training.crossval_fold_index,
                 holdout_role=config.training.crossval_holdout_role,
+                region_set=config.training.crossval_region_set,
             )
         else:
             train_nodes, val_nodes, test_nodes = _split_nodes_crossval(
@@ -784,9 +820,10 @@ def split_nodes_by_ratio(
             test_split=config.training.test_split,
         )
 
-    assert len(train_nodes) + len(val_nodes) + len(test_nodes) == len(
-        metadata.valid_nodes
-    ), "Dataset split is not correct"
+    if config.training.crossval_region_set is None:
+        assert len(train_nodes) + len(val_nodes) + len(test_nodes) == len(
+            metadata.valid_nodes
+        ), "Dataset split is not correct"
 
     _log_node_split_diagnostics(
         strategy=config.training.node_split_strategy,
@@ -1137,6 +1174,7 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             test_nodes=list(test_nodes),
             real_run=real_run,
             synth_runs=synth_runs,
+            curriculum=config.training.curriculum,
             region_embedding_store=region_embedding_store,
         )
 
@@ -1147,6 +1185,7 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             real_run_id=result.real_run_id,
             synth_run_ids=result.synth_run_ids,
             region_embedding_store=result.region_embedding_store,
+            block_pipeline=result.block_pipeline,
         )
     else:
         if not config.data.run_id:

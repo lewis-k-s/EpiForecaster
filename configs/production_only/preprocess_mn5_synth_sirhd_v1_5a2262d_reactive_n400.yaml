@@ -1,0 +1,82 @@
+# Closed-loop reactive SIRHD corpus for synthetic latent-supervision pretraining:
+# epiforecaster_sirhd_v1_zarr_5a2262d_20261105_reactive_n400 (440 runs:
+# 400 Reactive profiles, each with a policy, plus 40 no-policy Baseline twins
+# for every 10th profile, 945 regions).
+#
+# EpiSim.jl 5a2262d widened the sampled parameter ranges (R0 log-uniform
+# 1.0-1.9, wider severity scales, log-uniform case ascertainment in reporting
+# profile v4) so the corpus covers more variability than the n100 corpus. It
+# declares state space epiforecaster_sirhd_v2: the same five SIRHD stocks and
+# destination-dated death flow as v1, plus sirhd_infection_flow and
+# sirhd_hospitalization_flow, which this preprocessing does not read. The
+# pinned contract SHA-256 is that of the embedded v2 contract JSON.
+#
+# The generator's reporting QA fails 19 of 55 checks against the real-data
+# targets; EpiSim.jl waives them in qa_acceptance.json. All reactive gates, the
+# physical layout check and the factorized mobility parity (440/440) pass.
+#
+# The raw corpus is packed sharded Zarr (episim-raw-zarr-v1, lossless). It
+# stores only the factorized mobility (mobility_base_edges +
+# npi_mobility_reduction, rule max_endpoint_self_loop v1); the dense
+# mobility_time_varying is omitted. SyntheticProcessor rebuilds mobility from
+# the factorized layout and checks the row sums.
+#
+# The corpus identity is its DVC pointer
+# (data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip.dvc).
+# The build records no SHA-256 or logical dataset hash, so the DVC md5 and byte
+# size are the identity.
+
+base_config: "preprocess_mn5_synth.yaml"
+
+env: "mn5"
+synthetic_path: "data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip"
+cases_file: "data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip"
+mobility_path: "data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip"
+wastewater_file: "data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip"
+population_file: "data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip"
+region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_edges.nc"
+
+# The corpus starts on 2020-02-09. sirhd_death_flow is destination-dated, so its
+# first interval ends on 2020-02-10; the first corpus date has no death-flow
+# target and is excluded rather than filled.
+start_date: "2020-02-10"
+end_date: "2021-05-09"
+dataset_name: "synthetic_sirhd_v1_5a2262d_reactive_n400_holt_damped"
+vaccination_file: null
+continuous_storage_dtype: "float32"
+# The trainer casts mobility to float16 (10 mantissa bits), so rounding the
+# stored float32 mobility to 10 bits keeps what the model sees. The float32
+# exponent range stays, so small positive flows are not set to zero. See
+# docs/SYNTHETIC_ZARR_LAYOUT.md.
+bitround_keepbits:
+  mobility: 10
+
+synthetic_state_space_schema_version: "epiforecaster_sirhd_v2"
+synthetic_state_space_contract_sha256: "2e133e67d9278a9e05e2689961f17339497440530d5a88deee106323abe6ca54"
+
+temporal_covariates:
+  holiday_calendar_file: "data/files/catalonia_preprocessing_inputs_v1/catalonia_holidays.csv"
+
+smoothing:
+  clinical_method: "holt_damped"
+
+source_provenance:
+  generator_repository: "EpiSim.jl"
+  generator_source_commit: "5a2262d24b330769c42f0d1194b7d236ee9dfa61"
+  simulation_source_commit: "5a2262d24b330769c42f0d1194b7d236ee9dfa61"
+  generator_dvc_commit: "2d05b2d1fdae9c42825fbb196694cb9a7de2267a"
+  generator_bundle: "epiforecaster_sirhd_v1_zarr_5a2262d_20261105_reactive_n400"
+  generator_workflow_run: "reactive-n400-20261105b"
+  raw_corpus_dvc_md5: "afda29837a0e7c77b48e86a5429f6812"
+  raw_corpus_bytes: 239065027536
+  raw_corpus_origin_path: "/gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim_workflow/runs/reactive-n400-20261105b/outputs/corpus/raw_synthetic_observations.zarr.zip"
+  raw_corpus_layout: "episim-raw-zarr-v1 blosc-zstd-5-shuffle zarr 3.4.2"
+  state_space_schema_version: "epiforecaster_sirhd_v2"
+  state_space_contract_sha256: "2e133e67d9278a9e05e2689961f17339497440530d5a88deee106323abe6ca54"
+  reporting_profile: "sirhd_pretraining_reporting_v4"
+  reporting_config_sha256: "aa44642175a7d9ac3c88e4d67505741185047746ccf7ac21298ae413615ffaf8"
+  storage_profile_name: "epiforecaster_sirhd_v1_zarr_training_v3"
+  mobility_reduction_rule: "max_endpoint_self_loop v1"
+  dense_mobility: "omitted"
+  seed_cap_rule: "max_seed_half_region_population v1 (fraction 0.5, 3 runs capped)"
+  generation_slurm_jobs: "corpus=48600120"

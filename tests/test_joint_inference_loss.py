@@ -334,6 +334,31 @@ def test_joint_inference_asinh_keeps_s_and_r_on_standard_scale():
     assert components["latent_s"].item() == pytest.approx(1.0)
 
 
+def test_joint_inference_asinh_fraction_rescales_only_small_latents():
+    weights = {name: 0.0 for name in ("s", "i", "h", "r", "death_flow")}
+    weights["i"] = 0.5
+    weights["s"] = 0.5
+    loss_fn = JointInferenceLoss(
+        latent_total_weight=1.0,
+        latent_scaling="asinh",
+        latent_component_weights=weights,
+        latent_scales={name: 2.0 for name in weights},
+        latent_asinh_scale_fraction=0.25,
+        latent_require_complete_targets=True,
+    )
+    outputs, targets = _complete_latent_case(
+        i_prediction=torch.full((1, 3), 2.0),
+        i_target=torch.zeros(1, 3),
+    )
+    outputs["S_trajectory"] = torch.full((1, 3), 2.0)
+
+    components = loss_fn.compute_components(outputs, targets)
+
+    # I is compared as asinh(x / (0.25 * 2)); S keeps its std scale of 2.
+    assert components["latent_i"].item() == pytest.approx(math.asinh(4.0) ** 2)
+    assert components["latent_s"].item() == pytest.approx(1.0)
+
+
 def test_joint_inference_complete_latent_contract_rejects_missing_target():
     loss_fn = JointInferenceLoss(
         latent_total_weight=1.0,
@@ -757,6 +782,41 @@ def test_joint_inference_normal_nll_uses_distribution_params() -> None:
     ) / 2.0
     assert components["ww"].item() == pytest.approx(expected)
     assert components["total"].item() == pytest.approx(expected)
+
+
+def test_joint_inference_censored_nll_scores_zero_as_probability_mass() -> None:
+    loss_fn = JointInferenceLoss(
+        observation_loss="nll",
+        censored=True,
+        obs_weight_sum=1.0,
+        latent_total_weight=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.full((1, 3), 100.0),
+        "dist_ww_loc": torch.tensor([[-9.0, 0.0, 1.0]]),
+        "dist_ww_scale": torch.tensor([[1.0, 1.0, 2.0]]),
+    }
+    targets = {
+        "ww": torch.tensor([[0.0, 3.0]]),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.ones(1, 2),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+
+    # Observed zero: -log P(Y <= 0) = log 2 at loc 0. Observed 3: Normal density.
+    expected = (
+        math.log(2.0) + (0.5 + math.log(2.0) + 0.5 * math.log(2.0 * math.pi))
+    ) / 2.0
+    assert components["ww"].item() == pytest.approx(expected)
 
 
 def test_joint_inference_normal_nll_preserves_negative_values_and_gradient() -> None:

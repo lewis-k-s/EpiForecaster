@@ -7,9 +7,65 @@ env: "mn5"
 # train_epifor_mn5_full.yaml with training.init_checkpoint_path set to the best
 # checkpoint from this run.
 #
-# Sizing: one epoch is about ten times a 20-run epoch
-# (~4.2M examples, ~131k batches, ~3.1 h at the measured compiled throughput).
-# Four epochs keep the cycle well inside one acc_bscls allocation.
+# Sizing: one epoch is 5,309,124 examples (165,825 batches of 32). Compiled
+# training with the block pipeline below runs at about 90 batches/s on MN5
+# (production job 48429417), about 31 min per epoch.
+#
+# Memory: the 200 runs are never all resident. training.curriculum.run_block_size
+# keeps 8 runs at a time (each epoch draws blocks of 8 runs; chunks interleave
+# only inside a block). Startup builds only each run's light state (series,
+# masks, index maps; ~0.05 GB/run, ~10 GB for 200 runs) in
+# curriculum.light_build_workers threads. A run's heavy state (dense mobility
+# reduced to compact float16 graph weights [455, 660, 660] ~0.40 GB, k-hop
+# closure, bit-packed context tables ~0.06 GB, ~0.46 GB per run) is built when
+# the run's block is reached and dropped when the block ends; while a block
+# trains, the next curriculum.prefetch_blocks blocks are built in the background
+# by curriculum.block_builders spawned processes of curriculum.builder_threads
+# native threads each (not threads of the trainer: in job 48425142 trainer
+# threads built a run 3-10x slower than the old serial build and cost ~30% of
+# the training throughput through GIL and OMP contention). A builder re-reads one
+# run's mobility, holds ~1.2 GB dense plus ~1 GB intermediates transiently and
+# hands the ~0.46 GB result to the trainer through shared memory. 4 builders x
+# 3 threads use 12 of the 20 CPUs next to the 4 train and 2 validation loader
+# workers and the trainer. In sizing job 48428830 a run built in ~11.7 s and a
+# block of 8 in ~25 s, so each epoch's first block waits ~25 s; later blocks
+# waited under 1 s. Peak host RSS was 36.2 GB.
+# Mobility diagnostics are computed once per run, on its first build. Nothing is
+# written to disk. Host RAM holds the light
+# state plus one block plus the prefetched block(s) plus ~7 GB fixed overhead,
+# instead of the ~0.7 GB/run measured in the MN5 sizing run (job 48420141: OOM
+# at 115.5 GB after 152 runs; graph weights plus a never-freed (T, n_targets, N)
+# k-hop table). The sizing run (job 48421321) spent ~21 min building all runs
+# eagerly before training; the per-block log (curriculum_block_builds.jsonl in
+# the run directory: build_s, wait_s per block) shows how much of the build the
+# prefetch hides, to tune prefetch_blocks / block_builders / builder_threads. On the device a
+# block holds ~0.86 GB/run (float32 adjacency ~0.79 GB plus context tables),
+# ~7 GB for 8 runs against the 64 GB H100. A run is loaded onto the device once
+# per epoch (200 loads instead of ~8k chunk-switch rebuilds), and 8 runs per
+# block keep every stretch of batches mixed over several scenarios.
+#
+# Latent supervision is fit in a fixed training-split scale: S and R are divided
+# by their standard deviation, I, H and death flow are compared as asinh(x / c)
+# with c = asinh_scale_fraction * std. With raw fraction-space MSE ("none",
+# total_weight 0.01) the first a97c812 pretrain logged a weighted latent loss of
+# ~2e-4 against an observation loss of order 1, and its synthetic-test I
+# predictions kept 0.00085 of the target standard deviation. With c = std
+# (sizing run synth-sizing-asinh-a97c812-20261103, total_weight 1.0) the latent
+# objective held ~95% of the shared X0/rate gradient, yet I still collapsed to
+# ~1e-7 within 500 steps and its own gradient fell to ~1e-6 of the S/R
+# gradients: below c the asinh comparison is linear, so its gradient shrinks
+# with I through the X0 softmax and the multiplicative roll-forward. The fitted
+# stds are I 0.0275, H 7.1e-4, death flow 8.7e-6 per day; a fraction of 1e-3
+# puts c at 2.75 per 100k for I, so the comparison is logarithmic across
+# epidemiologically relevant prevalence. In sizing run
+# synth-sizing-asinh-f1e-3-a97c812-20261103b (total_weight 1.0, 21,000
+# batches) I no longer collapsed: its batch prediction spread tracked the
+# target spread (e.g. 0.018 vs 0.026) and I had the largest latent gradient.
+# After step 5,000 the latent/observation shared-gradient norm ratio had median
+# 0.29 (latentgrad_combined_to_obs_grad_norm_ratio). total_weight 1.5 targets a
+# ratio of ~0.44, a squared gradient share of ~16%. I carries the largest
+# component weight because the inferred prevalence anchors the real-data
+# latents.
 
 data:
   dataset_path: data/processed/synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip
@@ -43,6 +99,11 @@ model:
     forecast_horizon: 28
     max_neighbors: 20
     gnn_depth: 2
+    # Head architecture and optimizer match train_epifor_mn5_full.yaml so the
+    # pretrained checkpoint initializes the real-data fine-tune.
+    head_d_model: 128
+    head_num_layers: 4
+    head_dropout: 0.162
     sir_physics:
       dt: 1.0
       enforce_nonnegativity: true
@@ -85,8 +146,8 @@ training:
   early_stopping_patience: 5
   nan_loss_patience: 5
   epochs: 4
-  learning_rate: 0.001
-  weight_decay: 1.0e-05
+  learning_rate: 5.52e-04
+  weight_decay: 5.94e-04
   warmup_steps: 100
   num_workers: 4
   val_workers: 2
@@ -122,14 +183,26 @@ training:
     joint:
       observation_loss: nll
       latent:
-        total_weight: 0.01
-        scaling: "none"
+        total_weight: 1.5
+        scaling: "asinh"
+        component_weights:
+          s: 0.15
+          i: 0.4
+          h: 0.15
+          r: 0.15
+          death_flow: 0.15
+        asinh_scale_fraction: 1.0e-3
         require_complete_targets: true
 
   curriculum:
     enabled: true
     active_runs: -1          # Use all available synthetic runs each epoch
     chunk_size: 512
+    run_block_size: 8        # 25 blocks of 8 runs per epoch; one block resident
+    prefetch_blocks: 1       # build the next block while this one trains
+    block_builders: 4        # spawned processes building the runs of a block
+    builder_threads: 3       # native threads per builder (4 x 3 of 20 CPUs)
+    light_build_workers: 8   # threads building all runs' light state at startup
     run_sampling: "round_robin"
     schedule:
       - start_epoch: 0

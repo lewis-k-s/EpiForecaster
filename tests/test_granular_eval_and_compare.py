@@ -131,6 +131,14 @@ def _make_batch() -> SimpleNamespace:
                 dtype=torch.float32,
             ),
             "death_flow": torch.zeros((2, 2), dtype=torch.float32),
+            "infection_flow": torch.tensor(
+                [[0.001, 0.002], [0.003, 0.004]],
+                dtype=torch.float32,
+            ),
+            "beta_t": torch.full((2, 2), 0.3, dtype=torch.float32),
+            "gamma_t": torch.full((2, 2), 0.1, dtype=torch.float32),
+            "mortality_t": torch.full((2, 2), 0.01, dtype=torch.float32),
+            "hospitalization_rate_t": torch.full((2, 2), 0.05, dtype=torch.float32),
             "observation_source_hosp": torch.tensor(
                 [[0.0, 0.02, 0.03], [0.0, 0.04, 0.05]],
                 dtype=torch.float32,
@@ -346,7 +354,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert fallback_row["region_label"] == "08002"
 
     meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
-    assert meta["schema_version"] == "4"
+    assert meta["schema_version"] == "5"
     assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
@@ -577,6 +585,7 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
             batch_size=32,
             prefetch_factor=4,
             pin_memory=True,
+            crossval_manifest_path=None,
         ),
     )
     dataset = _DummyDataset()

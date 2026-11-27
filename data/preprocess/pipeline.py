@@ -12,6 +12,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 
+import dask
 import numpy as np
 import xarray as xr
 import yaml
@@ -67,6 +68,9 @@ class OfflinePreprocessingPipeline:
             "edar": EDARProcessor(self.config),
             "alignment": AlignmentProcessor(self.config),
         }
+        self._synthetic_processor = (
+            SyntheticProcessor(self.config) if self.config.synthetic_path else None
+        )
 
         # Initialize cases processor if cases file is configured
         if self.config.cases_file:
@@ -99,9 +103,19 @@ class OfflinePreprocessingPipeline:
             "warnings": [],
         }
 
+    @property
+    def synthetic_processor(self) -> SyntheticProcessor:
+        if self._synthetic_processor is None:
+            raise ValueError("The pipeline is not configured with a synthetic_path")
+        return self._synthetic_processor
+
     def run(self) -> Path:
         """
         Execute complete preprocessing pipeline with validation at each step.
+
+        Synthetic corpora are built one run at a time by ``write_workers``
+        processes (``synthetic_runs.write_synthetic_dataset``); other sources
+        are aligned and written in this process.
 
         Returns:
             Path to the generated Zarr dataset
@@ -116,102 +130,24 @@ class OfflinePreprocessingPipeline:
         print()
 
         try:
-            # Stage 1: Load and process raw data sources
-            processed_data = self._load_raw_sources()
-
-            self._log_sample_stats(
-                processed_data["cases"]["cases"],
-                label="raw cases",
-                sample=self._default_sample_indexer(processed_data["cases"]["cases"]),
+            dataset_path = Path(self.config.output_path) / (
+                self.config.dataset_name + ZARR_ZIP_SUFFIX
             )
-            self._log_sample_stats(
-                processed_data["mobility"]["mobility"],
-                label="raw mobility",
-                sample=self._default_sample_indexer(
-                    processed_data["mobility"]["mobility"]
-                ),
-                check_coords={"origin": REGION_COORD, "destination": REGION_COORD},
-                dataset=processed_data["mobility"]
-                if isinstance(processed_data["mobility"], xr.Dataset)
-                else None,
-            )
+            dataset_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.config.synthetic_path:
+                from .synthetic_runs import write_synthetic_dataset
 
-            alignment_result = self.processors["alignment"].align_datasets(
-                cases_data=processed_data["cases"],
-                mobility_data=processed_data["mobility"],
-                edar_data=processed_data["edar"],
-                population_data=processed_data["population"],
-                hospitalizations_data=processed_data.get("hospitalizations"),
-                deaths_data=processed_data.get("deaths"),
-                vaccination_data=processed_data.get("vaccination"),
-                latent_sird_data=processed_data.get("latent_sird"),
-            )
-
-            self._log_sample_stats(
-                alignment_result["mobility"],
-                label="aligned mobility",
-                sample=self._default_sample_indexer(alignment_result["mobility"]),
-                check_coords={"origin": REGION_COORD, "destination": REGION_COORD},
-                dataset=alignment_result,
-            )
-
-            for name in SYNTHETIC_PER_RUN_METADATA:
-                if name not in processed_data:
-                    continue
-                metadata = processed_data[name]
-                if "run_id" in metadata.dims and "run_id" in alignment_result.coords:
-                    metadata = metadata.reindex(
-                        run_id=alignment_result["run_id"].values
-                    )
-                alignment_result[name] = metadata
-                print(f"  ✓ Preserved {name} metadata")
-
-            if "synthetic_corpus_provenance" in processed_data:
-                alignment_result.attrs[SYNTHETIC_CORPUS_PROVENANCE_ATTR] = json.dumps(
-                    processed_data["synthetic_corpus_provenance"], sort_keys=True
+                write_synthetic_dataset(self, dataset_path)
+            else:
+                aligned = self._align(self._load_raw_sources())
+                dataset = self._prepare_dataset(aligned)
+                results = write_dataset(
+                    dataset,
+                    dataset_path,
+                    bitround_keepbits=self.config.bitround_keepbits,
                 )
-
-            # Only chunk run_id dimension for memory efficiency
-            # Other dimensions are kept unchunked to avoid performance warnings
-            alignment_result = alignment_result.chunk(
-                {"run_id": self.config.run_id_chunk_size}
-            )
-
-            # Compute valid_targets mask based on data density
-            valid_targets_mask = self._compute_valid_targets_mask(alignment_result)
-            alignment_result["valid_targets"] = valid_targets_mask
-
-            # Add wastewater source availability per region
-            edar_region_mask = self._compute_edar_region_mask(
-                self.config.region_metadata_file,
-                alignment_result[REGION_COORD].values,
-            )
-            alignment_result["edar_has_source"] = edar_region_mask
-
-            if "temporal_covariates" in processed_data:
-                temporal_covariates_da = processed_data["temporal_covariates"]
-                target_dates = alignment_result[TEMPORAL_COORD].values
-                if not np.array_equal(
-                    temporal_covariates_da[TEMPORAL_COORD].values,
-                    target_dates,
-                ):
-                    temporal_covariates_da = temporal_covariates_da.reindex(
-                        {TEMPORAL_COORD: target_dates}
-                    )
-                alignment_result["temporal_covariates"] = temporal_covariates_da
-                print("  ✓ Added temporal covariates from synthetic preprocessing")
-            elif "temporal_covariates" in self.processors:
-                temporal_covariates_da = self.processors["temporal_covariates"].process(
-                    start_date=alignment_result[TEMPORAL_COORD].values[0],
-                    end_date=alignment_result[TEMPORAL_COORD].values[-1],
-                )
-                alignment_result["temporal_covariates"] = temporal_covariates_da
-                print("  ✓ Added temporal covariates to dataset")
-
-            # # Store alignment report in pipeline state
-            # self.pipeline_state["alignment_report"] = alignment_report
-
-            dataset_path = self._save_aligned_dataset(alignment_result)
+                self._log_postwrite_summary(results)
+            print(f"  ✓ Aligned dataset saved to {dataset_path}")
 
             total_time = datetime.now() - self.pipeline_state["start_time"]
             print("=" * 60)
@@ -226,48 +162,125 @@ class OfflinePreprocessingPipeline:
             print(f"PIPELINE FAILED: {str(e)}")
             raise
 
+    def build_synthetic_runs(
+        self, corpus: xr.Dataset, run_ids: list[str] | np.ndarray
+    ) -> xr.Dataset:
+        """Return the lazy processed dataset of ``run_ids`` from an opened corpus.
+
+        Every step of the synthetic path works on each run separately, so this
+        gives the same values for a run whether it is built alone or with the
+        rest of the corpus.
+        """
+        processed = self.synthetic_processor.extract_runs(
+            corpus, run_ids, check_mobility=False
+        )
+        # Process EDAR using the same code path as real data.
+        print("Processing synthetic EDAR data through shared aggregation path...")
+        processed["edar"] = self.processors["edar"].process_from_xarray(
+            processed.pop("edar_flow"),
+            processed.pop("edar_censor"),
+            self.config.region_metadata_file,
+        )
+        # The alignment expects these keys to exist.
+        processed.setdefault("hospitalizations", None)
+        processed.setdefault("deaths", None)
+        processed["vaccination"] = (
+            self.processors["vaccination"].process(self.config.vaccination_file)
+            if "vaccination" in self.processors
+            else None
+        )
+        return self._prepare_dataset(self._align(processed))
+
+    def _align(self, processed_data: dict) -> xr.Dataset:
+        """Align the processed sources and add the derived masks."""
+        self._log_sample_stats(
+            processed_data["cases"]["cases"],
+            label="raw cases",
+            sample=self._default_sample_indexer(processed_data["cases"]["cases"]),
+        )
+        self._log_sample_stats(
+            processed_data["mobility"]["mobility"],
+            label="raw mobility",
+            sample=self._default_sample_indexer(processed_data["mobility"]["mobility"]),
+            check_coords={"origin": REGION_COORD, "destination": REGION_COORD},
+            dataset=processed_data["mobility"]
+            if isinstance(processed_data["mobility"], xr.Dataset)
+            else None,
+        )
+
+        alignment_result = self.processors["alignment"].align_datasets(
+            cases_data=processed_data["cases"],
+            mobility_data=processed_data["mobility"],
+            edar_data=processed_data["edar"],
+            population_data=processed_data["population"],
+            hospitalizations_data=processed_data.get("hospitalizations"),
+            deaths_data=processed_data.get("deaths"),
+            vaccination_data=processed_data.get("vaccination"),
+            latent_sird_data=processed_data.get("latent_sird"),
+        )
+
+        self._log_sample_stats(
+            alignment_result["mobility"],
+            label="aligned mobility",
+            sample=self._default_sample_indexer(alignment_result["mobility"]),
+            check_coords={"origin": REGION_COORD, "destination": REGION_COORD},
+            dataset=alignment_result,
+        )
+
+        for name in SYNTHETIC_PER_RUN_METADATA:
+            if name not in processed_data:
+                continue
+            metadata = processed_data[name]
+            if "run_id" in metadata.dims and "run_id" in alignment_result.coords:
+                metadata = metadata.reindex(run_id=alignment_result["run_id"].values)
+            alignment_result[name] = metadata
+            print(f"  ✓ Preserved {name} metadata")
+
+        # Only chunk run_id dimension for memory efficiency
+        # Other dimensions are kept unchunked to avoid performance warnings
+        alignment_result = alignment_result.chunk(
+            {"run_id": self.config.run_id_chunk_size}
+        )
+
+        # Compute valid_targets mask based on data density
+        alignment_result["valid_targets"] = self._compute_valid_targets_mask(
+            alignment_result
+        )
+
+        # Add wastewater source availability per region
+        alignment_result["edar_has_source"] = self._compute_edar_region_mask(
+            self.config.region_metadata_file,
+            alignment_result[REGION_COORD].values,
+        )
+
+        if "temporal_covariates" in processed_data:
+            temporal_covariates_da = processed_data["temporal_covariates"]
+            target_dates = alignment_result[TEMPORAL_COORD].values
+            if not np.array_equal(
+                temporal_covariates_da[TEMPORAL_COORD].values,
+                target_dates,
+            ):
+                temporal_covariates_da = temporal_covariates_da.reindex(
+                    {TEMPORAL_COORD: target_dates}
+                )
+            alignment_result["temporal_covariates"] = temporal_covariates_da
+            print("  ✓ Added temporal covariates from synthetic preprocessing")
+        elif "temporal_covariates" in self.processors:
+            temporal_covariates_da = self.processors["temporal_covariates"].process(
+                start_date=alignment_result[TEMPORAL_COORD].values[0],
+                end_date=alignment_result[TEMPORAL_COORD].values[-1],
+            )
+            alignment_result["temporal_covariates"] = temporal_covariates_da
+            print("  ✓ Added temporal covariates to dataset")
+
+        return alignment_result
+
     def _load_raw_sources(self) -> dict[str, xr.DataArray | xr.Dataset]:
-        """Load and process raw data sources. All data sources are required."""
+        """Load and process the real data sources. All sources are required."""
         self._update_stage("loading_raw_data")
         print("Stage 1: Loading and processing raw data sources")
         print("-" * 50)
 
-        # Check if using synthetic data
-        if self.config.synthetic_path:
-            print("Using synthetic data processor...")
-            synthetic_processor = SyntheticProcessor(self.config)
-            processed = synthetic_processor.process(self.config.synthetic_path)
-
-            # Process EDAR using the same code path as real data!
-            print("Processing synthetic EDAR data through shared aggregation path...")
-            edar_processor = self.processors["edar"]
-            processed["edar"] = edar_processor.process_from_xarray(
-                processed["edar_flow"],
-                processed["edar_censor"],
-                self.config.region_metadata_file,
-            )
-            # Remove temporary flow/censor keys
-            del processed["edar_flow"]
-            del processed["edar_censor"]
-
-            # Ensure hospitalizations and deaths are set to None if not present
-            # (the pipeline expects these keys to exist)
-            if "hospitalizations" not in processed:
-                processed["hospitalizations"] = None
-            if "deaths" not in processed:
-                processed["deaths"] = None
-            # Process vaccination data from real file if configured
-            if "vaccination" in self.processors:
-                print("Processing vaccination data...")
-                processed["vaccination"] = self.processors["vaccination"].process(
-                    self.config.vaccination_file
-                )
-            else:
-                processed["vaccination"] = None
-
-            return processed
-
-        # Standard real data processing
         raw_data = {}
 
         # Process cases data (required)
@@ -379,7 +392,7 @@ class OfflinePreprocessingPipeline:
         return df.set_index(REGION_COORD)["population"].to_xarray()
 
     def _compute_valid_targets_mask(self, aligned_dataset: xr.Dataset) -> xr.DataArray:
-        """Compute boolean mask for regions that meet minimum density threshold.
+        """Compute the target-region mask from population or case density.
 
         Args:
             aligned_dataset: Aligned dataset with cases data (run_id, date, region_id)
@@ -390,15 +403,39 @@ class OfflinePreprocessingPipeline:
         print("Computing valid_targets mask...")
 
         cases_da = aligned_dataset.cases
+        min_population = self.config.valid_target_min_population
+        if min_population is not None:
+            population = aligned_dataset["population"]
+            valid_mask = (
+                (population.fillna(0) >= min_population)
+                .broadcast_like(cases_da.isel(date=0, drop=True))
+                .transpose("run_id", REGION_COORD)
+            )
+            print(
+                f"  regions with population >= {min_population:g}: "
+                f"{int(valid_mask.sum())}/{valid_mask.size}"
+            )
+            return xr.DataArray(
+                valid_mask.values.astype(np.int32),
+                dims=["run_id", REGION_COORD],
+                coords={
+                    "run_id": cases_da["run_id"].values,
+                    REGION_COORD: cases_da[REGION_COORD].values,
+                },
+            )
         density_threshold = self.config.min_density_threshold
 
-        # Compute observed data density per (run_id, region). The cases value
-        # channel can contain causal smoother predictions in missing periods, so
-        # cases_mask is the source of truth for observed clinical coverage.
+        # Compute data density per (run_id, region). The cases value channel
+        # holds causal fills on unobserved days, so cases_mask is the source of
+        # truth for observed clinical coverage.
         if "cases_mask" in aligned_dataset:
             coverage_source = aligned_dataset["cases_mask"] > 0
         else:
             coverage_source = cases_da.notnull()
+        if self.config.valid_target_density_basis == "positive":
+            # Registry zeros are observations, so coverage alone does not
+            # separate active regions: count the days with a positive count.
+            coverage_source = coverage_source & (cases_da > 0)
 
         valid_count = coverage_source.sum(dim="date")
         total_per_region = cases_da["date"].size
@@ -455,13 +492,9 @@ class OfflinePreprocessingPipeline:
         print(f"  Regions with EDAR source: {int(has_source.sum())}/{has_source.size}")
         return has_source
 
-    def _save_aligned_dataset(self, aligned_dataset: xr.Dataset) -> Path:
-        """Save aligned dataset to processed dir."""
-        print("Saving aligned dataset to processed dir...")
-        aligned_dataset_path = Path(self.config.output_path) / (
-            self.config.dataset_name + ZARR_ZIP_SUFFIX
-        )
-        aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    def _prepare_dataset(self, aligned_dataset: xr.Dataset) -> xr.Dataset:
+        """Apply the storage transforms, dtypes and attributes to be written."""
+        print("Preparing aligned dataset for storage...")
 
         # Rechunk to uniform chunks for Zarr compatibility
         # Chunk run_id, date, and spatial dims to avoid oversized chunks
@@ -639,15 +672,7 @@ class OfflinePreprocessingPipeline:
                 rechunked_dataset = rechunked_dataset.assign(upcast_vars)
                 print(f"  Upcast {len(upcast_vars)} float16 variables to float32")
 
-        results = write_dataset(
-            rechunked_dataset,
-            aligned_dataset_path,
-            workers=self.config.write_workers,
-            bitround_keepbits=self.config.bitround_keepbits,
-        )
-        self._log_postwrite_summary(results)
-        print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
-        return aligned_dataset_path
+        return rechunked_dataset
 
     @staticmethod
     def _validate_positive_clinical_preservation(
@@ -656,30 +681,35 @@ class OfflinePreprocessingPipeline:
         processed: xr.Dataset,
     ) -> dict[str, dict[str, int]]:
         """Require positive synthetic clinical observations to stay positive."""
-        evidence: dict[str, dict[str, int]] = {}
+        counts = {}
         for variable in ("cases", "hospitalizations", "deaths"):
             if variable not in raw_aligned or variable not in processed:
                 continue
             raw = raw_aligned[variable]
             positive = np.isfinite(raw) & (raw > 0)
-            positive_count = int(positive.sum().compute().item())
+            output = processed[variable]
+            counts[variable] = (
+                positive.sum(),
+                (positive & (~np.isfinite(output) | (output <= 0))).sum(),
+                (np.isfinite(output) & (output > 0)).sum(),
+            )
+        # One pass shares the raw reads of all clinical counts.
+        (computed,) = dask.compute(counts)
+        evidence: dict[str, dict[str, int]] = {}
+        for variable, (positive, invalid, processed_positive) in computed.items():
+            positive_count = int(positive.item())
             if positive_count == 0:
                 continue
-            output = processed[variable]
-            invalid = positive & (~np.isfinite(output) | (output <= 0))
-            invalid_count = int(invalid.sum().compute().item())
+            invalid_count = int(invalid.item())
             if invalid_count > 0:
                 raise ValueError(
                     f"{invalid_count} of {positive_count} positive raw synthetic "
                     f"'{variable}' observations did not remain positive after "
                     "preprocessing."
                 )
-            processed_positive_count = int(
-                (np.isfinite(output) & (output > 0)).sum().compute().item()
-            )
             evidence[variable] = {
                 "raw_positive_count": positive_count,
-                "processed_positive_count": processed_positive_count,
+                "processed_positive_count": int(processed_positive.item()),
                 "zeroed_raw_positive_count": invalid_count,
             }
             print(

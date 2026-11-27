@@ -9,12 +9,14 @@ SIF=""
 WORKERS=""
 CPUS_PER_TASK=""
 WORKER_GROUP=""
+MPS_CLIENTS_PER_GPU="1"
 
 # Print the worker-step interface.
 usage() {
   cat <<EOF
 Usage: $(basename "$0") --run-root PATH --source-root PATH --sif PATH \
-  --workers N --cpus-per-task 20 --worker-group NAME -- COMMAND [ARG...]
+  --workers N --cpus-per-task N --worker-group NAME \
+  [--mps-clients-per-gpu K] -- COMMAND [ARG...]
 EOF
 }
 
@@ -46,6 +48,10 @@ parse_arguments() {
         WORKER_GROUP="$2"
         shift 2
         ;;
+      --mps-clients-per-gpu)
+        MPS_CLIENTS_PER_GPU="$2"
+        shift 2
+        ;;
       --)
         shift
         SCIENTIFIC_COMMAND=("$@")
@@ -72,8 +78,24 @@ validate_arguments() {
     return 2
   fi
 
-  if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || [ "$CPUS_PER_TASK" != "20" ]; then
-    echo "MN5 parallel workflows require positive workers with 20 CPUs each" >&2
+  if ! [[ "$MPS_CLIENTS_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MPS clients per GPU must be a positive integer: $MPS_CLIENTS_PER_GPU" >&2
+    return 2
+  fi
+  if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MN5 parallel workflows require a positive worker count" >&2
+    return 2
+  fi
+  if [ "$MPS_CLIENTS_PER_GPU" -eq 1 ]; then
+    if [ "$CPUS_PER_TASK" != "20" ]; then
+      echo "MN5 parallel workflows require positive workers with 20 CPUs each" >&2
+      return 2
+    fi
+  elif [ $((WORKERS % MPS_CLIENTS_PER_GPU)) -ne 0 ] \
+    || [ $((WORKERS / MPS_CLIENTS_PER_GPU)) -gt 4 ] \
+    || ! [[ "$CPUS_PER_TASK" =~ ^[1-9][0-9]*$ ]] \
+    || [ $((WORKERS * CPUS_PER_TASK)) -ne $((20 * WORKERS / MPS_CLIENTS_PER_GPU)) ]; then
+    echo "MPS packing needs workers = GPUs * K (at most 4 GPUs) and 20 CPUs per GPU" >&2
     return 2
   fi
 
@@ -90,8 +112,14 @@ validate_allocation() {
     return 1
   fi
 
-  if ! [[ "${SLURM_NTASKS:-}" =~ ^[1-4]$ ]]; then
-    echo "Expected SLURM_NTASKS in [1,4], got ${SLURM_NTASKS:-unset}" >&2
+  if [ "$MPS_CLIENTS_PER_GPU" -eq 1 ]; then
+    if ! [[ "${SLURM_NTASKS:-}" =~ ^[1-4]$ ]]; then
+      echo "Expected SLURM_NTASKS in [1,4], got ${SLURM_NTASKS:-unset}" >&2
+      return 1
+    fi
+  elif [ "${SLURM_NTASKS:-}" != "$WORKERS" ]; then
+    # Every MPS client must run at once, so one wave holds all workers.
+    echo "MPS packing expects SLURM_NTASKS=$WORKERS, got ${SLURM_NTASKS:-unset}" >&2
     return 1
   fi
 
@@ -195,12 +223,24 @@ main() {
       wave_workers="$remaining"
     fi
 
+    local -a gpu_arguments=(--gpus-per-task=1)
+    local -a mps_arguments=()
+    if [ "$MPS_CLIENTS_PER_GPU" -gt 1 ]; then
+      # Every task sees all GPUs of the step; each rank selects its own GPU by
+      # UUID and shares it with K - 1 other ranks through its MPS daemon.
+      gpu_arguments=(
+        "--gres=gpu:$((WORKERS / MPS_CLIENTS_PER_GPU))"
+        --gpu-bind=none
+      )
+      mps_arguments=(--mps-clients-per-gpu "$MPS_CLIENTS_PER_GPU")
+    fi
+
     srun \
       --nodes=1 \
       --ntasks="$wave_workers" \
       --ntasks-per-node="$wave_workers" \
       --cpus-per-task="$CPUS_PER_TASK" \
-      --gpus-per-task=1 \
+      "${gpu_arguments[@]}" \
       --exact \
       --kill-on-bad-exit=1 \
       --open-mode=append \
@@ -213,6 +253,7 @@ main() {
       --cpus "$CPUS_PER_TASK" \
       --worker-group "$WORKER_GROUP" \
       --worker-offset "$worker_offset" \
+      ${mps_arguments[@]+"${mps_arguments[@]}"} \
       -- "${SCIENTIFIC_COMMAND[@]}"
 
     worker_offset=$((worker_offset + wave_workers))

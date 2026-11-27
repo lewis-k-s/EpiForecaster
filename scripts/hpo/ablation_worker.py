@@ -6,7 +6,6 @@ exactly-once queue coordination; it neither samples nor defines conditions.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import logging
@@ -16,7 +15,8 @@ import re
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -30,7 +30,17 @@ from optuna.distributions import CategoricalDistribution
 from optuna.trial import create_trial
 
 from models.configs import EpiForecasterConfig
+from scripts.hpo.campaign_init import (
+    INIT_CHECKPOINT_PATH_KEY,
+    condition_init_checkpoint,
+    init_checkpoint_identity_value,
+    parse_init_checkpoints,
+    pinned_init_checkpoint_relative,
+    validate_init_checkpoint_references,
+)
+from scripts.hpo.file_lock import file_lock
 from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
+from scripts.workflow.run_support import _verify_pinned_checkpoint
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 
@@ -51,6 +61,7 @@ STALE_RECOVERED_ATTR = "ablation_stale_recovered_trials"
 # failures. They stop consuming nothing only up to this bound per identity, so
 # a trial that always kills its worker still ends in a retry-budget error.
 STALE_RECOVERY_BUDGET = 3
+INIT_CHECKPOINT_SHA256_ATTR = "campaign_init_checkpoint_sha256"
 
 
 @dataclass(frozen=True)
@@ -59,6 +70,15 @@ class CampaignCondition:
     hypothesis: str
     overrides: dict[str, Any]
     allowed_difference_paths: tuple[str, ...]
+    init_checkpoint: str | None = None
+
+
+@dataclass(frozen=True)
+class PinnedInitCheckpoint:
+    """An init checkpoint pinned into the run, verified against its recorded hash."""
+
+    path: Path
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -96,6 +116,10 @@ class AblationCampaign:
     completeness_requirements: dict[str, Any]
     provenance_requirements: dict[str, Any]
     allowed_reuse_code_identities: tuple[str, ...] = ()
+    init_checkpoints: Mapping[str, Path] = dataclass_field(default_factory=dict)
+    pinned_init_checkpoints: Mapping[str, PinnedInitCheckpoint] = dataclass_field(
+        default_factory=dict
+    )
 
     @property
     def has_folds(self) -> bool:
@@ -265,6 +289,29 @@ def _resolved_value(config: Mapping[str, Any], path: str) -> Any:
     return value
 
 
+def _reject_direct_init_checkpoint_path(
+    overrides: Mapping[str, Any], *, field: str
+) -> None:
+    if INIT_CHECKPOINT_PATH_KEY in _flatten(overrides):
+        raise ValueError(
+            f"{field} must not set {INIT_CHECKPOINT_PATH_KEY}; declare the "
+            "checkpoint in init_checkpoints and reference it with the "
+            "condition's init_checkpoint so it is pinned and hashed"
+        )
+
+
+def _condition_overrides(
+    fixed_overrides: Mapping[str, Any],
+    condition: CampaignCondition,
+    init_path: str | None,
+) -> dict[str, Any]:
+    """Merge fixed and condition overrides plus the declared init checkpoint path."""
+    merged = _deep_merge(dict(fixed_overrides), condition.overrides)
+    if init_path is None:
+        return merged
+    return _deep_merge(merged, {"training": {"init_checkpoint_path": init_path}})
+
+
 def _validate_conditions(
     *,
     base_config: Path,
@@ -272,6 +319,7 @@ def _validate_conditions(
     conditions: tuple[CampaignCondition, ...],
     baseline_condition: str,
     equal_budget_policy: EqualBudgetPolicy,
+    init_checkpoints: Mapping[str, Path],
 ) -> None:
     by_name = {condition.name: condition for condition in conditions}
     if baseline_condition not in by_name:
@@ -282,11 +330,28 @@ def _validate_conditions(
     resolved_by_name = {
         condition.name: _hydrate_effective_config(
             base_config=base_config,
-            overrides=_deep_merge(fixed_overrides, condition.overrides),
+            overrides=_condition_overrides(
+                fixed_overrides,
+                condition,
+                None
+                if condition.init_checkpoint is None
+                else str(init_checkpoints[condition.init_checkpoint]),
+            ),
             label=f"condition {condition.name!r}",
         )
         for condition in conditions
     }
+    for condition in conditions:
+        if (
+            condition.init_checkpoint is None
+            and resolved_by_name[condition.name]["training"]["init_checkpoint_path"]
+            is not None
+        ):
+            raise ValueError(
+                f"condition {condition.name!r} resolves "
+                f"{INIT_CHECKPOINT_PATH_KEY} from the base config; initialization "
+                "checkpoints must be declared through init_checkpoints"
+            )
     baseline = resolved_by_name[baseline_condition]
     baseline_flat = _flatten(baseline)
     semantic_identities: dict[str, str] = {}
@@ -323,6 +388,21 @@ def _validate_conditions(
                     f"condition {condition_name!r} changes equal budget path "
                     f"{path}: {baseline_value!r} -> {value!r}"
                 )
+
+
+def _declaration_identity(
+    root: Mapping[str, Any], init_checkpoints: Mapping[str, Path]
+) -> dict[str, Any]:
+    """Return the declaration a campaign hash covers.
+
+    Checkpoint paths are locations, not scientific identity: the hash keeps the
+    declared names (conditions reference them) and leaves content identity to
+    the pinned SHA-256 each run binds, so moving a checkpoint does not change it.
+    """
+    identity = {key: value for key, value in root.items() if key != "init_checkpoints"}
+    if init_checkpoints:
+        identity["init_checkpoint_names"] = sorted(init_checkpoints)
+    return identity
 
 
 def load_campaign(path: Path) -> AblationCampaign:
@@ -372,6 +452,9 @@ def load_campaign(path: Path) -> AblationCampaign:
     smoke_overrides = _promote_model_params(
         _mapping(root.get("smoke_overrides", {}), field="smoke_overrides")
     )
+    _reject_direct_init_checkpoint_path(fixed_overrides, field="fixed_overrides")
+    _reject_direct_init_checkpoint_path(smoke_overrides, field="smoke_overrides")
+    init_checkpoints = parse_init_checkpoints(root.get("init_checkpoints"))
     raw_conditions = root["conditions"]
     if not isinstance(raw_conditions, list) or not raw_conditions:
         raise ValueError("conditions must be a non-empty list")
@@ -386,21 +469,33 @@ def load_campaign(path: Path) -> AblationCampaign:
         if name in names:
             raise ValueError(f"duplicate condition name: {name}")
         names.add(name)
+        condition_overrides = _promote_model_params(
+            _mapping(item["overrides"], field=f"conditions[{index}].overrides")
+        )
+        _reject_direct_init_checkpoint_path(
+            condition_overrides, field=f"condition {name!r} overrides"
+        )
         conditions.append(
             CampaignCondition(
                 name=name,
                 hypothesis=_string(
                     item["hypothesis"], field=f"conditions[{index}].hypothesis"
                 ),
-                overrides=_promote_model_params(
-                    _mapping(item["overrides"], field=f"conditions[{index}].overrides")
-                ),
+                overrides=condition_overrides,
                 allowed_difference_paths=_string_list(
                     item["allowed_difference_paths"],
                     field=f"conditions[{index}].allowed_difference_paths",
                 ),
+                init_checkpoint=condition_init_checkpoint(
+                    item.get("init_checkpoint"),
+                    field=f"conditions[{index}].init_checkpoint",
+                ),
             )
         )
+    validate_init_checkpoint_references(
+        init_checkpoints,
+        {condition.name: condition.init_checkpoint for condition in conditions},
+    )
     seeds_raw = root["paired_model_seeds"]
     if (
         not isinstance(seeds_raw, list)
@@ -571,7 +666,11 @@ def load_campaign(path: Path) -> AblationCampaign:
         raise ValueError("equal_budget_policy.paths must contain valid dot paths")
     campaign = AblationCampaign(
         path=path,
-        sha256=hashlib.sha256(_canonical_json(root).encode("utf-8")).hexdigest(),
+        sha256=hashlib.sha256(
+            _canonical_json(_declaration_identity(root, init_checkpoints)).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
         campaign_id=campaign_id,
         stage=stage,
         hypothesis=_string(root["hypothesis"], field="hypothesis"),
@@ -604,6 +703,7 @@ def load_campaign(path: Path) -> AblationCampaign:
             root["provenance_requirements"], field="provenance_requirements"
         ),
         allowed_reuse_code_identities=allowed_reuse_code_identities,
+        init_checkpoints=init_checkpoints,
     )
     _validate_conditions(
         base_config=base_config,
@@ -611,8 +711,70 @@ def load_campaign(path: Path) -> AblationCampaign:
         conditions=campaign.conditions,
         baseline_condition=campaign.baseline_condition,
         equal_budget_policy=campaign.equal_budget_policy,
+        init_checkpoints=init_checkpoints,
     )
     return campaign
+
+
+def load_pinned_init_checkpoints(
+    manifest_path: Path, campaign: AblationCampaign
+) -> dict[str, PinnedInitCheckpoint]:
+    """Resolve and verify the run-pinned copies of the campaign's init checkpoints.
+
+    The manifest written at prepare records each checkpoint's SHA-256. Every
+    pinned file is re-hashed here, so a tampered or substituted file is rejected
+    before it can initialize a model. Paths are anchored at the manifest's run
+    root, which is the in-container run root for workers.
+    """
+    if not campaign.init_checkpoints:
+        return {}
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    recorded = _mapping(
+        _mapping(
+            manifest.get("campaign_init_inputs"), field="manifest.campaign_init_inputs"
+        ).get(campaign.campaign_id),
+        field=f"manifest.campaign_init_inputs.{campaign.campaign_id}",
+    )
+    if set(recorded) != set(campaign.init_checkpoints):
+        raise ValueError(
+            "run manifest pins init checkpoints "
+            f"{sorted(recorded)} but the campaign declares "
+            f"{sorted(campaign.init_checkpoints)}"
+        )
+    pins: dict[str, PinnedInitCheckpoint] = {}
+    for name, declared in campaign.init_checkpoints.items():
+        record = _mapping(recorded[name], field=f"manifest pinned checkpoint {name}")
+        label = f"campaign {campaign.campaign_id} init checkpoint {name}"
+        if record.get("configured_checkpoint") != str(declared):
+            raise ValueError(f"Pinned {label} does not match the campaign declaration")
+        sha256 = _string(record.get("checkpoint_sha256"), field=f"{label} sha256")
+        if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+            raise ValueError(f"Pinned {label} has an invalid recorded SHA-256")
+        relative = pinned_init_checkpoint_relative(campaign.campaign_id, name)
+        if record.get("pinned_checkpoint_relative") != str(relative):
+            raise ValueError(f"Pinned {label} is not at {relative}")
+        path = manifest_path.parent / relative
+        _verify_pinned_checkpoint(path, sha256, label=label)
+        pins[name] = PinnedInitCheckpoint(path=path, sha256=sha256)
+    return pins
+
+
+def bind_pinned_init_checkpoints(
+    campaign: AblationCampaign, manifest_path: Path
+) -> AblationCampaign:
+    """Return the campaign bound to its verified run-pinned init checkpoints."""
+    return replace(
+        campaign,
+        pinned_init_checkpoints=load_pinned_init_checkpoints(manifest_path, campaign),
+    )
+
+
+def _require_pinned_init_checkpoints(campaign: AblationCampaign) -> None:
+    if set(campaign.pinned_init_checkpoints) != set(campaign.init_checkpoints):
+        raise ValueError(
+            "campaign init_checkpoints are not bound to run-pinned copies; "
+            "call bind_pinned_init_checkpoints with the run manifest"
+        )
 
 
 def _as_cli_overrides(
@@ -683,17 +845,6 @@ def expected_trial_identities(
     }
 
 
-@contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 def _mark_running_attempt_failed(study: optuna.Study, trial_number: int) -> None:
     """Terminalize a stale attempt through Optuna's supported public API."""
     study.tell(trial_number, state=optuna.trial.TrialState.FAIL)
@@ -759,10 +910,20 @@ def _without_evaluation_controls(config: dict[str, Any]) -> dict[str, Any]:
 def hydrated_training_config(
     campaign: AblationCampaign, *, condition: str, fold: int, seed: int
 ) -> dict[str, Any]:
-    """Resolve the canonical training config of one identity (receipt contract)."""
-    merged = _deep_merge(
-        campaign.fixed_overrides, campaign.conditions_by_name[condition].overrides
-    )
+    """Resolve the canonical training config of one identity (receipt contract).
+
+    A fine-tuning condition's ``training.init_checkpoint_path`` is the pinned
+    checkpoint's SHA-256, never its location, so the identity follows the
+    checkpoint content and is independent of any path string.
+    """
+    condition_spec = campaign.conditions_by_name[condition]
+    init_path: str | None = None
+    if condition_spec.init_checkpoint is not None:
+        _require_pinned_init_checkpoints(campaign)
+        init_path = init_checkpoint_identity_value(
+            campaign.pinned_init_checkpoints[condition_spec.init_checkpoint].sha256
+        )
+    merged = _condition_overrides(campaign.fixed_overrides, condition_spec, init_path)
     overrides = _as_cli_overrides(merged)
     overrides.extend(
         [
@@ -856,6 +1017,14 @@ def reuse_rejection_reasons(
         hydrated
     ):
         reasons.append("hydrated_training_config_mismatch")
+    init_name = campaign.conditions_by_name[condition].init_checkpoint
+    expected_init_sha256 = (
+        None
+        if init_name is None
+        else campaign.pinned_init_checkpoints[init_name].sha256
+    )
+    if record.get("init_checkpoint_sha256") != expected_init_sha256:
+        reasons.append("init_checkpoint_sha256_mismatch")
     for field, config_key in (
         ("dataset_dvc_md5", "dataset_path"),
         ("region2vec_dvc_md5", "region2vec_path"),
@@ -1020,11 +1189,22 @@ def initialize_study_queue(
     """Fill uncompleted identities, optionally replacing stale running attempts."""
     expected_params = build_trial_queue(campaign, smoketest=smoketest)
     expected = expected_trial_identities(campaign, smoketest=smoketest)
-    with _file_lock(lock_path):
+    with file_lock(lock_path):
         recorded_hash = study.user_attrs.get("campaign_sha256")
         if recorded_hash is not None and recorded_hash != campaign.sha256:
             raise ValueError(
                 "Study campaign_sha256 does not match the requested campaign declaration"
+            )
+        init_hashes = {
+            name: pin.sha256
+            for name, pin in sorted(campaign.pinned_init_checkpoints.items())
+        }
+        _require_pinned_init_checkpoints(campaign)
+        recorded_init_hashes = study.user_attrs.get(INIT_CHECKPOINT_SHA256_ATTR)
+        if recorded_init_hashes is not None and recorded_init_hashes != init_hashes:
+            raise ValueError(
+                "Study init checkpoint SHA-256 identities do not match the run's "
+                "pinned campaign init checkpoints"
             )
         if recover_stale_running:
             if active_allocation_id is None:
@@ -1075,6 +1255,8 @@ def initialize_study_queue(
             study.set_user_attr(QUEUE_INITIALIZED_ATTR, True)
         study.set_user_attr("campaign_sha256", campaign.sha256)
         study.set_user_attr("campaign_id", campaign.campaign_id)
+        if init_hashes:
+            study.set_user_attr(INIT_CHECKPOINT_SHA256_ATTR, init_hashes)
 
 
 def is_study_complete(
@@ -1266,9 +1448,9 @@ def run_queued_trials(
             closeout_requested is not None and closeout_requested.is_set()
         ) or (timeout_s is not None and time.monotonic() - started >= timeout_s)
         if stop_claiming:
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 return _has_waiting_trials(study, expected)
-        with _file_lock(lock_path):
+        with file_lock(lock_path):
             waiting = [
                 trial
                 for trial in study.trials
@@ -1299,23 +1481,23 @@ def run_queued_trials(
                 smoketest=smoketest,
             )
         except optuna.TrialPruned:
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 study.tell(trial, state=optuna.trial.TrialState.PRUNED)
                 _reenqueue_failed_identity(
                     study, identity, attempts_budget=FAILED_ATTEMPT_BUDGET
                 )
         except Exception:
             logger.exception("Campaign trial %d failed", trial.number)
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
                 _reenqueue_failed_identity(
                     study, identity, attempts_budget=FAILED_ATTEMPT_BUDGET
                 )
         else:
-            with _file_lock(lock_path):
+            with file_lock(lock_path):
                 study.tell(trial, value)
         completed += 1
-    with _file_lock(lock_path):
+    with file_lock(lock_path):
         return _has_waiting_trials(study, expected)
 
 
@@ -1359,6 +1541,23 @@ def objective(
     overrides = _as_cli_overrides(campaign.fixed_overrides) + _as_cli_overrides(
         condition.overrides
     )
+    init_pin: PinnedInitCheckpoint | None = None
+    if condition.init_checkpoint is not None:
+        _require_pinned_init_checkpoints(campaign)
+        init_pin = campaign.pinned_init_checkpoints[condition.init_checkpoint]
+        _verify_pinned_checkpoint(
+            init_pin.path,
+            init_pin.sha256,
+            label=(
+                f"campaign {campaign.campaign_id} init checkpoint "
+                f"{condition.init_checkpoint}"
+            ),
+        )
+        trial.set_user_attr("campaign_init_checkpoint", condition.init_checkpoint)
+        trial.set_user_attr("campaign_init_checkpoint_sha256", init_pin.sha256)
+        overrides += _as_cli_overrides(
+            {"training": {"init_checkpoint_path": str(init_pin.path)}}
+        )
     overrides += [
         f"training.seed={seed}",
         "training.plot_forecasts=false",
@@ -1415,6 +1614,14 @@ def objective(
                     "condition": condition_name,
                     "seed": seed,
                     "fold": fold,
+                    **(
+                        {
+                            "init_checkpoint": condition.init_checkpoint,
+                            "init_checkpoint_sha256": init_pin.sha256,
+                        }
+                        if init_pin is not None
+                        else {}
+                    ),
                 },
                 sort_keys=True,
             )
@@ -1494,6 +1701,12 @@ def main(
         raise click.UsageError("--recover-stale-running requires SLURM_JOB_ID")
     setup_logging()
     declaration = load_campaign(campaign)
+    manifest_path = (
+        run_manifest
+        if run_manifest is not None
+        else run_root.parent.parent / "manifest.yaml"
+    )
+    declaration = bind_pinned_init_checkpoints(declaration, manifest_path)
     run_root.mkdir(parents=True, exist_ok=True)
     if journal_file is None:
         journal_file = Path("outputs/ablation_studies") / f"{study_name}.journal"
@@ -1514,11 +1727,6 @@ def main(
     execution: ExecutionIdentity | None = None
     acceptance_path: Path | None = None
     if reuse_receipt is not None:
-        manifest_path = (
-            run_manifest
-            if run_manifest is not None
-            else run_root.parent.parent / "manifest.yaml"
-        )
         execution = load_execution_identity(manifest_path)
         acceptance_path = run_root / "reuse_acceptance.json"
     initialize_study_queue(

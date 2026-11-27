@@ -21,6 +21,7 @@ if sys_path not in __import__("sys").path:
     __import__("sys").path.append(sys_path)
 
 from utils.plotting import Palette, Style  # noqa: E402
+from data.preprocess.zarr_layout import open_zarr_store  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load dataset
-    dataset = xr.open_zarr(args.dataset_path)
+    dataset = open_zarr_store(args.dataset_path)
     logger.info("Loaded dataset: %s", args.dataset_path)
 
     # Get population

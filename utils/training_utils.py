@@ -7,16 +7,45 @@ from collections import OrderedDict
 
 import torch
 from data.epi_batch import EpiBatch
+from data.epi_dataset import EpiDataset
 from utils.precision_policy import MODEL_PARAM_DTYPE
 
 STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
 
 # Each dataset caches its full-run adjacency and context tables on the device
-# (~1 GB per 945-region, 455-day run). Curriculum training interleaves chunks
-# from every run, so unbounded caches grow with the run count. Keep at most this
-# many datasets resident; an evicted dataset rebuilds its cache on next use.
+# (~1 GB per 945-region, 455-day run). Keep at most this many datasets
+# resident; an evicted dataset rebuilds its cache on next use. Curriculum
+# training raises the limit to the run block size
+# (``EpidemicCurriculumSampler.resident_dataset_limit``); the block pipeline
+# (``data.block_pipeline``) additionally drops a block's host and device state
+# when the block ends, so a block's runs stay resident and nothing is rebuilt
+# within a block.
 MAX_DEVICE_CACHED_DATASETS = 4
+_device_cache_limit = MAX_DEVICE_CACHED_DATASETS
 _device_cached_datasets: OrderedDict[int, weakref.ReferenceType] = OrderedDict()
+
+
+def set_device_cache_limit(limit: int) -> None:
+    """Set how many datasets may keep device caches at once."""
+    global _device_cache_limit
+    if limit < 1:
+        raise ValueError(f"device cache limit must be >= 1, got {limit}")
+    _device_cache_limit = limit
+
+
+def _has_device_caches(dataset: object) -> bool:
+    return bool(
+        getattr(dataset, "_gpu_mobility_cache", None)
+        or getattr(dataset, "_context_device_cache", None)
+    )
+
+
+def _evict_device_caches(evicted: object) -> None:
+    """Clear a dataset's device caches."""
+    for name in ("_gpu_mobility_cache", "_context_device_cache"):
+        cache = getattr(evicted, name, None)
+        if cache:
+            cache.clear()
 
 
 def _retain_device_caches(base_ds: object) -> None:
@@ -25,16 +54,31 @@ def _retain_device_caches(base_ds: object) -> None:
     existing = _device_cached_datasets.pop(key, None)
     if existing is not None and existing() is not base_ds:
         existing = None
+    # Datasets whose caches were dropped (released blocks) must not count
+    # against the limit and push out live ones.
+    for other_key, ref in list(_device_cached_datasets.items()):
+        other = ref()
+        if other is None or not _has_device_caches(other):
+            del _device_cached_datasets[other_key]
     _device_cached_datasets[key] = existing or weakref.ref(base_ds)
-    while len(_device_cached_datasets) > MAX_DEVICE_CACHED_DATASETS:
+    while len(_device_cached_datasets) > _device_cache_limit:
         _, ref = _device_cached_datasets.popitem(last=False)
         evicted = ref()
-        if evicted is None:
-            continue
-        for name in ("_gpu_mobility_cache", "_context_device_cache"):
-            cache = getattr(evicted, name, None)
-            if cache:
-                cache.clear()
+        if evicted is not None:
+            _evict_device_caches(evicted)
+
+
+def _activate_dataset(base_ds: object | None) -> None:
+    """Make ``base_ds`` the most recent resident run with its heavy state built.
+
+    A lazy run belongs to a block pipeline; reaching a run of a new block
+    releases the previous block and waits for this block's build.
+    """
+    if base_ds is None:
+        return
+    if isinstance(base_ds, EpiDataset) and base_ds.block_pipeline is not None:
+        base_ds.block_pipeline.activate(base_ds)
+    _retain_device_caches(base_ds)
 
 
 def drop_nowcast(prediction: torch.Tensor, horizon: int | None = None) -> torch.Tensor:
@@ -149,6 +193,34 @@ def _resolve_base_dataset(
     return base_ds
 
 
+def inject_context_placement(
+    batch_data: EpiBatch,
+    dataset: torch.utils.data.Dataset,
+) -> None:
+    """Attach the run's graph placement to ``batch_data.mob_batch``.
+
+    Workers only know global node ids. The local target position inside the
+    k-hop context node set and the context nodes' region indices depend on the
+    run's mobility, so they come from its heavy state here in the main process:
+    ``mob_batch.target_node`` is [B*L] (each sample's target position repeated
+    over its L history steps) and ``mob_batch.mob_real_node_idx`` is [N_ctx].
+    """
+    mob_batch = batch_data.mob_batch
+    if mob_batch is None or not hasattr(mob_batch, "global_t"):
+        return
+
+    base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
+    if not isinstance(base_ds, EpiDataset):
+        raise TypeError(
+            f"Cannot place a batch on {type(base_ds).__name__}; EpiDataset required."
+        )
+    # Builds the run's heavy state first: placement reads it.
+    _activate_dataset(base_ds)
+    local_targets = base_ds.local_target_positions(batch_data.target_node)
+    mob_batch.target_node = local_targets.repeat_interleave(batch_data.t)
+    mob_batch.mob_real_node_idx = base_ds.mob_real_node_idx
+
+
 def inject_gpu_mobility(
     batch_data: EpiBatch,
     dataset: torch.utils.data.Dataset,
@@ -170,6 +242,8 @@ def inject_gpu_mobility(
         return
 
     base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
+    # Builds the run's heavy state first: the checks below read it.
+    _activate_dataset(base_ds)
 
     config = getattr(base_ds, "config", None)
     adjacency_source = (
@@ -190,7 +264,6 @@ def inject_gpu_mobility(
     else:
         source_adjacency = base_ds.preloaded_mobility
 
-    _retain_device_caches(base_ds)
     # Cache GPU mobility directly on the dataset object keyed by device
     if not hasattr(base_ds, "_gpu_mobility_cache"):
         base_ds._gpu_mobility_cache = {}
@@ -206,12 +279,13 @@ def inject_gpu_mobility(
             sliced_mob = source_adjacency[node_ids.unsqueeze(-1), node_ids].to(
                 MODEL_PARAM_DTYPE
             )
-            total_t = base_ds.preloaded_mobility.shape[0]
+            total_t = len(base_ds._temporal_coords)
             sliced_mob = sliced_mob.unsqueeze(0).expand(total_t, -1, -1)
         elif source_adjacency is None:
             # Released dataset: weights are already masked and restricted to
-            # graph nodes in the same [TotalT, N_ctx, N_ctx] source-major layout.
-            sliced_mob = base_ds.graph_mobility_weights.to(MODEL_PARAM_DTYPE)
+            # graph nodes in the same [TotalT, N_ctx, N_ctx] source-major
+            # layout. They are widened after the transfer, on the device.
+            sliced_mob = base_ds.graph_mobility_weights
         else:
             # Slice original CPU tensor to context nodes: resulting size [TotalT, N_ctx, N_ctx]
             # Using unsqueeze is faster and creates an intermediate of correct shape directly
@@ -228,7 +302,7 @@ def inject_gpu_mobility(
             sliced_mob = sliced_mob.transpose(-1, -2)
 
         # Transfer to GPU
-        gpu_mob = sliced_mob.to(device, non_blocking=True)
+        gpu_mob = sliced_mob.to(device, non_blocking=True).to(MODEL_PARAM_DTYPE)
 
         # Enforce self-loops (diagonal >= 1.0) on the GPU
         eye = torch.eye(
@@ -281,13 +355,14 @@ def inject_context_features(
         return
 
     base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
+    # Builds the run's heavy state first: the checks below read it.
+    _activate_dataset(base_ds)
     if base_ds is None or (
         getattr(base_ds, "context_feature_ww", None) is None
         and getattr(base_ds, "context_feature_clinical", None) is None
     ):
         return
 
-    _retain_device_caches(base_ds)
     assembly_device = device if device.type == "cuda" else torch.device("cpu")
     mob_batch.x_dense = assemble_context_features(
         base_ds,

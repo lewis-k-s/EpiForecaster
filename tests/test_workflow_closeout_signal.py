@@ -208,6 +208,7 @@ def _coordinator_run(
     attempt_root.mkdir(parents=True)
     (run_root / "source").mkdir()
     (run_root / "config.yaml").write_text("{}\n")
+    (run_root / ".state/dispatch.tsv").write_text("run_id\trun\n")
     if marker_text is not None:
         (run_root / ".state/continuation.required").write_text(marker_text)
     sif = tmp_path / "runtime.sif"

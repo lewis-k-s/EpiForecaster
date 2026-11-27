@@ -8,7 +8,6 @@ This module provides a streamlined command-line interface with only two main com
 This replaces the complex variant-specific CLI with configuration-driven training.
 """
 
-import json
 import logging
 import math
 import traceback
@@ -24,6 +23,7 @@ from data.preprocess.region_graph_preprocessor import (
     RegionGraphPreprocessConfig,
     RegionGraphPreprocessor,
 )
+from evaluation.aggregate_export import write_evaluation_summary
 from training.epiforecaster_trainer import (
     EpiForecasterConfig,
     EpiForecasterTrainer,
@@ -112,7 +112,7 @@ def preprocess_cli(debug: bool):
 @click.option(
     "--mobility-zarr",
     type=click.Path(path_type=Path),
-    default=Path("data/files/mobility.zarr"),
+    default=Path("data/files/mobility.zarr.zip"),
     show_default=True,
     help="Path to mobility Zarr dataset for OD flows",
 )
@@ -686,25 +686,12 @@ def eval_epiforecaster(
         summary = _format_eval_summary(loss, metrics)
         click.echo(f"\nEval summary ({split}):\n{summary}")
         if summary_json is not None:
-            summary_json.parent.mkdir(parents=True, exist_ok=True)
-            summary_json.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "checkpoint": str(checkpoint.resolve()),
-                        "split": split,
-                        "eval_loss": _json_metric_value(float(loss)),
-                        "metrics": {
-                            str(name): _json_metric_value(value)
-                            for name, value in sorted(metrics.items())
-                        },
-                    },
-                    indent=2,
-                    sort_keys=True,
-                    allow_nan=False,
-                )
-                + "\n",
-                encoding="utf-8",
+            write_evaluation_summary(
+                summary_json,
+                checkpoint=checkpoint,
+                split=split,
+                eval_loss=loss,
+                metrics=metrics,
             )
 
         baseline_results_csv = compare_baselines
@@ -1324,26 +1311,6 @@ def _format_eval_summary(loss: float, metrics: dict) -> str:
     for name, value in rows:
         lines.append(f"{name:<6}  {value}")
     return "\n".join(lines)
-
-
-def _json_metric_value(value: object) -> object:
-    """Convert scalar or structured evaluation metrics to JSON-native values."""
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, dict):
-        return {str(key): _json_metric_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_metric_value(item) for item in value]
-
-    tolist = getattr(value, "tolist", None)
-    if callable(tolist):
-        return _json_metric_value(tolist())
-    item = getattr(value, "item", None)
-    if callable(item):
-        return _json_metric_value(item())
-    raise TypeError(f"Unsupported evaluation metric value: {type(value).__name__}")
 
 
 @train_cli.command("regions")

@@ -36,9 +36,11 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
+from scripts.hpo.campaign_init import pinned_init_checkpoint_relative
 from scripts.workflow.run_config import (
     preprocessing_dataset_name,
     validate_workflow_contract,
+    workflow_campaign_init_checkpoints,
 )
 from training.training_dynamics import (
     DYNAMICS_ARTIFACT_NAME,
@@ -49,6 +51,8 @@ from training.training_dynamics import (
 # Packed sharded Zarr store (data.preprocess.zarr_layout.ZARR_ZIP_SUFFIX).
 # Kept local so host-side commands do not import the scientific stack.
 PROCESSED_DATASET_SUFFIX = ".zarr.zip"
+TRAINING_RESUME_CHECKPOINT = Path("inputs/training_resume_checkpoint.pt")
+TRAINING_RESUME_BEST_CHECKPOINT = Path("inputs/training_resume_best_checkpoint.pt")
 
 
 def sha256_file(path: Path) -> str:
@@ -357,6 +361,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         }
 
     training_input = None
+    training_resume_input = None
     if workflow_kind == "train":
         configured_init_checkpoint = config["training"].get("init_checkpoint")
         if configured_init_checkpoint is not None:
@@ -367,6 +372,27 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             )
             identity["init_checkpoint_sha256"] = training_input["checkpoint_sha256"]
 
+        configured_resume = config["training"].get("resume_checkpoint")
+        if configured_resume is not None:
+            training_resume_input = {
+                "resume": pin_checkpoint(
+                    Path(str(configured_resume)),
+                    run_root / TRAINING_RESUME_CHECKPOINT,
+                    label="Training resume",
+                ),
+                "best": pin_checkpoint(
+                    Path(str(config["training"]["resume_best_checkpoint"])),
+                    run_root / TRAINING_RESUME_BEST_CHECKPOINT,
+                    label="Training resume best",
+                ),
+            }
+            identity["resume_checkpoint_sha256"] = training_resume_input["resume"][
+                "checkpoint_sha256"
+            ]
+            identity["resume_best_checkpoint_sha256"] = training_resume_input["best"][
+                "checkpoint_sha256"
+            ]
+
     evaluation_input = None
     if workflow_kind == "evaluate":
         evaluation_input = pin_checkpoint(
@@ -375,6 +401,26 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             label="Evaluation",
         )
         identity["input_checkpoint_sha256"] = evaluation_input["checkpoint_sha256"]
+
+    campaign_init_inputs: dict[str, dict[str, dict[str, str]]] = {}
+    for campaign_id, declared in workflow_campaign_init_checkpoints(
+        config, source_root
+    ).items():
+        campaign_init_inputs[campaign_id] = {
+            name: pin_checkpoint(
+                path,
+                run_root / pinned_init_checkpoint_relative(campaign_id, name),
+                label=f"Campaign {campaign_id} init checkpoint {name}",
+            )
+            for name, path in declared.items()
+        }
+    if campaign_init_inputs:
+        identity["campaign_init_checkpoint_sha256"] = {
+            campaign_id: {
+                name: pinned["checkpoint_sha256"] for name, pinned in inputs.items()
+            }
+            for campaign_id, inputs in campaign_init_inputs.items()
+        }
 
     manifest = {
         "schema_version": 1,
@@ -430,6 +476,10 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         manifest["evaluation_input"] = evaluation_input
     if training_input is not None:
         manifest["training_input"] = training_input
+    if training_resume_input is not None:
+        manifest["training_resume_input"] = training_resume_input
+    if campaign_init_inputs:
+        manifest["campaign_init_inputs"] = campaign_init_inputs
     manifest_path = run_root / "manifest.yaml"
     write_yaml(manifest_path, manifest)
     prepared_path = run_root / ".state/prepared.done"
@@ -473,6 +523,43 @@ def training_artifact_paths(
     return model_root / "checkpoints/best_model.pt", model_root
 
 
+def _verify_pinned_checkpoint(path: Path, expected_sha256: str, *, label: str) -> None:
+    if not path.is_file() or path.is_symlink() or sha256_file(path) != expected_sha256:
+        raise ValueError(f"Pinned {label} checkpoint failed validation")
+
+
+def _validate_resume_pair(resume_path: Path, best_path: Path) -> None:
+    """Require the best checkpoint to be the selection state the resume carries."""
+    import torch
+
+    resume = torch.load(resume_path, map_location="cpu", weights_only=False)
+    best = torch.load(best_path, map_location="cpu", weights_only=False)
+    for label, checkpoint in (("resume", resume), ("best", best)):
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Training {label} checkpoint must be a checkpoint dict")
+    resume_epoch = resume["epoch"]
+    best_epoch = best["epoch"]
+    if best_epoch > resume_epoch:
+        raise ValueError(
+            f"Training resume best checkpoint epoch {best_epoch} is later than "
+            f"the resume checkpoint epoch {resume_epoch}"
+        )
+    if best["val_selection_score"] != resume["best_val_selection_score"]:
+        raise ValueError(
+            "Training resume best checkpoint val_selection_score "
+            f"{best['val_selection_score']!r} does not match the resume "
+            f"checkpoint best_val_selection_score "
+            f"{resume['best_val_selection_score']!r}"
+        )
+    if best["val_selection_metric"] != resume["best_val_selection_metric"]:
+        raise ValueError(
+            "Training resume best checkpoint val_selection_metric "
+            f"{best['val_selection_metric']!r} does not match the resume "
+            f"checkpoint best_val_selection_metric "
+            f"{resume['best_val_selection_metric']!r}"
+        )
+
+
 def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
     """Run one deterministic training entity and record its exact checkpoint."""
     config = load_yaml(config_path)
@@ -504,16 +591,32 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
     if training.get("init_checkpoint") is not None:
         pinned_init_checkpoint = run_root / "inputs/training_init_checkpoint.pt"
         manifest = load_yaml(run_root / "manifest.yaml")
-        expected_sha256 = str(manifest["training_input"]["checkpoint_sha256"])
-        if (
-            not pinned_init_checkpoint.is_file()
-            or pinned_init_checkpoint.is_symlink()
-            or sha256_file(pinned_init_checkpoint) != expected_sha256
-        ):
-            raise ValueError(
-                "Pinned training initialization checkpoint failed validation"
-            )
+        _verify_pinned_checkpoint(
+            pinned_init_checkpoint,
+            str(manifest["training_input"]["checkpoint_sha256"]),
+            label="training initialization",
+        )
         overrides.append(f"training.init_checkpoint_path={pinned_init_checkpoint}")
+    if training.get("resume_checkpoint") is not None:
+        pinned_resume = run_root / TRAINING_RESUME_CHECKPOINT
+        pinned_best = run_root / TRAINING_RESUME_BEST_CHECKPOINT
+        resume_input = load_yaml(run_root / "manifest.yaml")["training_resume_input"]
+        _verify_pinned_checkpoint(
+            pinned_resume,
+            str(resume_input["resume"]["checkpoint_sha256"]),
+            label="training resume",
+        )
+        _verify_pinned_checkpoint(
+            pinned_best,
+            str(resume_input["best"]["checkpoint_sha256"]),
+            label="training resume best",
+        )
+        _validate_resume_pair(pinned_resume, pinned_best)
+        # Every attempt restarts from the pinned resume state, so its best
+        # checkpoint restarts from the pinned best, replacing any stale one.
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(pinned_best, checkpoint)
+        overrides.append(f"training.resume_checkpoint_path={pinned_resume}")
     for override in overrides:
         command.extend(["--override", override])
 
@@ -892,6 +995,8 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         source_pointer = source_root / target
         workspace_pointer = workspace / target
         workspace_pointer.parent.mkdir(parents=True, exist_ok=True)
+        # A retried attempt finds the read-only pointer copied by the last one.
+        workspace_pointer.unlink(missing_ok=True)
         shutil.copy2(source_pointer, workspace_pointer)
         output = dvc_output(source_pointer)
         output_relative = target.parent / str(output["path"])
@@ -905,9 +1010,11 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
     cache = Path(str(config["dvc"]["cache"]))
     _run(["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)], cwd=workspace)
     _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=workspace)
-    # Keep DVC's SQLite/index state off the quota-constrained cluster home.
-    # A relative path is resolved inside this run's isolated DVC workspace.
-    _run(["dvc", "config", "core.site_cache_dir", ".dvc/tmp"], cwd=workspace)
+    # Keep DVC's SQLite/index state off the cluster home and off GPFS: one
+    # SQLite update per file on GPFS made checkout take about 1 s per file.
+    # TMPDIR is the execution's node-local scratch inside the container.
+    site_cache = tempfile.mkdtemp(prefix="dvc-site-cache-")
+    _run(["dvc", "config", "--local", "core.site_cache_dir", site_cache], cwd=workspace)
     _run(["dvc", "config", "cache.dir", str(cache)], cwd=workspace)
     _run(["dvc", "config", "cache.shared", "group"], cwd=workspace)
     _run(["dvc", "config", "cache.type", "symlink"], cwd=workspace)
@@ -1087,21 +1194,28 @@ def _processed_dataset_qa(
 
     flow_alignment: dict[str, Any] | None = None
     if {"latent_D_true", "latent_death_flow_true"} <= set(dataset.data_vars):
-        cumulative_difference = dataset["latent_D_true"].diff("date")
+        from data.preprocess.processors.synthetic_processor import (
+            LATENT_DEATH_FLOW_ALIGNMENT_ATOL,
+            LATENT_DEATH_FLOW_ALIGNMENT_RTOL,
+            death_flow_alignment_tolerance,
+        )
+
+        stock = dataset["latent_D_true"]
+        cumulative_difference = stock.diff("date")
         destination_flow = dataset["latent_death_flow_true"].sel(
             date=cumulative_difference["date"]
         )
         difference_values = np.asarray(cumulative_difference.values)
         flow_values = np.asarray(destination_flow.values)
+        allowed = death_flow_alignment_tolerance(
+            np.asarray(stock.isel(date=slice(None, -1)).values),
+            np.asarray(stock.isel(date=slice(1, None)).values),
+            difference_values,
+        )
         comparable = np.isfinite(difference_values) & np.isfinite(flow_values)
         absolute_error = np.abs(difference_values[comparable] - flow_values[comparable])
         max_absolute_error = float(absolute_error.max()) if absolute_error.size else 0.0
-        if not np.allclose(
-            difference_values[comparable],
-            flow_values[comparable],
-            rtol=1e-5,
-            atol=1e-8,
-        ):
+        if (absolute_error > allowed[comparable]).any():
             raise ValueError(
                 "Processed latent death flow is not destination-aligned with "
                 f"latent_D_true.diff(date); max error={max_absolute_error:.8g}"
@@ -1109,8 +1223,9 @@ def _processed_dataset_qa(
         flow_alignment = {
             "comparison_count": int(comparable.sum()),
             "max_absolute_error": max_absolute_error,
-            "rtol": 1e-5,
-            "atol": 1e-8,
+            "rtol": LATENT_DEATH_FLOW_ALIGNMENT_RTOL,
+            "atol": LATENT_DEATH_FLOW_ALIGNMENT_ATOL,
+            "float32_stock_quantization": "2 * eps * max(D_t, D_t+1)",
         }
 
     preservation_json = dataset.attrs.get("positive_clinical_preservation_json")
@@ -1242,25 +1357,27 @@ def _run_preprocessing_attempt(
         }
     finally:
         dataset.close()
-    dataset_sha256 = sha256_file(built_dataset)
     if local_root is None:
         attempt_dataset = built_dataset
     else:
         attempt_dataset = attempt / "dataset" / built_dataset.name
         attempt_dataset.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(built_dataset, attempt_dataset)
-        if attempt_dataset.stat().st_size != built_dataset.stat().st_size:
-            raise ValueError(
-                f"Copy of the node-local dataset is incomplete: {attempt_dataset}"
-            )
+    dataset_bytes = built_dataset.stat().st_size
+    if attempt_dataset.stat().st_size != dataset_bytes:
+        raise ValueError(
+            f"Copy of the node-local dataset is incomplete: {attempt_dataset}"
+        )
     attempt_qa = attempt / "qa.json"
     attempt_marker = attempt / ".preprocessed.done"
     write_json(attempt_qa, qa_record)
+    # The dataset is identified by size until publication: its DVC md5 is the
+    # only hash of the payload.
     write_json(
         attempt_marker,
         {
             "dataset": str(dataset_path),
-            "dataset_sha256": dataset_sha256,
+            "dataset_bytes": dataset_bytes,
             "qa": str(qa_path),
             "qa_sha256": sha256_file(attempt_qa),
         },
@@ -1275,6 +1392,7 @@ def _run_preprocessing_attempt(
             output_marker: attempt_marker,
         },
         run_root,
+        size_only={dataset_path},
     )
     return output_marker
 
@@ -1292,7 +1410,7 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     dataset.relative_to(output_root.resolve(strict=True))
     if dataset.is_symlink() or not dataset.is_file():
         raise ValueError("Preprocessed dataset must be a non-symlink packed Zarr file")
-    if sha256_file(dataset) != str(marker["dataset_sha256"]):
+    if dataset.stat().st_size != int(marker["dataset_bytes"]):
         raise ValueError("Preprocessed dataset changed after QA")
     qa_path = Path(str(marker["qa"])).resolve(strict=True)
     if sha256_file(qa_path) != str(marker["qa_sha256"]):
@@ -1324,10 +1442,10 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
             if error.errno != errno.EXDEV:
                 raise
             shutil.copy2(dataset, payload)
-            if sha256_file(payload) != str(marker["dataset_sha256"]):
+            if payload.stat().st_size != int(marker["dataset_bytes"]):
                 raise ValueError(
-                    "Publication staging changed the processed dataset"
-                ) from None
+                    "Publication staging copy of the dataset is incomplete"
+                )
         remote = Path(str(config["dvc"]["remote"]))
         cache = Path(str(config["dvc"]["cache"]))
         _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)
@@ -1364,7 +1482,7 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
             },
             "dvc_pointer": dataset_pointer,
             "dvc_md5": str(pointer_identity["md5"]),
-            "dataset_sha256": str(marker["dataset_sha256"]),
+            "dataset_bytes": int(marker["dataset_bytes"]),
             "qa": str(qa_path),
             "qa_sha256": str(marker["qa_sha256"]),
             "published_at": datetime.now(UTC).isoformat(),
@@ -1772,7 +1890,11 @@ def finalize_ablation(
     from optuna.storages import JournalStorage
     from optuna.storages.journal import JournalFileBackend
 
-    from scripts.hpo.ablation_worker import is_study_complete, load_campaign
+    from scripts.hpo.ablation_worker import (
+        bind_pinned_init_checkpoints,
+        is_study_complete,
+        load_campaign,
+    )
     from evaluation.ablation_probabilistic_analysis import campaign_analysis_spec
 
     config = load_yaml(config_path)
@@ -1796,7 +1918,9 @@ def finalize_ablation(
         study_name=str(ablation["study_name"]),
         storage=JournalStorage(JournalFileBackend(str(journal_path))),
     )
-    campaign = load_campaign(Path(str(ablation["campaign"])))
+    campaign = bind_pinned_init_checkpoints(
+        load_campaign(Path(str(ablation["campaign"]))), run_root / "manifest.yaml"
+    )
     if not is_study_complete(study, campaign, smoketest=smoketest):
         state_counts = Counter(trial.state.name for trial in study.trials)
         # The worker rule's completion marker is meaningless while the identity
@@ -1867,6 +1991,10 @@ def finalize_ablation(
             "study_name": study.study_name,
             "campaign_id": campaign_id,
             "campaign_sha256": campaign.sha256,
+            "init_checkpoint_sha256": {
+                name: pin.sha256
+                for name, pin in sorted(campaign.pinned_init_checkpoints.items())
+            },
             "journal": str(journal_path),
             "trial_count": len(study.trials),
             "artifacts": [

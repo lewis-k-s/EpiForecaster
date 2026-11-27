@@ -126,6 +126,8 @@ def fit_latent_scale_state(
 
     for dataset in datasets:
         state_dates_by_node, flow_dates_by_node = _supervised_dates_by_node(dataset)
+        # One string per date of the run, shared by every node's date list.
+        date_strings = [_date_string(value) for value in dataset._temporal_coords]
         target_nodes = sorted(int(node) for node in dataset.target_nodes)
         run_id = str(dataset.run_id)
         membership.append(
@@ -157,9 +159,7 @@ def fit_latent_scale_state(
                         "domain": domain,
                         "run_id": run_id,
                         "target_node": node,
-                        "dates": [
-                            _date_string(dataset._temporal_coords[i]) for i in dates
-                        ],
+                        "dates": [date_strings[i] for i in dates],
                     }
                 )
 
@@ -205,23 +205,28 @@ def validate_complete_latent_targets(dataset: _LatentScaleDataset | object) -> N
 
     The loss cannot branch on target values without breaking the compiled
     training graph, so the complete-target contract is checked once per split.
+    Each run is checked on whole ``[date, node]`` arrays against its supervised
+    date mask, not window by window.
     """
     for run in _flatten_datasets(dataset):
-        state_dates_by_node, flow_dates_by_node = _supervised_dates_by_node(run)
+        state_mask, flow_mask = _supervised_masks(run)
         invalid = []
-        for attribute, dates_by_node in (
-            ("precomputed_S_target", state_dates_by_node),
-            ("precomputed_I_target", state_dates_by_node),
-            ("precomputed_H_target", state_dates_by_node),
-            ("precomputed_R_target", state_dates_by_node),
-            ("precomputed_death_flow_target", flow_dates_by_node),
+        for attribute, mask in (
+            ("precomputed_S_target", state_mask),
+            ("precomputed_I_target", state_mask),
+            ("precomputed_H_target", state_mask),
+            ("precomputed_R_target", state_mask),
+            ("precomputed_death_flow_target", flow_mask),
         ):
             values = _required_target(run, attribute).detach().cpu().numpy()
-            for node, dates in dates_by_node.items():
-                window = values[np.asarray(dates, dtype=np.int64), node]
-                if not (np.isfinite(window).all() and (window >= 0).all()):
-                    invalid.append(attribute)
-                    break
+            node_count = mask.shape[1]
+            if values.shape[1] < node_count:
+                raise ValueError(
+                    f"Target node index {node_count - 1} is outside target dimensions."
+                )
+            supervised = values[:, :node_count][mask]
+            if not (np.isfinite(supervised).all() and (supervised >= 0).all()):
+                invalid.append(attribute)
         if invalid:
             raise ValueError(
                 "Complete latent supervision targets must be finite and "
@@ -303,35 +308,57 @@ def _unique_datasets(
     return [unique[key] for key in sorted(unique)]
 
 
-def _supervised_dates_by_node(
-    dataset: _LatentScaleDataset,
-) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+def _supervised_masks(dataset: _LatentScaleDataset) -> tuple[np.ndarray, np.ndarray]:
+    """Boolean ``[date, node]`` masks of the state- and flow-supervised dates.
+
+    A valid sample ``(node, window_start)`` of a target node supervises the
+    ``[H+1]`` state dates ``range_end - 1 .. range_end + H - 1`` and the ``[H]``
+    flow dates ``range_end .. range_end + H - 1`` (``range_end`` is the window
+    start plus the history length); overlapping windows mark a date once.
+    """
     model_config = dataset.config.model
     history_length = int(model_config.input_window_length)
     horizon = int(model_config.forecast_horizon)
     time_count = len(dataset._temporal_coords)
+    target_nodes = np.array(sorted({int(node) for node in dataset.target_nodes}))
+    samples = np.asarray(dataset._index_map, dtype=np.int64).reshape(-1, 2)
+    samples = samples[np.isin(samples[:, 0], target_nodes)]
+    nodes = samples[:, 0]
+    range_end = samples[:, 1] + history_length
+    if nodes.size and (
+        int(range_end.min()) - 1 < 0 or int(range_end.max()) + horizon > time_count
+    ):
+        raise ValueError(
+            f"Latent supervision window for run {dataset.run_id!r} exceeds "
+            "the temporal coordinate range."
+        )
+    node_count = (
+        int(max(target_nodes.max(initial=-1), nodes.max(initial=-1))) + 1
+        if target_nodes.size
+        else 0
+    )
+
+    def covered(first_date: np.ndarray) -> np.ndarray:
+        # Difference array over dates, one +1/-1 pair per window.
+        starts = np.zeros((time_count + 1, node_count), dtype=np.int32)
+        np.add.at(starts, (first_date, nodes), 1)
+        np.add.at(starts, (range_end + horizon, nodes), -1)
+        return np.cumsum(starts[:time_count], axis=0) > 0
+
+    return covered(range_end - 1), covered(range_end)
+
+
+def _supervised_dates_by_node(
+    dataset: _LatentScaleDataset,
+) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    state_mask, flow_mask = _supervised_masks(dataset)
+    # Iterate the unsorted target-node set exactly as the original per-sample
+    # accumulation did: the streaming statistics are order dependent in the
+    # last float bits, and the scale hashes include them.
     target_nodes = {int(node) for node in dataset.target_nodes}
-    state_dates = {node: set() for node in target_nodes}
-    flow_dates = {node: set() for node in target_nodes}
-
-    for node, window_start in dataset._index_map:
-        node = int(node)
-        if node not in target_nodes:
-            continue
-        range_end = int(window_start) + history_length
-        state_range = range(range_end - 1, range_end + horizon)
-        flow_range = range(range_end, range_end + horizon)
-        if state_range.start < 0 or state_range.stop > time_count:
-            raise ValueError(
-                f"Latent supervision window for run {dataset.run_id!r} exceeds "
-                "the temporal coordinate range."
-            )
-        state_dates[node].update(state_range)
-        flow_dates[node].update(flow_range)
-
     return (
-        {node: sorted(dates) for node, dates in state_dates.items()},
-        {node: sorted(dates) for node, dates in flow_dates.items()},
+        {node: np.flatnonzero(state_mask[:, node]).tolist() for node in target_nodes},
+        {node: np.flatnonzero(flow_mask[:, node]).tolist() for node in target_nodes},
     )
 
 

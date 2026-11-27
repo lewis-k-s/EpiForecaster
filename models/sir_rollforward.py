@@ -24,6 +24,16 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def generation_interval_weights(mean: float, sd: float, length: int) -> torch.Tensor:
+    """Gamma(mean, sd) density at lags 1..length days, normalized to sum to 1."""
+    shape = (mean / sd) ** 2
+    rate = mean / sd**2
+    lags = torch.arange(1, length + 1, dtype=torch.float64)
+    log_density = (shape - 1.0) * torch.log(lags) - rate * lags
+    weights = torch.exp(log_density - log_density.max())
+    return (weights / weights.sum()).float()
+
+
 class SIRRollForward(nn.Module):
     """
     Differentiable SIR roll-forward using discrete Euler integration.
@@ -34,10 +44,14 @@ class SIRRollForward(nn.Module):
     training regularization.
 
     Args:
-        gamma: Fixed recovery rate (default 0.2 = 5-day infectious period)
         dt: Time step size in days (default 1.0)
         enforce_nonnegativity: If True, clamps S, I, R to [0, N] after each step
         enforce_mass_conservation: If True, normalizes (S+I+R) to N after each step
+        generation_interval: Optional probabilities of generation-interval lags
+            1..G days. When given, the S -> I flux is the renewal equation
+            R_t * S_t / N * sum_s g_s * incidence_{t-s} with
+            R_t = beta_t / (gamma_t + alpha_t + mu_t) instead of mass action
+            beta_t * S_t * I_t / N. Compartment bookkeeping is unchanged.
     """
 
     def __init__(
@@ -47,6 +61,7 @@ class SIRRollForward(nn.Module):
         enforce_mass_conservation: bool = True,
         residual_clip: float = 1e4,
         strict: bool = True,
+        generation_interval: torch.Tensor | None = None,
     ):
         super().__init__()
         self.dt = dt
@@ -54,6 +69,15 @@ class SIRRollForward(nn.Module):
         self.enforce_mass_conservation = enforce_mass_conservation
         self.residual_clip = residual_clip
         self.strict = strict
+        # Stored oldest lag first to match the incidence history order. Not
+        # persistent: it is configuration, and checkpoints keep one layout.
+        self.register_buffer(
+            "generation_interval_oldest_first",
+            None
+            if generation_interval is None
+            else generation_interval.detach().float().flip(0),
+            persistent=False,
+        )
 
         logger.info(
             f"Initialized SIRRollForward: dt={dt}, "
@@ -99,6 +123,8 @@ class SIRRollForward(nn.Module):
                 - R_trajectory: [batch_size, horizon+1] (includes R0)
                 - D_trajectory: [batch_size, horizon+1] (accumulated deaths, starts at 0)
                 - hospitalization_flow: [batch_size, horizon] (new hospitalizations per step)
+                - infection_flow: [batch_size, horizon] (S -> I flow beta*S*I/N of each
+                  Euler step, taken before the non-negativity clamp and mass rescale)
                 - death_flow: [batch_size, horizon] (new deaths per step)
                 - hospital_death_flow: [batch_size, horizon] (H -> D deaths per step)
                 - direct_death_flow: [batch_size, horizon] (I -> D deaths per step)
@@ -171,10 +197,21 @@ class SIRRollForward(nn.Module):
         D_list = [D0]
 
         hospitalization_flow_list = []
+        infection_flow_list = []
         death_flow_list = []
         hospital_death_flow_list = []
         direct_death_flow_list = []
         physics_residual_list = []
+        # Renewal force of infection: incidence of the previous G days, oldest
+        # first. Days before the roll-forward are seeded with the stationary
+        # incidence that sustains I0, (gamma_0 + alpha_0 + mu_0) * I0.
+        generation_interval = self.generation_interval_oldest_first
+        incidence_history: list[torch.Tensor] = []
+        if generation_interval is not None:
+            seed_incidence = (
+                gamma_t[:, 0] + hospitalization_rate_t[:, 0] + mortality_t[:, 0]
+            ) * I0
+            incidence_history = [seed_incidence] * generation_interval.numel()
 
         # Roll forward
         for t in range(horizon):
@@ -194,13 +231,27 @@ class SIRRollForward(nn.Module):
             mu_h = hospital_mortality_t[:, t]
 
             # SIRHD derivatives
-            # dS/dt = -beta * S * I / N
-            # dI/dt = beta * S * I / N - gamma * I - alpha * I - mu * I
+            # dS/dt = -infection_flow
+            # dI/dt = infection_flow - gamma * I - alpha * I - mu * I
             # dH/dt = alpha * I - rho * H - mu_h * H
             # dR/dt = gamma * I + rho * H
             # dD/dt = mu * I + mu_h * H
 
-            beta_SI_over_N = beta * S_t * I_t / population
+            if generation_interval is None:
+                infection_flow = beta * S_t * I_t / population
+            else:
+                recent_incidence = torch.stack(
+                    incidence_history[-generation_interval.numel() :], dim=1
+                )
+                infection_pressure = (
+                    recent_incidence * generation_interval.to(recent_incidence.dtype)
+                ).sum(dim=1)
+                reproduction_number = beta / (gamma + alpha + mu)
+                infection_flow = torch.minimum(
+                    reproduction_number * S_t / population * infection_pressure,
+                    S_t,
+                )
+                incidence_history.append(infection_flow)
             recovery_flow = gamma * I_t
             hospitalization_flow = alpha * I_t
             hospital_recovery_flow = rho * H_t
@@ -208,9 +259,9 @@ class SIRRollForward(nn.Module):
             hospital_death_flow = mu_h * H_t
             death_flow = direct_death_flow + hospital_death_flow
 
-            dS_dt = -beta_SI_over_N
+            dS_dt = -infection_flow
             dI_dt = (
-                beta_SI_over_N
+                infection_flow
                 - recovery_flow
                 - hospitalization_flow
                 - direct_death_flow
@@ -259,13 +310,14 @@ class SIRRollForward(nn.Module):
 
             # Store flow for observation heads
             hospitalization_flow_list.append(hospitalization_flow)
+            infection_flow_list.append(infection_flow)
             death_flow_list.append(death_flow)
             hospital_death_flow_list.append(hospital_death_flow)
             direct_death_flow_list.append(direct_death_flow)
 
             # Compute physics residual on constrained step (clip at source for stability)
             dI_expected = (
-                beta_SI_over_N
+                infection_flow
                 - recovery_flow
                 - hospitalization_flow
                 - direct_death_flow
@@ -287,6 +339,7 @@ class SIRRollForward(nn.Module):
         hospitalization_flow_traj = torch.stack(
             hospitalization_flow_list, dim=1
         )  # [B, H]
+        infection_flow_traj = torch.stack(infection_flow_list, dim=1)  # [B, H]
         death_flow_traj = torch.stack(death_flow_list, dim=1)  # [B, H]
         hospital_death_flow_traj = torch.stack(
             hospital_death_flow_list, dim=1
@@ -301,6 +354,7 @@ class SIRRollForward(nn.Module):
             "R_trajectory": R_traj,
             "D_trajectory": D_traj,
             "hospitalization_flow": hospitalization_flow_traj,
+            "infection_flow": infection_flow_traj,
             "death_flow": death_flow_traj,
             "hospital_death_flow": hospital_death_flow_traj,
             "direct_death_flow": direct_death_flow_traj,

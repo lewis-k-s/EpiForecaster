@@ -27,6 +27,7 @@ import pandas as pd
 import xarray as xr
 
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 
 logger = logging.getLogger("mobility_ego_lockdown_analysis")
@@ -84,7 +85,7 @@ class EgoAnalysisConfig:
 
 def open_canonical_dataset(config: EpiForecasterConfig) -> xr.Dataset:
     """Open the configured canonical Zarr and select the configured run_id."""
-    ds = xr.open_zarr(config.data.dataset_path, chunks={"run_id": 1}, zarr_format=2)
+    ds = open_zarr_store(config.data.dataset_path, chunks={"run_id": 1})
     run_id = config.data.run_id
     if not run_id:
         raise ValueError("config.data.run_id must be set")

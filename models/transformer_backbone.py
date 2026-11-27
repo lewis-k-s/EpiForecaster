@@ -40,6 +40,32 @@ def _inverse_softplus(value: float, eps: float = 1e-8) -> float:
     return math.log(math.expm1(clamped))
 
 
+# Rate output key -> (forecast projection attribute, prior rate).
+_RATE_HEADS: dict[str, tuple[str, float]] = {
+    "beta_t": ("beta_projection", 0.25),
+    "gamma_t": ("gamma_projection", 0.14),
+    "mortality_t": ("mortality_projection", 0.0005),
+    "hospitalization_rate_t": ("hospitalization_projection", 0.02),
+    "hospital_recovery_t": ("hospital_recovery_projection", 0.1),
+    "hospital_mortality_t": ("hospital_mortality_projection", 0.005),
+}
+
+
+def _rate_bounds(cfg: SIRPhysicsConfig) -> dict[str, tuple[float, float]]:
+    """Clamp range of each rate output."""
+    return {
+        "beta_t": (cfg.beta_min, cfg.beta_max),
+        "gamma_t": (cfg.gamma_min, cfg.gamma_max),
+        "mortality_t": (cfg.mortality_min, cfg.mortality_max),
+        "hospitalization_rate_t": (cfg.hospitalization_min, cfg.hospitalization_max),
+        "hospital_recovery_t": (cfg.hospital_recovery_min, cfg.hospital_recovery_max),
+        "hospital_mortality_t": (
+            cfg.hospital_mortality_min,
+            cfg.hospital_mortality_max,
+        ),
+    }
+
+
 class PositionalEncoding(nn.Module):
     """
     Positional encoding for Transformer time series processing.
@@ -376,6 +402,24 @@ class TransformerBackbone(nn.Module):
             nn.Linear(d_model // 2, obs_context_dim),
         )
 
+        # Rates that vary per step; the rest are constant over a window.
+        self.time_varying_rate_keys = (
+            tuple(_RATE_HEADS)
+            if self.sir_physics.time_varying_rates == "all"
+            else ("beta_t",)
+        )
+        # Per-day rates of the history part of the roll-forward [B, L, n_rates].
+        self.history_steps = self.sir_physics.rollforward_history_steps
+        self.history_rate_projection = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, len(self.time_varying_rate_keys)),
+            )
+            if self.history_steps > 0
+            else None
+        )
+
         self._initialize_conservative_weights()
 
         # Log initialization
@@ -402,43 +446,38 @@ class TransformerBackbone(nn.Module):
         for layer in projection_stems:
             self._init_linear_xavier(layer)
 
-        cfg = self.sir_physics
-        self._init_rate_head(
-            self.beta_projection[2],
-            prior=0.25,
-            min_value=cfg.beta_min,
-            max_value=cfg.beta_max,
-        )
-        self._init_rate_head(
-            self.gamma_projection[2],
-            prior=0.14,
-            min_value=cfg.gamma_min,
-            max_value=cfg.gamma_max,
-        )
-        self._init_rate_head(
-            self.mortality_projection[2],
-            prior=0.0005,
-            min_value=cfg.mortality_min,
-            max_value=cfg.mortality_max,
-        )
-        self._init_rate_head(
-            self.hospitalization_projection[2],
-            prior=0.02,
-            min_value=cfg.hospitalization_min,
-            max_value=cfg.hospitalization_max,
-        )
-        self._init_rate_head(
-            self.hospital_recovery_projection[2],
-            prior=0.1,
-            min_value=cfg.hospital_recovery_min,
-            max_value=cfg.hospital_recovery_max,
-        )
-        self._init_rate_head(
-            self.hospital_mortality_projection[2],
-            prior=0.005,
-            min_value=cfg.hospital_mortality_min,
-            max_value=cfg.hospital_mortality_max,
-        )
+        bounds = _rate_bounds(self.sir_physics)
+        for key, (projection_name, prior) in _RATE_HEADS.items():
+            min_value, max_value = bounds[key]
+            self._init_rate_head(
+                getattr(self, projection_name)[2],
+                prior=prior,
+                min_value=min_value,
+                max_value=max_value,
+            )
+        if self.history_rate_projection is not None:
+            priors = {
+                key: min(max(prior, bounds[key][0]), bounds[key][1])
+                for key, (_projection_name, prior) in _RATE_HEADS.items()
+            }
+            # History starts stationary (R_t = 1), so the prior I0 reaches the
+            # origin unchanged instead of growing for the whole history at the
+            # forecast prior.
+            priors["beta_t"] = min(
+                max(
+                    priors["gamma_t"]
+                    + priors["hospitalization_rate_t"]
+                    + priors["mortality_t"],
+                    bounds["beta_t"][0],
+                ),
+                bounds["beta_t"][1],
+            )
+            self._init_linear_xavier(self.history_rate_projection[0])
+            self._init_linear_small_xavier_with_bias(
+                self.history_rate_projection[2],
+                [_inverse_softplus(priors[key]) for key in self.time_varying_rate_keys],
+                gain=self.rate_head_final_gain,
+            )
 
         # Encourage plausible initial composition at startup: S >> I > H ~= R.
         # Use default dtype (float32) for initial prior
@@ -546,38 +585,42 @@ class TransformerBackbone(nn.Module):
         # Sequence-to-vector: use final time step for parameter prediction
         final_hidden = encoded[:, -1, :]  # [batch_size, d_model]
 
-        # Output projections with bounded softplus for numerical stability
-        cfg = self.sir_physics
-        beta_t = torch.clamp(
-            F.softplus(self.beta_projection(final_hidden)),
-            min=cfg.beta_min,
-            max=cfg.beta_max,
-        )
-        mortality_t = torch.clamp(
-            F.softplus(self.mortality_projection(final_hidden)),
-            min=cfg.mortality_min,
-            max=cfg.mortality_max,
-        )
-        hospitalization_rate_t = torch.clamp(
-            F.softplus(self.hospitalization_projection(final_hidden)),
-            min=cfg.hospitalization_min,
-            max=cfg.hospitalization_max,
-        )
-        hospital_recovery_t = torch.clamp(
-            F.softplus(self.hospital_recovery_projection(final_hidden)),
-            min=cfg.hospital_recovery_min,
-            max=cfg.hospital_recovery_max,
-        )
-        hospital_mortality_t = torch.clamp(
-            F.softplus(self.hospital_mortality_projection(final_hidden)),
-            min=cfg.hospital_mortality_min,
-            max=cfg.hospital_mortality_max,
-        )
-        gamma_t = torch.clamp(
-            F.softplus(self.gamma_projection(final_hidden)),
-            min=cfg.gamma_min,
-            max=cfg.gamma_max,
-        )
+        # Output projections with bounded softplus for numerical stability.
+        # Forecast-step rates come from the final hidden state.
+        bounds = _rate_bounds(self.sir_physics)
+        rates: dict[str, torch.Tensor] = {}
+        for key, (projection_name, _prior) in _RATE_HEADS.items():
+            min_value, max_value = bounds[key]
+            rate = torch.clamp(
+                F.softplus(getattr(self, projection_name)(final_hidden)),
+                min=min_value,
+                max=max_value,
+            )
+            if key not in self.time_varying_rate_keys:
+                rate = rate.mean(dim=1, keepdim=True).expand(
+                    -1, self.history_steps + self.horizon
+                )
+            rates[key] = rate
+
+        if self.history_rate_projection is not None:
+            if seq_len <= self.history_steps:
+                raise ValueError(
+                    f"rollforward_history_steps={self.history_steps} needs a "
+                    f"longer input window than {seq_len}"
+                )
+            # The rate of history step k (day k -> k+1) reads the encoding of
+            # day k; the last history day is the forecast origin.
+            history_raw = self.history_rate_projection(
+                encoded[:, -1 - self.history_steps : -1, :]
+            )  # [batch_size, history_steps, n_time_varying]
+            for index, key in enumerate(self.time_varying_rate_keys):
+                min_value, max_value = bounds[key]
+                history_rate = torch.clamp(
+                    F.softplus(history_raw[..., index]),
+                    min=min_value,
+                    max=max_value,
+                )
+                rates[key] = torch.cat([history_rate, rates[key]], dim=1)
 
         initial_states_logits = self.initial_states_projection(
             final_hidden
@@ -598,12 +641,7 @@ class TransformerBackbone(nn.Module):
             obs_context = F.pad(obs_context, (0, 0, pad_len, 0), mode="replicate")
 
         return {
-            "beta_t": beta_t,
-            "mortality_t": mortality_t,
-            "hospitalization_rate_t": hospitalization_rate_t,
-            "hospital_recovery_t": hospital_recovery_t,
-            "hospital_mortality_t": hospital_mortality_t,
-            "gamma_t": gamma_t,
+            **rates,
             "initial_states_logits": initial_states_logits,
             "obs_context": obs_context,
         }

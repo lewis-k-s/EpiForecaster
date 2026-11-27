@@ -219,7 +219,7 @@ def test_build_neighborhood_context_report_labels_aggregation_methods(
             "forecast_horizon": 28,
         }
         config["data"] = {
-            "dataset_path": "data/processed/real_with_id.zarr",
+            "dataset_path": "data/processed/real_with_id.zarr.zip",
             "mobility_min_flow_raw": 0.0,
             "mobility_weight_clip_max": 8.0,
             "mobility_lags": [],

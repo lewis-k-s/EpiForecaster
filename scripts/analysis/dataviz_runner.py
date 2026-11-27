@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from data.preprocess.zarr_layout import open_zarr_store
 
 
 def get_dataset_path(preprocess_config: Path, train_config: Path) -> str | None:
@@ -67,9 +68,8 @@ def check_dataset_variables(dataset_path: str | None) -> dict[str, bool]:
         return available
 
     try:
-        import xarray as xr
 
-        ds = xr.open_zarr(dataset_path)
+        ds = open_zarr_store(dataset_path)
         data_vars = list(ds.data_vars)
 
         available["hospitalizations"] = "hospitalizations" in data_vars
@@ -89,7 +89,7 @@ def get_preprocess_paths(preprocess_config: Path) -> tuple[str, str, str]:
     defaults = (
         "data/files/hospitalizations_municipality.csv",
         "data/files/deaths_municipality.csv",
-        "data/files/mobility.zarr",
+        "data/files/mobility.zarr.zip",
     )
     if not preprocess_config.exists():
         return defaults
@@ -107,9 +107,9 @@ def get_preprocess_paths(preprocess_config: Path) -> tuple[str, str, str]:
 
 
 def has_edge_weight_source_data(
-    data_path: Path = Path("data/files/mobility.zarr"),
+    data_path: Path = Path("data/files/mobility.zarr.zip"),
 ) -> bool:
-    """Return True if mobility.zarr exists for edge-weight analysis."""
+    """Return True if mobility.zarr.zip exists for edge-weight analysis."""
     return data_path.exists()
 
 
@@ -118,9 +118,8 @@ def dataset_has_run_id_dimension(dataset_path: str | None) -> bool:
     if not dataset_path:
         return False
     try:
-        import xarray as xr
 
-        ds = xr.open_zarr(dataset_path)
+        ds = open_zarr_store(dataset_path)
         has_run_id = "run_id" in ds.dims or "run_id" in ds.coords
         ds.close()
         return has_run_id

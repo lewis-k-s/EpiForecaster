@@ -1,0 +1,5 @@
+outs:
+- md5: 5b465d72394fba15addce1dd3c493754
+  size: 204212147324
+  hash: md5
+  path: synthetic_sirhd_v1_5a2262d_reactive_n400_holt_damped.zarr.zip

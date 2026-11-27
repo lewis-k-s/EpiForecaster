@@ -16,6 +16,7 @@ from utils.logging import suppress_zarr_warnings
 suppress_zarr_warnings()
 
 from ..config import TEMPORAL_COORD, PreprocessingConfig  # noqa: E402
+from ..zarr_layout import is_zarr_zip, open_zarr_store  # noqa: E402
 
 
 class MobilityProcessor:
@@ -51,8 +52,8 @@ class MobilityProcessor:
                 chunks={"run_id": self.config.run_id_chunk_size},
             )
         else:
-            ds = xr.open_zarr(  # type: ignore[arg-type]
-                str(path),
+            ds = open_zarr_store(
+                path,
                 chunks={"run_id": self.config.run_id_chunk_size},
             )
 
@@ -92,7 +93,14 @@ class MobilityProcessor:
 
             print(f"Reconstructed mobility tensor: {ds['mobility'].shape}")
 
-        ds = ds.rename({"target": "destination"})
+        # Real municipality stores name the second region dimension `destination`;
+        # the legacy packed store and synthetic corpora name it `target`.
+        if "target" in ds.dims:
+            ds = ds.rename({"target": "destination"})
+
+        # `source_version` labels each date's upstream source; it is provenance,
+        # not an OD signal, so it must not enter alignment or the dataset.
+        ds = ds.drop_vars("source_version", errors="ignore")
 
         # For real (non-synthetic) data, add run_id dimension to match synthetic format
         if "run_id" not in ds.dims:
@@ -147,8 +155,10 @@ class MobilityProcessor:
 
         mobility_dir = Path(mobility_path)  # type: ignore[assignment]
 
-        if not mobility_dir.is_dir():
-            raise ValueError(f"Mobility path must be a Zarr directory: {mobility_dir}")
+        if not (mobility_dir.is_dir() or is_zarr_zip(mobility_dir)):
+            raise ValueError(
+                f"Mobility path must be a Zarr directory or .zarr.zip: {mobility_dir}"
+            )
 
         mobility_data = self._open_dataset(str(mobility_dir))
 

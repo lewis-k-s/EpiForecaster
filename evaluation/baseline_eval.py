@@ -14,6 +14,7 @@ import torch
 from scipy.special import ndtr
 
 from data.epi_dataset import EpiDataset
+from evaluation.distribution_scores import TARGET_LOWER_BOUND
 from evaluation.baseline_models import (
     BaselinePredictionResult,
     predict_with_exponential_smoothing_fallback,
@@ -1039,14 +1040,14 @@ def _probabilistic_row_metrics(
     for level, level_name in _PROB_INTERVAL_LEVEL_NAMES.items():
         z = _NORMAL_INTERVAL.inv_cdf((1.0 + float(level)) / 2.0)
         half_width = z * scale_value
-        low = prediction - half_width
-        high = prediction + half_width
+        low = max(prediction - half_width, TARGET_LOWER_BOUND)
+        high = max(prediction + half_width, TARGET_LOWER_BOUND)
         covered = float(low <= target <= high)
         row[f"interval_low_{level_name}"] = float(low)
         row[f"interval_high_{level_name}"] = float(high)
         row[f"covered_{level_name}"] = covered
         row[f"coverage_{level_name}"] = covered
-        row[f"interval_width_{level_name}"] = float(2.0 * half_width)
+        row[f"interval_width_{level_name}"] = float(high - low)
     return row
 
 

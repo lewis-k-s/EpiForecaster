@@ -19,6 +19,7 @@ from scipy import stats
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+from data.preprocess.zarr_layout import open_zarr_store
 from constants import (
     LOCKDOWNS,
     RESTRICTION_LEVELS,
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 class EdgeWeightAnalyzer:
     """Analyzes edge weight distributions in OD mobility networks."""
 
-    def __init__(self, mobility_path: str = "data/files/mobility.zarr"):
+    def __init__(self, mobility_path: str = "data/files/mobility.zarr.zip"):
         self.mobility_path = Path(mobility_path)
         self.results = {}
         self.lockdown_periods = LOCKDOWNS
@@ -41,7 +42,7 @@ class EdgeWeightAnalyzer:
         """Load mobility data from zarr file."""
         logger.info(f"Loading mobility data from {self.mobility_path}...")
 
-        ds = xr.open_zarr(self.mobility_path)
+        ds = open_zarr_store(self.mobility_path)
         # Use the entire dataset as a single entry keyed by date range
         dates = ds["date"].values
         date_key = f"{dates[0]}_{dates[-1]}"

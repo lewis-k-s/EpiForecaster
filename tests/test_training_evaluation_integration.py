@@ -6,6 +6,7 @@ import json
 import math
 
 import pytest
+import torch
 
 from models.configs import OutputConfig, TrainingParams
 from scripts.workflow.run_support import evaluate_best
@@ -32,7 +33,7 @@ def test_train_checkpoint_and_evaluate_synthetic_dataset(tmp_path, mobility_enab
                 "regions": False,
                 "biomarkers": True,
                 "mobility": mobility_enabled,
-            }
+            },
         },
     )
     config.training = TrainingParams(
@@ -63,6 +64,18 @@ def test_train_checkpoint_and_evaluate_synthetic_dataset(tmp_path, mobility_enab
     model_dir = tmp_path / "training/integration/model"
     checkpoint = model_dir / "checkpoints/best_model.pt"
     assert checkpoint.is_file()
+    epoch_checkpoint = torch.load(
+        model_dir / "checkpoints/checkpoint_epoch_0000.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    # The periodic checkpoint is written after best-score bookkeeping so an
+    # exact resume sees this epoch's selection state.
+    assert (
+        epoch_checkpoint["best_val_selection_score"]
+        == epoch_checkpoint["val_selection_score"]
+    )
+    assert len(epoch_checkpoint["training_history"]["val_loss"]) == 1
     evaluation_dir = tmp_path / "evaluation"
     manifest_path = evaluate_best(checkpoint, evaluation_dir, "test", [], False)
     manifest = json.loads(manifest_path.read_text())
@@ -72,9 +85,10 @@ def test_train_checkpoint_and_evaluate_synthetic_dataset(tmp_path, mobility_enab
         "test_node_metrics.csv",
         "test_node_metrics_per_head.csv",
     }
-    assert manifest["checkpoint_sha256"] == hashlib.sha256(
-        checkpoint.read_bytes()
-    ).hexdigest()
+    assert (
+        manifest["checkpoint_sha256"]
+        == hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    )
     for artifact in manifest["artifacts"]:
         path = evaluation_dir / artifact["path"]
         assert artifact["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
@@ -85,6 +99,31 @@ def test_train_checkpoint_and_evaluate_synthetic_dataset(tmp_path, mobility_enab
         summary["metrics"][f"effective_count_{head}"] > 0
         for head in ("ww", "hosp", "cases", "deaths")
     )
+    metrics = summary["metrics"]
+    plausibility = {
+        key: value
+        for key, value in metrics.items()
+        if key.startswith("latent_plausibility_")
+    }
+    assert plausibility["latent_plausibility_window_count"] > 0
+    for family in (
+        "i_origin",
+        "i_peak",
+        "s_depletion_origin",
+        "forecast_attack",
+        "rt_origin",
+        "rt_horizon_mean",
+    ):
+        for label in ("q05", "q25", "median", "q75", "q95"):
+            assert math.isfinite(
+                plausibility[f"latent_plausibility_{family}_{label}"]
+            ), (family, label)
+    assert 0.0 <= plausibility["latent_plausibility_i_collapse_fraction"] <= 1.0
+    for head in ("cases", "hosp", "deaths"):
+        prefix = f"latent_plausibility_ascertainment_{head}_"
+        assert plausibility[f"{prefix}window_count"] > 0, head
+        for suffix in ("q05", "median", "q95", "pooled", "zero_latent_window_fraction"):
+            assert math.isfinite(plausibility[prefix + suffix]), (head, suffix)
     with (evaluation_dir / "test_node_metrics_per_head.csv").open() as stream:
         rows = list(csv.DictReader(stream))
     assert {row["target"] for row in rows} == {

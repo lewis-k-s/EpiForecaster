@@ -289,6 +289,7 @@ class TestDiscoverRunsSynthOnly:
                 self.cases_output_dim = 3
                 self.biomarkers_output_dim = 4
                 self.temporal_covariates_dim = 2
+                self.block_pipeline = None
 
             def __len__(self):
                 return 1
@@ -296,7 +297,7 @@ class TestDiscoverRunsSynthOnly:
             def release_shared_sparse_topology(self):
                 self.shared_sparse_topology = None
 
-            def release_dense_mobility(self):
+            def convert_to_lazy_heavy_state(self):
                 self.preloaded_mobility = None
                 self.mobility_mask = None
 
@@ -332,6 +333,7 @@ class TestDiscoverRunsSynthOnly:
                 test_nodes=[3],
                 real_run="",
                 synth_runs=synth_runs,
+                curriculum=CurriculumConfig(run_block_size=8),
             )
 
         load_region_ids.assert_called_once_with(
@@ -371,3 +373,38 @@ class TestCurriculumConfigActiveRuns:
         """Positive active_runs values should still be valid."""
         config = CurriculumConfig(active_runs=3)
         assert config.active_runs == 3
+
+
+class TestCurriculumConfigRunBlockSize:
+    """Tests for CurriculumConfig.run_block_size validation."""
+
+    def test_default_block_size_is_positive(self):
+        assert CurriculumConfig().run_block_size == 8
+
+    def test_block_pipeline_defaults(self):
+        config = CurriculumConfig()
+        assert config.prefetch_blocks == 1
+        assert config.block_builders == 4
+        assert config.builder_threads == 3
+        assert config.light_build_workers == 8
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("prefetch_blocks", -1, "prefetch_blocks must be >= 0"),
+            ("block_builders", 0, "block_builders must be >= 1"),
+            ("builder_threads", 0, "builder_threads must be >= 1"),
+            ("light_build_workers", 0, "light_build_workers must be >= 1"),
+        ],
+    )
+    def test_invalid_block_pipeline_knobs_are_rejected(self, field, value, message):
+        with pytest.raises(ValueError, match=message):
+            CurriculumConfig(**{field: value})
+
+    def test_zero_prefetch_is_valid(self):
+        assert CurriculumConfig(prefetch_blocks=0).prefetch_blocks == 0
+
+    @pytest.mark.parametrize("size", [0, -1])
+    def test_non_positive_block_size_is_invalid(self, size):
+        with pytest.raises(ValueError, match="run_block_size must be >= 1"):
+            CurriculumConfig(run_block_size=size)

@@ -1,0 +1,62 @@
+# Immutable build of the real dataset real_with_id_v2 with the current
+# preprocessing defaults: observed days keep the raw observation (registry
+# zeros included), unobserved days are filled causally (LOCF), the mask records
+# which is which, hospitalizations_reporting_lag_days=7, float32 storage, and
+# target regions selected by the static population floor 3000.
+#
+# Raw inputs are the DVC directory data/files/catalonia_real_raw_inputs_v1.dvc
+# (nine files, 233 MB) and the dasymetric_mob promotion
+# data/files/dasymetric_mob_full-20261104b.dvc (2070 files, 4.0 GB; mobility is
+# mobility/mobility_catalonia.zarr, Zarr v3). Preprocessing runs no GPU step, so
+# it uses one GPP node under gp_debug (2 h maximum).
+#
+# Run:
+#   bash scripts/workflow/mn5_workflow.sh prepare <run-id> \
+#     --config workflow/config/mn5_preprocess_real.yaml
+#   (then submit the prepared run as docs/MN5_SNAKEMAKE.md describes)
+#
+# The run owns outputs/preprocessing/real_with_id_v2.zarr.zip, qa.json and
+# outputs/preprocessing/publication/{real_with_id_v2.zarr.zip.dvc,receipt.json}.
+# After the receipt passes review, copy the pointer to
+# data/processed/real_with_id_v2.zarr.zip.dvc in a Git branch. The previous
+# real_with_id dataset keeps its own pointer; consumers move to v2 explicitly.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: preprocess
+  target: preprocess
+
+dvc:
+  targets:
+    - data/files/catalonia_real_raw_inputs_v1.dvc
+    - data/files/dasymetric_mob_full-20261104b.dvc
+  provenance_targets: []
+
+preprocessing:
+  base_config: configs/production_only/preprocess_mn5_real.yaml
+  dataset_name: real_with_id_v2
+  expected_run_count: 1
+  required_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - edar_biomarker_N1
+  float32_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - edar_biomarker_N1
+
+resources:
+  allocation:
+    account: bsc08
+    partition: gpp
+    qos: gp_debug
+    nodes: 1
+    tasks: 1
+    # GPP grants about 1.87 GB per CPU: 48 CPUs give about 90 GB.
+    cpus_per_task: 48
+    runtime: 90

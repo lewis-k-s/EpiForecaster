@@ -133,12 +133,15 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
 
     Items no longer carry per-sample ``mob_x``; dense features are assembled
     batch-side on the target device from the dataset's prebuilt context tables
-    (see ``utils.training_utils.inject_context_features``). This collate only
-    builds placement tensors:
+    (see ``utils.training_utils.inject_context_features``). Workers also do not
+    know the run's k-hop context node set (it depends on the run's mobility, a
+    main-process heavy state), so this collate only builds time placement and
+    provenance; ``utils.training_utils.inject_context_placement`` later adds
+    ``target_node`` ([B*T] local target position inside the context node set)
+    and ``mob_real_node_idx`` ([N_ctx] context region indices):
 
     - global_t: [B*T] global time index per graph, or [T] when all samples
       share one window start (graph g then uses global_t[g % T])
-    - target_node: [B*T] local target position inside the context node set
     """
     B = len(batch)
     if B == 0:
@@ -159,17 +162,6 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
         window_starts.unsqueeze(-1) + torch.arange(L, dtype=torch.long).unsqueeze(0)
     ).reshape(-1)
 
-    # Local target positions [B*L] in the same order.
-    target_nodes_stacked = torch.stack(
-        [
-            item["mob_target_node_idx"]
-            if isinstance(item["mob_target_node_idx"], torch.Tensor)
-            else torch.tensor(item["mob_target_node_idx"], dtype=torch.long)
-            for item in batch
-        ]
-    ).long()
-    target_node_tensor = target_nodes_stacked.repeat_interleave(L)
-
     # Extract run_id provenance if the batch is homogeneous (expected with chunked samplers).
     run_ids = [item.get("run_id") for item in batch]
     non_none_run_ids = [run_id for run_id in run_ids if run_id is not None]
@@ -178,24 +170,9 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     if len(non_none_run_ids) == len(run_ids) and len(normalized_run_ids) == 1:
         batch_run_id = next(iter(normalized_run_ids))
 
-    # Context node mapping is cached once on the dataset and shared by identity
-    # across all samples in the batch.
-    mob_real_node_idx = None
-    if "mob_real_node_idx" in batch[0]:
-        mob_real_node_idx = batch[0]["mob_real_node_idx"]
-        for item_idx, item in enumerate(batch[1:], start=1):
-            if item.get("mob_real_node_idx") is not mob_real_node_idx:
-                raise ValueError(
-                    "Inconsistent mobility batch: mob_real_node_idx must be the "
-                    f"same cached tensor for all samples; sample {item_idx} differs."
-                )
-
     # 3) Batch-like container
     mob_batch = Batch()
     mob_batch.global_t = global_t_dense
-    mob_batch.target_node = target_node_tensor
-    if mob_real_node_idx is not None:
-        mob_batch.mob_real_node_idx = mob_real_node_idx
     mob_batch.run_id = batch_run_id
 
     return mob_batch

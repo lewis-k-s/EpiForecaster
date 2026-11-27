@@ -17,18 +17,44 @@
 - Production synthetic pretraining on the processed a97c812 reactive corpus
 - Invoked only through `workflow/config/mn5_synth_pretrain_reactive_n100.yaml`
 - Enables direct latent `S/I/H/R/death_flow` supervision for stage-1 pretraining
+- Memory: `training.curriculum.run_block_size: 8` keeps one block of 8 of the 200
+  runs resident. Startup builds only each run's light series state (in parallel,
+  `light_build_workers`); a block's heavy state (graph weights and context
+  tables, ~0.46 GB/run) is built when the block is reached, with the next
+  `prefetch_blocks` blocks built in the background by `block_builders` spawned
+  processes (`builder_threads` threads each; 4 x 3 of the node's 20 CPUs), and
+  dropped when the block ends. No node-local disk is used. Per-block build and wait times are written
+  to `curriculum_block_builds.jsonl` in the run directory
 
 ### `preprocess_mn5_synth.yaml`
 - Canonical MN5 synthetic preprocessing base
 - Reads the DVC-tracked raw synthetic Zarr on project GPFS
 
 ### `preprocess_mn5_synth_sirhd_v1_a97c812_reactive_n100.yaml`
-- Produces the processed a97c812 reactive corpus (the only synthetic corpus)
+- Produces the processed a97c812 reactive corpus (the corpus that production
+  pretraining uses)
 - Keeps clinical observations as continuous expected reported counts and stores
   float32 processed supervision so small positive clinical expectations and
   latent fractions cannot underflow back to zero
 - Represents missingness only through masks and NaNs and stores wastewater as
   raw concentration for exactly one downstream `log1p`
+
+### `preprocess_mn5_synth_sirhd_v1_5a2262d_reactive_n400.yaml`
+- Produces the processed 5a2262d reactive corpus: 440 runs (400 Reactive runs
+  with a policy and 40 Baseline twins), widened parameter ranges, state space
+  `epiforecaster_sirhd_v2` and reporting profile `sirhd_pretraining_reporting_v4`
+- Same processed-variable contract as the a97c812 config; the v2
+  `sirhd_infection_flow` and `sirhd_hospitalization_flow` are not read
+- Invoked through `workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml`
+
+### `preprocess_mn5_real.yaml`
+- Rebuilds the production real dataset `real_with_id_v2` from the staged DVC
+  directory `data/files/catalonia_real_raw_inputs_v1` and the dasymetric_mob
+  promotion `data/files/dasymetric_mob_full-20261104b`
+  (`mobility/mobility_catalonia.zarr`)
+- Scientific settings match `configs/preprocess_full.yaml` (hospitalization
+  reporting lag 7, float32 storage, `parameter_fit_end_date` unset)
+- Invoked only through `workflow/config/mn5_preprocess_real.yaml`
 
 ## Intended Usage
 

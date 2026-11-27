@@ -24,7 +24,8 @@ Example:
 Notes:
 - Uses CMA-ES sampler by default for better convergence on high-dimensional spaces.
 - Implements early pruning to kill unpromising trials and save compute.
-- Default: 50 epochs per trial with pruning after epoch 10.
+- Default: 50 epochs per trial with pruning after epoch 10, once 2 trials have
+  completed.
 - We force `training.plot_forecasts=False` by default to avoid workers clobbering
   shared forecast images (trainer writes `{split}_forecasts.png` at the
   experiment root).
@@ -32,6 +33,7 @@ Notes:
 
 from __future__ import annotations
 
+import gc
 import importlib
 import json
 import logging
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import torch
 
 from models.configs import EpiForecasterConfig
 from scripts.hpo.trial_artifacts import (
@@ -87,6 +90,21 @@ def _record_training_dynamics_attrs(
         identity["status"],
     )
     return identity
+
+
+def _release_trial_resources() -> None:
+    """Free the finished trial's compiled graphs and memory.
+
+    Every trial builds a new trainer, so torch.compile recompiles the shared
+    training-step code. Dynamo keeps each entry, with its model references and
+    CUDA graph pools, and runs eager once recompile_limit (8) entries exist. In
+    run hpo-core-mps-20261102 later trials trained 10x slower and worker host
+    memory grew until the step ran out of memory.
+    """
+    torch._dynamo.reset()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
@@ -191,6 +209,34 @@ def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
     return dotlist
 
 
+SEARCH_SPACES = ("default", "lr_only", "core")
+CORE_HEAD_D_MODEL_CHOICES = (128, 256, 384, 512)
+
+
+def _suggest_core_params(trial: Any, base_cfg: EpiForecasterConfig) -> dict[str, Any]:
+    """Sample only optimizer and head-capacity knobs; the base config owns the rest."""
+    n_heads = int(base_cfg.model.head_n_heads)
+    incompatible = [v for v in CORE_HEAD_D_MODEL_CHOICES if v % n_heads]
+    if incompatible:
+        raise ValueError(
+            f"head_d_model choices {incompatible} are not divisible by "
+            f"model.head_n_heads={n_heads}"
+        )
+    return {
+        "training.learning_rate": trial.suggest_float(
+            "training.learning_rate", 1e-5, 1e-3, log=True
+        ),
+        "training.weight_decay": trial.suggest_float(
+            "training.weight_decay", 1e-7, 1e-3, log=True
+        ),
+        "model.head_dropout": trial.suggest_float("model.head_dropout", 0.0, 0.3),
+        "model.head_d_model": trial.suggest_categorical(
+            "model.head_d_model", _categorical_choices(CORE_HEAD_D_MODEL_CHOICES)
+        ),
+        "model.head_num_layers": trial.suggest_int("model.head_num_layers", 2, 4),
+    }
+
+
 def suggest_epiforecaster_params(
     *,
     trial: Any,
@@ -204,6 +250,15 @@ def suggest_epiforecaster_params(
     journal is failure-heavy and completion-poor, so we focus on a small set of
     first-order knobs before revisiting startup/init and controller tuning.
     """
+
+    if search_space not in SEARCH_SPACES:
+        raise ValueError(
+            f"Unknown search space {search_space!r}; expected one of {SEARCH_SPACES}"
+        )
+    if search_space == "core":
+        if sample_training_loss_objective:
+            raise ValueError("The core search space does not sample the loss objective")
+        return _suggest_core_params(trial, base_cfg)
 
     overrides: dict[str, Any] = {}
 
@@ -432,6 +487,7 @@ def objective(
         pruning_start_epoch=pruning_start_epoch,
         model_id=model_id,
     )
+    trainer_model_id = trainer.model_id
     if trainer.experiment_dir is None:
         raise RuntimeError("Trainer did not initialize its experiment directory")
     actual_trial_dir = trainer.experiment_dir.resolve()
@@ -483,6 +539,9 @@ def objective(
             raise
         # Re-raise other exceptions
         raise
+    finally:
+        del trainer
+        _release_trial_resources()
 
     duration_s = time.time() - start_time
     logger.info(
@@ -518,7 +577,7 @@ def objective(
                 "config_effective": {
                     "output.log_dir": cfg.output.log_dir,
                     "output.experiment_name": cfg.output.experiment_name,
-                    "trainer.model_id": trainer.model_id,
+                    "trainer.model_id": trainer_model_id,
                 },
             },
             indent=2,
@@ -593,6 +652,13 @@ def objective(
     help="Epoch to start checking for pruning (default: 10).",
 )
 @click.option(
+    "--pruning-startup-trials",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Completed trials required before any trial can be pruned.",
+)
+@click.option(
     "--override",
     "cli_overrides",
     type=str,
@@ -606,7 +672,7 @@ def objective(
 )
 @click.option(
     "--search-space",
-    type=click.Choice(["default", "lr_only"], case_sensitive=False),
+    type=click.Choice(list(SEARCH_SPACES), case_sensitive=False),
     default="default",
     show_default=True,
     help="Named HPO search space to use.",
@@ -624,6 +690,7 @@ def main(
     seed: int,
     sampler: str,
     pruning_start_epoch: int,
+    pruning_startup_trials: int,
     cli_overrides: tuple[str, ...],
     sample_training_loss_objective: bool,
     search_space: str,
@@ -687,11 +754,11 @@ def main(
         logger.info("Using Random sampler (seed=%d)", worker_seed)
 
     storage = JournalStorage(JournalFileBackend(str(journal_file)))
-    # Use PercentilePruner to enable early pruning even with few workers
-    # Prunes trials in the bottom 25th percentile after just 2 trials complete
+    # Prune a trial that is outside the best quarter of completed trials at the
+    # same epoch, once pruning_startup_trials trials have completed.
     selected_pruner = optuna.pruners.PercentilePruner(
         percentile=25.0,
-        n_startup_trials=2,
+        n_startup_trials=pruning_startup_trials,
         n_warmup_steps=pruning_start_epoch,
     )
     study = optuna.create_study(
@@ -708,10 +775,11 @@ def main(
     logger.info("Journal file: %s", journal_file)
     logger.info("Run root: %s", run_root)
     logger.info(
-        "Settings: epochs=%d, pruning_start_epoch=%d, seed=%d, "
-        "pruner=PercentilePruner(25%%)",
+        "Settings: epochs=%d, pruning_start_epoch=%d, pruning_startup_trials=%d, "
+        "seed=%d, pruner=PercentilePruner(25%%)",
         epochs,
         pruning_start_epoch,
+        pruning_startup_trials,
         seed,
     )
     slurm = _slurm_identity()

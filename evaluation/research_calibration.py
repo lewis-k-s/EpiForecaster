@@ -11,7 +11,12 @@ import torch
 from scipy import stats
 
 from evaluation.distribution_scores import (
+    TARGET_LOWER_BOUND,
     WIS_INTERVAL_LEVELS,
+    censored_normal_crps,
+    censored_normal_nll,
+    clip_to_support,
+    clipped_interval,
     distribution_wis,
     normal_crps,
     standard_wis_half_widths,
@@ -149,11 +154,14 @@ def score_research_calibrators(
     *,
     role: str,
     checkpoint_sha256: str,
+    censored: bool,
 ) -> tuple[pd.DataFrame, dict]:
     """Evaluate frozen controls on selection or frozen confirmation forecasts.
 
     Returned rows are canonical metric outputs. Reporting code must use these
-    values rather than refit calibration or recompute metrics.
+    values rather than refit calibration or recompute metrics. `censored` is the
+    model's `censored_location`: NLL, CRPS and PIT then score the Normal
+    censored at zero and the point prediction is its median.
     """
     if role not in {"selection", "confirmation"}:
         raise ValueError("Calibration fit data cannot supply evaluation evidence")
@@ -174,6 +182,7 @@ def score_research_calibrators(
         "schema_version": 1,
         "role": role,
         "calibration_artifact_sha256": artifact["artifact_sha256"],
+        "censored": censored,
         "controls": {},
     }
     for control in ["C0", "C1", "C2"]:
@@ -188,6 +197,8 @@ def score_research_calibrators(
                 raise ValueError(
                     "Evaluation and calibration distribution identities differ"
                 )
+            if censored and family != "normal":
+                raise ValueError("Censored heads require the normal family")
             multiplier = float(fitted[control]["multiplier"])
             loc, scale, y = [
                 torch.as_tensor(head[c].to_numpy(dtype=float))
@@ -199,19 +210,36 @@ def score_research_calibrators(
             scored["control"] = control
             scored["calibrated_scale"] = scale.numpy()
             scored["wis"] = distribution_wis(loc, scale, y, widths).numpy()
-            scored["crps"] = (
-                normal_crps(loc, scale, y)
-                if family == "normal"
-                else student_t_crps(loc, scale, y, df)
-            ).numpy()
             residual = ((y - loc) / scale).numpy()
             distribution = stats.norm if family == "normal" else stats.t(df)
-            scored["pit"] = distribution.cdf(residual)
-            scored["nll"] = -distribution.logpdf(residual) + np.log(scale.numpy())
-            scored["absolute_error"] = np.abs((y - loc).numpy())
-            scored["prediction"] = loc.numpy()
+            if censored:
+                # An observed zero is a probability mass; its PIT is uniform on
+                # that mass (randomized PIT, same draws for every control).
+                bound_mass = stats.norm.cdf(
+                    ((TARGET_LOWER_BOUND - loc) / scale).numpy()
+                )
+                uniform = np.random.default_rng(0).uniform(size=len(scored))
+                scored["crps"] = censored_normal_crps(loc, scale, y).numpy()
+                scored["nll"] = censored_normal_nll(loc, scale, y).numpy()
+                scored["pit"] = np.where(
+                    y.numpy() <= TARGET_LOWER_BOUND,
+                    uniform * bound_mass,
+                    stats.norm.cdf(residual),
+                )
+                prediction = clip_to_support(loc.numpy())
+            else:
+                scored["crps"] = (
+                    normal_crps(loc, scale, y)
+                    if family == "normal"
+                    else student_t_crps(loc, scale, y, df)
+                ).numpy()
+                scored["pit"] = distribution.cdf(residual)
+                scored["nll"] = -distribution.logpdf(residual) + np.log(scale.numpy())
+                prediction = loc.numpy()
+            scored["prediction"] = prediction
+            scored["absolute_error"] = np.abs(y.numpy() - prediction)
             scored["abs_error"] = scored.absolute_error
-            scored["sq_error"] = (y - loc).numpy() ** 2
+            scored["sq_error"] = (y.numpy() - prediction) ** 2
             scored["target_units"] = (
                 "log1p_concentration" if target == "wastewater" else "log1p_per_100k"
             )
@@ -225,7 +253,7 @@ def score_research_calibrators(
                 | {round((1 + level) / 2, 8) for level in WIS_INTERVAL_LEVELS}
             )
             for quantile in quantiles:
-                scored[f"quantile_{round(1000 * quantile):03d}"] = (
+                scored[f"quantile_{round(1000 * quantile):03d}"] = clip_to_support(
                     loc.numpy() + scale.numpy() * float(distribution.ppf(quantile))
                 )
             metrics = {
@@ -237,13 +265,14 @@ def score_research_calibrators(
                 scored[["region_id", "target_date"]].drop_duplicates()
             )
             for level in [50, 80, 95]:
-                half_width = scale.numpy() * float(
-                    distribution.ppf((1 + level / 100) / 2)
+                low, high = clipped_interval(
+                    loc.numpy(),
+                    scale.numpy() * float(distribution.ppf((1 + level / 100) / 2)),
                 )
-                scored[f"interval_low_{level}"] = loc.numpy() - half_width
-                scored[f"interval_high_{level}"] = loc.numpy() + half_width
-                scored[f"covered_{level}"] = scored.absolute_error <= half_width
-                scored[f"width_{level}"] = 2 * half_width
+                scored[f"interval_low_{level}"] = low
+                scored[f"interval_high_{level}"] = high
+                scored[f"covered_{level}"] = scored.observed.between(low, high)
+                scored[f"width_{level}"] = high - low
                 metrics[f"coverage_{level}"] = float(scored[f"covered_{level}"].mean())
                 metrics[f"width_{level}"] = float(scored[f"width_{level}"].mean())
             summary["controls"][control]["heads"][target] = metrics

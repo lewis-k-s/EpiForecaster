@@ -32,9 +32,13 @@ tasks=N
 gres=gpu:N
 ```
 
-Templates use `acc_bscls`; `acc_debug` is also accepted when its wall-time
-limits fit the run. No `--mem` or `--mem-per-cpu` directive is permitted
-because MN5 derives host memory from the CPU allocation.
+Templates use `acc_bscls`. Use `acc_debug` for any run that fits its two-hour
+limit: its QOS priority is 10000 against 100 for `acc_bscls`, but it holds one
+queued or running job per user. Pack many short runs into one `ablation`
+campaign (with `mps_clients_per_gpu` when trials leave the GPU idle) instead of
+submitting one job per run. Size `runtime` from measured wall time with about a
+twofold margin; a shorter limit backfills sooner. No `--mem` or `--mem-per-cpu`
+directive is permitted because MN5 derives host memory from the CPU allocation.
 
 Single training and evaluation use `N=1`. HPO and ablation use their configured
 worker count. Cross-validation uses up to `N` concurrent folds, with ten folds
@@ -181,15 +185,36 @@ preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
 
 Synthetic pretraining uses the same `train` entity through
-`workflow/config/mn5_synth_pretrain_reactive_n100.yaml`. Its processed Zarr is
-materialized for training, while the raw synthetic Zarr is a provenance-only DVC
-target. The raw corpus DVC pointer is the corpus identity.
+`workflow/config/mn5_synth_pretrain_reactive_n100.yaml` and, for the n400
+corpus, `workflow/config/mn5_synth_pretrain_reactive_n400.yaml`. Its processed
+Zarr is materialized for training, while the raw synthetic Zarr is a
+provenance-only DVC target. The raw corpus DVC pointer is the corpus identity.
 
 The a97c812 corpus uses
 `workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml`. The immutable
 run owns the processed dataset, QA record, generated DVC pointer, and publication
 receipt. Promote the pointer to the source repository only after these records
 pass review.
+
+The 5a2262d n400 corpus uses
+`workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml` on one
+`gp_debug` GPP node (120 minutes, 64 CPUs). Its raw object is 239 GB, so hard-link
+it from the EpiSim.jl DVC store on GPFS into both the `storage` and `cache`
+directories of the EpiForecaster DVC root, as for the a97c812 corpus.
+
+The real dataset `real_with_id_v2` is rebuilt with
+`workflow/config/mn5_preprocess_real.yaml` on one `gp_debug` GPP node (90 minutes,
+48 CPUs). Raw inputs are the DVC pointers
+`data/files/catalonia_real_raw_inputs_v1.dvc` and
+`data/files/dasymetric_mob_full-20261104b.dvc`. The latter is the dasymetric_mob
+promotion `full-20261104b`; its objects were hard-linked from that project's DVC
+store into `EpiForecaster-DVC/storage`, and preprocessing reads
+`mobility/mobility_catalonia.zarr` (Zarr v3) from it. The run publishes a packed
+`real_with_id_v2.zarr.zip.dvc` pointer. After review, copy it to `data/processed/`
+and repoint the consuming templates and `data.dataset_path` (see the template
+header). The production config, the standing templates in `workflow/config/`
+and the campaigns `ablation_default_v2`, `ablation_smoke_v1` and `transfer_v2`
+use `real_with_id_v2` with `configs/crossval/representative_10fold_pop3000.json`.
 
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
@@ -218,7 +243,7 @@ resolved configuration paths (currently `training.epochs` and
 `training.max_batches`) whose values must be identical for every condition.
 
 Production campaigns evaluate every fold in the persisted manifest. The canonical
-10-fold manifest places all 161 valid target regions in the held-out test role
+10-fold manifest places all 280 valid target regions in the held-out test role
 exactly once per condition and paired model seed. `ablation_default_v2.yaml`
 therefore declares folds `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]` and two paired seeds
 `[42, 43]`, giving `28 conditions × 10 folds × 2 seeds = 560` identities. Each
@@ -245,6 +270,74 @@ provenance, but they cannot support model-selection claims. Campaigns are expand
 in memory; the workflow never generates per-run YAML files. A campaign with fold
 indices must declare an existing persisted split manifest, and undeclared
 resolved-config drift fails before a worker starts training.
+
+`configs/campaigns/region_coverage_v1.yaml` (run with
+`workflow/config/mn5_region_coverage.yaml`) compares training populations on the
+population-floor dataset `real_with_id_v2` and its extended manifest
+`representative_10fold_pop3000.json`. The baseline sets
+`training.crossval_region_set: base`, so it trains and selects on the 161 former
+targets; the candidate trains on all 280. Both score every region of each fold,
+so the primary endpoint has identical support, and the manifest region sets give
+the paired effect on the former targets (`base`), the added targets, and each
+population bin.
+
+`configs/campaigns/scale_floor_v1.yaml` (run with
+`workflow/config/mn5_scale_floor.yaml`) varies
+`model.observation_heads.distribution_scale_floor` (0.001, 0.05, 0.1, 0.2) on
+the same 280 targets. The Normal likelihood is unbounded on an observed zero
+when the anchored location sits on the zero clamp, so the floor is the only
+bound on the reward of a collapsed scale; the campaign measures what a larger
+floor costs in WIS and removes from the NLL tail.
+`configs/campaigns/scale_floor_v2.yaml` (`workflow/config/mn5_scale_floor_v2.yaml`)
+keeps the constant 0.05 floor on every head and varies
+`count_step_scale_floor_cases` (0, 0.05, 0.1, 0.2), the cases floor as a fraction
+of one count in the target municipality. The production config adopts the
+constant 0.05 floor with a cases fraction of 0.2; the three campaigns that ran
+before pin their own floors in `fixed_overrides`.
+`configs/campaigns/censored_likelihood_v1.yaml`
+(`workflow/config/mn5_censored_likelihood.yaml`) compares the former production
+Normal NLL with the zero-clipped WIS objective and with
+`model.observation_heads.censored_location`, under both objectives. The
+production config adopts the clipped WIS with the censored location; the four
+campaigns above pin the Normal NLL they ran with in `fixed_overrides`.
+
+Fine-tuning conditions declare their pretrained sources once, in a top-level
+`init_checkpoints` mapping of name to absolute GPFS path, and reference one by
+name with the condition's `init_checkpoint`:
+
+```yaml
+init_checkpoints:
+  synth-n400: /gpfs/projects/bsc08/.../synth_n400/checkpoints/best_model.pt
+conditions:
+  - name: real-only
+    overrides: {}
+    allowed_difference_paths: []
+  - name: ft-synth-n400
+    init_checkpoint: synth-n400
+    overrides: {}
+    allowed_difference_paths: [training.init_checkpoint_path]
+```
+
+A campaign fails at load if a condition names an undeclared checkpoint, a
+declared checkpoint is used by no condition, a path is relative, or any override
+or the base config sets `training.init_checkpoint_path` directly. The path change
+is not implicit: it is part of the condition's hydrated difference from the
+baseline, so `training.init_checkpoint_path` must be in that condition's
+`allowed_difference_paths`. Fine-tuning and from-scratch conditions must still
+share `equal_budget_policy.paths`.
+
+`mn5_workflow.sh prepare` pins every declared checkpoint into
+`inputs/campaign_init/<campaign_id>/<name>.pt`, records its SHA-256 in
+`manifest.yaml` (`campaign_init_inputs`, `identity.campaign_init_checkpoint_sha256`),
+and lists the source directories as `checkpoint_input_dir` bindings of the sealed
+dispatch request. Workers pass the pinned in-run path, never the GPFS path, and
+re-verify the SHA-256 at worker start and before every trial; a tampered file
+fails the worker. Scientific identity follows checkpoint content: the hydrated
+training-config hash used for `reuse_receipt` acceptance substitutes
+`sha256:<hash>` for `training.init_checkpoint_path`, reuse records must carry a
+matching `init_checkpoint_sha256`, and the campaign hash covers checkpoint names
+but not paths. The hashes are also recorded in the study journal, each trial's
+`campaign_identity.json`, and `ablation_manifest.json`.
 
 An `ablation_suite` config groups distinct campaigns in one immutable run and
 one four-GPU Slurm allocation. The suite runs each campaign in listed order,
@@ -300,6 +393,11 @@ endpoint aggregation and to the paired fold/seed deltas. Reused runs must supply
 this aggregate table in the evidence bundle, and the analyzer checks their
 recorded identity against the bundled `config.yaml`.
 
+Each trial also writes `test_summary.json` beside its aggregate tables. It holds
+every run-level test metric, including the `latent_plausibility_*` and
+`latent_info_*` indicators that the aggregate tables omit. It is not an input to
+endpoint aggregation.
+
 Each data, training, evaluation, cross-validation, HPO, ablation, selection,
 and promotion contract fingerprints the same complete scientific source
 inventory together with its relevant config fragment and SIF digest. This
@@ -316,9 +414,24 @@ coverage, run-context, aggregate table, and artifact manifest. Completion
 markers remain receipts rather than the sole scientific output contract.
 
 `stage_data` materializes the pinned DVC payloads once in the run workspace.
-The first scientific step copies them to an allocation-local cache on the node.
-The key includes the run config and data manifest. A lock protects construction;
-only a complete copy is published. All ranks and later stages mount this copy
+The first scientific step copies them to an allocation-local cache on the node:
+rsync copies files below 1 GiB and `scripts/workflow/parallel_copy.py` copies
+larger files with 16 concurrent 64 MiB block readers, because one stream reads
+about 0.4 GB/s from GPFS. Other jobs share the disk of an ACC node and can
+leave it nearly full (job 48640552 found 165 of 436 GB free for a 204 GB
+dataset and failed after four minutes of copying), so the copy checks the free
+space first and fails at once unless the large files fit with 16 GiB to spare.
+A check alone does not hold the space: two pretrains that started together on
+one 480 GB node both passed it, and one ran out of space after ten minutes of
+copying (jobs 49064430 and 49064484). Under a per-user node lock
+(`/scratch/tmp/epiforecaster-staging-<user>.lock`), the copy therefore checks
+the space and reserves the blocks of every large file with `posix_fallocate`
+before it copies any data. A job that cannot reserve its space releases what it
+reserved and fails within seconds; the copy of a job that has reserved cannot
+run out of space.
+Resubmit to get another node. The key includes the run config and data manifest. A
+lock protects construction; only a complete copy is published. All ranks and
+later stages mount this copy
 read-only. Each process keeps a private temporary directory. Shared leases keep
 the cache alive during execution, and the coordinator removes it on exit when
 no step still uses it. An abrupt allocation loss can leave node-local files;
@@ -331,8 +444,10 @@ progress. The initialization rule creates the journal before workers start.
 
 Preprocessing and cross-validation keep each attempt under `.state/attempts/`.
 Partial attempts remain available for inspection. A completed attempt has a
-receipt with the config identity and file hashes. On retry, the runtime checks
-those hashes and restores missing public outputs without repeating the work.
+receipt with the config identity and file hashes; the processed dataset is
+recorded by byte size, because its DVC MD5 at publication is its only hash. On
+retry, the runtime checks the recorded identities and restores missing public
+outputs without repeating the work.
 Publication uses atomic hard links within the run filesystem, so large payloads
 do not require a second copy. Keep attempt directories for the lifetime of the
 run: they contain the training logs, dynamics, and recovery evidence. Incomplete
@@ -342,8 +457,9 @@ publication depends on that file as well as its QA evidence.
 
 Processed datasets are sharded Zarr v3 stores packed into one uncompressed
 ZIP64 file (`data/preprocess/zarr_layout.py`, layout `synthetic-zarr-v1`).
-Each per-run variable has one shard per run, so `preprocessing.write_workers`
-processes write runs in parallel and verify each run by read-back. DVC tracks
+Each per-run variable has one shard per run. `preprocessing.write_workers`
+processes each build one synthetic run from the raw corpus, write it and verify
+it by read-back (`data/preprocess/synthetic_runs.py`). DVC tracks
 the packed file as one object. See `docs/SYNTHETIC_ZARR_LAYOUT.md`.
 
 ## Prepare and submit
@@ -426,6 +542,37 @@ declared artifacts without rewriting that default receipt. Existing run
 directories and promotion destinations are never overwritten. Do not run
 `dvc gc` while any run or promoted artifact may reference the shared cache.
 
+### Training continuation
+
+A `train` run that hits its Slurm time limit can be continued exactly by a new
+immutable run. The run keeps `checkpoint_epoch_NNNN.pt` after every epoch
+(`output.checkpoint_frequency=1` in the synthetic-pretraining template) under
+`outputs/training/<experiment_name>/<model_id>/checkpoints/` on GPFS. Work done
+after the last epoch checkpoint is lost; the continuation restarts at the
+following epoch.
+
+1. Copy the original template and keep every scientific setting identical,
+   including `training.epochs` in the base config, so the cosine schedule
+   continues rather than restarts.
+2. Set both absolute GPFS paths from the timed-out run:
+   `training.resume_checkpoint` to the last `checkpoint_epoch_NNNN.pt` and
+   `training.resume_best_checkpoint` to that run's `best_model.pt`. They must be
+   given together and exclude `training.init_checkpoint`.
+3. `prepare` a new run id with that config and `run` it as usual.
+
+Preparation pins both files under `inputs/` and records their SHA-256 in the
+manifest (`training_resume_input`). The sealed dispatch request lists the
+directory of every out-of-run checkpoint (`training.init_checkpoint`, the resume
+pair, `evaluation.checkpoint`), and the coordinator binds each read-only into its
+contained runtime so `prepare_run` can copy them. Before training, the best
+checkpoint must
+not be later than the resume checkpoint and must carry the resume checkpoint's
+best selection score and metric. It seeds the new run's `best_model.pt`, so the
+canonical checkpoint exists even if no later epoch improves. A retried attempt
+restarts from the same pinned pair and replaces any stale `best_model.pt`.
+Optimizer, scheduler, RNG, epoch, patience, and selection state resume from the
+epoch checkpoint.
+
 ## Research-role evaluation
 
 For a protected research training config, set `evaluation.research_outputs: true`,
@@ -456,3 +603,18 @@ value and alert thresholds, `event_decision_fixed_0_5`, and nullable
 calibration evidence. It is not a negative alert. Summary JSON contains metric
 counts, support reasons, and horizon-band results. Hospitalization event scores
 remain unsupported until source-level aggregation is defined.
+
+## CUDA MPS worker packing
+
+Set `resources.allocation.mps_clients_per_gpu` to K to run K HPO or ablation
+workers on each GPU. The default is 1 and keeps one worker per GPU. For K above
+1, `gres` is `gpu:G`, the worker count is `G * K`, `tasks` equals the worker
+count, and `cpus_per_task` is `20 * G / tasks`. Only `hpo` and `ablation` kinds
+accept K above 1.
+
+All workers run in one Slurm step that sees all G GPUs. Rank r uses GPU `r // K`,
+selected by UUID. The first rank on each GPU starts one MPS daemon for that GPU
+under the job `TMPDIR`, and stops it after all K ranks on that GPU exit. Each
+worker runs with `singularity exec --contain`, because `--containall` makes
+MPS reject the client. K of 1 keeps `--containall`. Daemon logs are copied to
+`logs/mps/` in the run root.

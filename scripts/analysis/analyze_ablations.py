@@ -964,6 +964,14 @@ def validate_campaign_outputs(
                 errors.append(
                     f"{_run_label(run)}: campaign output provenance does not match declaration"
                 )
+            condition_spec = campaign.conditions_by_name.get(condition)
+            if run.campaign_identity is None and identity.get("init_checkpoint") != (
+                None if condition_spec is None else condition_spec.init_checkpoint
+            ):
+                errors.append(
+                    f"{_run_label(run)}: output init checkpoint does not match "
+                    "declaration"
+                )
             if run.campaign_identity is not None:
                 errors.extend(_reuse_config_identity_errors(campaign, condition, run))
             errors.extend(

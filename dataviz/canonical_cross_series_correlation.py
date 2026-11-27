@@ -38,6 +38,7 @@ if sys_path not in __import__("sys").path:
     __import__("sys").path.append(sys_path)
 
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
+from data.preprocess.zarr_layout import open_zarr_store  # noqa: E402
 from utils.plotting import save_figure  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ def _load_canonical_data(
     Returns:
         CorrelationData container with values, masks, region_ids, and dates
     """
-    dataset = xr.open_zarr(dataset_path)
+    dataset = open_zarr_store(dataset_path)
 
     # Filter by run_id if present
     if "run_id" in dataset.dims:

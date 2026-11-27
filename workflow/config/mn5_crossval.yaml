@@ -8,14 +8,14 @@ workflow:
 
 dvc:
   targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id_v2.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 crossval:
-  campaign_id: epiforecaster-representative-10fold-v2
+  campaign_id: epiforecaster-representative-10fold-pop3000-v1
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
   folds: 10
   model_seed: 42
   holdout_role: test
@@ -34,9 +34,12 @@ resources:
   allocation:
     account: bsc08
     partition: acc
-    qos: acc_bscls
+    qos: acc_debug
     nodes: 1
     tasks: 4
     cpus_per_task: 20
     gres: gpu:4
-    runtime: 420
+    # One fold took about 7 minutes end to end in real-control-20261102c
+    # (5.5 min training, 1 min test evaluation). Ten folds on four GPUs run in
+    # three waves of about 7 minutes each.
+    runtime: 90

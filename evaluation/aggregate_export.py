@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,22 @@ _TARGET_AGGREGATE_COLUMNS += [
 _PRIMARY_ENDPOINT_COLUMN = "mean_target_wis"
 _TARGET_AGGREGATE_COLUMNS.append(_PRIMARY_ENDPOINT_COLUMN)
 _ENDPOINT_HEADS = ("ww", "hosp", "cases", "deaths")
+# Run-level scores restricted to each manifest region set (``region_set_<name>_*``
+# test metrics): per-head pooled scores plus the set's equal-head WIS endpoint.
+_REGION_SET_PREFIX = "region_set_"
+_REGION_SET_ENDPOINT_SUFFIX = "_mean_target_wis"
+_REGION_SET_HEAD_METRICS = ("wis", "crps", "nll", "probabilistic_effective_count")
+
+
+def region_set_names(eval_metrics: dict[str, Any]) -> list[str]:
+    """Names of the region sets scored in a run-level metric mapping."""
+    return sorted(
+        key[len(_REGION_SET_PREFIX) : -len(_REGION_SET_ENDPOINT_SUFFIX)]
+        for key in eval_metrics
+        if key.startswith(_REGION_SET_PREFIX)
+        and key.endswith(_REGION_SET_ENDPOINT_SUFFIX)
+    )
+
 
 _JOINT_AGGREGATE_COLUMNS = [
     "model",
@@ -143,6 +160,7 @@ def build_main_model_target_aggregate(
 
     mean_target_wis = _mean_target_wis(eval_metrics)
     rows: list[dict[str, Any]] = []
+    set_names = region_set_names(eval_metrics)
     for target_name, key_map in target_to_keys.items():
         row: dict[str, Any] = {
             "model": model_name,
@@ -170,9 +188,24 @@ def build_main_model_target_aggregate(
             row[f"{metric_name}_median"] = median
             row[f"{metric_name}_iqr"] = iqr
         row[_PRIMARY_ENDPOINT_COLUMN] = mean_target_wis
+        for name in set_names:
+            prefix = f"{_REGION_SET_PREFIX}{name}_"
+            for metric_name in _REGION_SET_HEAD_METRICS:
+                key = f"{prefix}{metric_name}_{head}"
+                if metric_name != "probabilistic_effective_count":
+                    key += "_log1p_per_100k"
+                row[f"{prefix}{metric_name}"] = _finite_or_nan(eval_metrics.get(key))
+            row[f"{prefix}mean_target_wis"] = _finite_or_nan(
+                eval_metrics.get(f"{prefix}mean_target_wis")
+            )
         rows.append(row)
 
-    return pd.DataFrame(rows, columns=_TARGET_AGGREGATE_COLUMNS)
+    columns = list(_TARGET_AGGREGATE_COLUMNS)
+    for name in set_names:
+        prefix = f"{_REGION_SET_PREFIX}{name}_"
+        columns += [f"{prefix}{metric}" for metric in _REGION_SET_HEAD_METRICS]
+        columns.append(f"{prefix}mean_target_wis")
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_main_model_joint_observation_aggregate(
@@ -269,3 +302,55 @@ def write_main_model_aggregate_csvs(
         f"{split_key}_main_model_aggregate_metrics": target_path,
         f"{split_key}_main_model_joint_loss_aggregate": joint_path,
     }
+
+
+def json_metric_value(value: object) -> object:
+    """Convert scalar or structured evaluation metrics to JSON-native values."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): json_metric_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_metric_value(item) for item in value]
+
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return json_metric_value(tolist())
+    item = getattr(value, "item", None)
+    if callable(item):
+        return json_metric_value(item())
+    raise TypeError(f"Unsupported evaluation metric value: {type(value).__name__}")
+
+
+def write_evaluation_summary(
+    path: Path,
+    *,
+    checkpoint: Path,
+    split: str,
+    eval_loss: float,
+    metrics: dict[str, Any],
+) -> Path:
+    """Write every run-level metric of one evaluation; non-finite values are null."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checkpoint": str(checkpoint.resolve()),
+                "split": split,
+                "eval_loss": json_metric_value(float(eval_loss)),
+                "metrics": {
+                    str(name): json_metric_value(value)
+                    for name, value in sorted(metrics.items())
+                },
+            },
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path

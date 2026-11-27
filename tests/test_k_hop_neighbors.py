@@ -181,7 +181,9 @@ def _reconstruct_mob_graph(item, t: int, dataset):
         "x": mob_x_t,
         "adj": adj,
         "node_ids": node_ids,
-        "target_node": item["mob_target_node_idx"],
+        "target_node": dataset.local_target_positions(
+            torch.tensor([item["target_node"]], dtype=torch.long)
+        )[0],
         "num_nodes": mob_x_t.size(0),
     }
 

@@ -61,6 +61,12 @@ class LatentSupervisionConfig:
     scale_floors: dict[str, float] = field(
         default_factory=lambda: {name: 1.0e-8 for name in _LATENT_TASKS}
     )
+    # In asinh mode, I/H/death-flow targets are compared as asinh(x / c) with
+    # c = asinh_scale_fraction * (fitted training-split std). Above c the
+    # comparison is logarithmic, so a collapsed small latent keeps an O(1)
+    # gradient through the multiplicative roll-forward and the X0 softmax; with
+    # c = std it is linear there and the gradient vanishes with the latent.
+    asinh_scale_fraction: float = 1.0
     require_complete_targets: bool = True
 
     def __post_init__(self) -> None:
@@ -75,6 +81,14 @@ class LatentSupervisionConfig:
             raise ValueError(
                 "latent.total_weight must be finite and non-negative, "
                 f"got {self.total_weight}"
+            )
+        if (
+            not math.isfinite(self.asinh_scale_fraction)
+            or self.asinh_scale_fraction <= 0
+        ):
+            raise ValueError(
+                "latent.asinh_scale_fraction must be finite and positive, "
+                f"got {self.asinh_scale_fraction}"
             )
 
         expected_tasks = set(_LATENT_TASKS)
@@ -156,6 +170,16 @@ class JointLossConfig:
     mask_input_hosp: bool = False
     mask_input_cases: bool = False
     mask_input_deaths: bool = False
+    # Regularizers added to the weighted observation and latent terms.
+    # Masked MSE between each head's mechanistic location over the rolled
+    # history and the observed history (needs sir_physics.rollforward_history_steps).
+    history_reconstruction_weight: float = 0.0
+    # Mean squared residual contribution to the forecast location over
+    # supervised points (minimum-norm residual, as in APHYNITY).
+    residual_penalty_weight: float = 0.0
+    # Mean squared first difference of log(beta) along the roll-forward
+    # (random-walk prior on transmission).
+    beta_smoothness_weight: float = 0.0
 
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
@@ -246,6 +270,13 @@ class JointLossConfig:
                 "gradnorm_min_weight is too large for gradnorm_obs_weight_sum "
                 "with four observation tasks"
             )
+        for name, value in [
+            ("history_reconstruction_weight", self.history_reconstruction_weight),
+            ("residual_penalty_weight", self.residual_penalty_weight),
+            ("beta_smoothness_weight", self.beta_smoothness_weight),
+        ]:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
 
 
 @dataclass
@@ -310,6 +341,29 @@ class CurriculumConfig:
     active_runs: int = 1
     # Contiguous windows per run before rotating to next run
     chunk_size: int = 512
+    # Synthetic runs resident at a time. Each epoch the active runs are split
+    # into consecutive blocks of this many runs; chunks are interleaved only
+    # within a block and blocks are visited one after another. A run's heavy
+    # state (dense mobility reduction, k-hop closure, graph weights, context
+    # tables) is built when its block is reached and dropped, with its device
+    # caches, when the block ends, so memory scales with this value instead of
+    # the run count. A value >= the number of active runs gives one block, no
+    # rotation, and heavy state stays resident across epochs.
+    run_block_size: int = 8
+    # Blocks built in the background ahead of the block being trained. 0 builds
+    # each block on demand when its first batch is needed (no overlap).
+    prefetch_blocks: int = 1
+    # Builder processes (spawn) building the runs of a block and of prefetched
+    # blocks concurrently. Each holds one run's dense mobility (~1.2 GB for a
+    # 945-region, 455-day run) plus ~1 GB of intermediates transiently.
+    block_builders: int = 4
+    # Torch/dask/blosc threads inside each builder process. builders x threads
+    # should leave room on the node for the trainer, DataLoader workers and
+    # their threads (4 x 3 = 12 of 20 CPUs next to 4 train + 2 val workers).
+    builder_threads: int = 3
+    # Threads building every synthetic run's light state (series, masks, index
+    # maps) at startup.
+    light_build_workers: int = 8
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
     # Build each batch from one window start of one run (replaces chunk_size
@@ -331,6 +385,22 @@ class CurriculumConfig:
             )
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
+        if self.run_block_size < 1:
+            raise ValueError(f"run_block_size must be >= 1, got {self.run_block_size}")
+        if self.prefetch_blocks < 0:
+            raise ValueError(
+                f"prefetch_blocks must be >= 0, got {self.prefetch_blocks}"
+            )
+        if self.block_builders < 1:
+            raise ValueError(f"block_builders must be >= 1, got {self.block_builders}")
+        if self.builder_threads < 1:
+            raise ValueError(
+                f"builder_threads must be >= 1, got {self.builder_threads}"
+            )
+        if self.light_build_workers < 1:
+            raise ValueError(
+                f"light_build_workers must be >= 1, got {self.light_build_workers}"
+            )
 
         # Validate schedule phases don't overlap
         for i, phase in enumerate(self.schedule):
@@ -498,6 +568,20 @@ class SIRPhysicsConfig:
     hospital_mortality_max: float = 0.1
     # Physics residual clipping at source (prevents extreme gradients)
     residual_clip: float = 1e4
+    # Days of the input window the latent is rolled through before the forecast
+    # origin. 0 starts the roll-forward at the origin; a positive value places
+    # the initial state that many days earlier, with per-day history rates.
+    rollforward_history_steps: int = 0
+    # "all": all six rates vary per step. "beta": only the transmission rate
+    # varies; the other five are constant over a window.
+    time_varying_rates: str = "all"
+    # "mass_action": infections are beta*S*I. "renewal": infections are
+    # R_t * S * sum_s g_s * incidence_{t-s} with R_t = beta/(gamma+alpha+mu_I)
+    # and g a discretized Gamma generation interval.
+    force_of_infection: str = "mass_action"
+    generation_interval_mean: float = 5.0
+    generation_interval_sd: float = 2.0
+    generation_interval_length: int = 14
 
     def __post_init__(self) -> None:
         if self.dt <= 0:
@@ -535,6 +619,32 @@ class SIRPhysicsConfig:
         if self.residual_clip <= 0:
             raise ValueError(
                 f"residual_clip must be positive, got {self.residual_clip}"
+            )
+        if self.rollforward_history_steps < 0:
+            raise ValueError(
+                "rollforward_history_steps must be non-negative, "
+                f"got {self.rollforward_history_steps}"
+            )
+        if self.time_varying_rates not in {"all", "beta"}:
+            raise ValueError(
+                "time_varying_rates must be 'all' or 'beta', "
+                f"got {self.time_varying_rates!r}"
+            )
+        if self.force_of_infection not in {"mass_action", "renewal"}:
+            raise ValueError(
+                "force_of_infection must be 'mass_action' or 'renewal', "
+                f"got {self.force_of_infection!r}"
+            )
+        if self.generation_interval_mean <= 0 or self.generation_interval_sd <= 0:
+            raise ValueError(
+                "generation_interval_mean and generation_interval_sd must be "
+                f"positive, got {self.generation_interval_mean} and "
+                f"{self.generation_interval_sd}"
+            )
+        if self.generation_interval_length < 1:
+            raise ValueError(
+                "generation_interval_length must be >= 1, "
+                f"got {self.generation_interval_length}"
             )
 
 
@@ -624,6 +734,19 @@ class ObservationHeadConfig:
     # Predictive distribution scale in the existing log1p(per-100k) target space.
     distribution_scale_init: float = 0.3
     distribution_scale_floor: float = 1.0e-3
+    # Population-dependent scale floor per clinical head, as a fraction of the
+    # log1p(per-100k) value of one count in the target region,
+    # log1p(100000 / population). Zero keeps distribution_scale_floor alone; a
+    # positive fraction applies max(distribution_scale_floor, fraction * step).
+    # Only meaningful for a head whose targets are integer counts of the region.
+    count_step_scale_floor_hosp: float = 0.0
+    count_step_scale_floor_cases: float = 0.0
+    count_step_scale_floor_deaths: float = 0.0
+    # When true every head's predictive distribution is a Normal censored at
+    # zero: `dist_<head>_loc` is the latent location and may be negative,
+    # `pred_<head>` is the censored median max(location, 0), and NLL and CRPS are
+    # the scores of the censored distribution. Requires the normal family.
+    censored_location: bool = False
 
     # Residual connection settings
     residual_mode: str = "additive"  # "additive" | "modulation"
@@ -634,6 +757,20 @@ class ObservationHeadConfig:
     # Heads in this set have no direct observation-context residual path. The
     # mechanistic signal and its learnable delay/scale remain active.
     residual_disabled_heads: list[str] = field(default_factory=list)
+    # Heads in this set predict from the observation-context residual alone:
+    # their mechanistic log location is an exact zero (black-box control).
+    mechanistic_disabled_heads: list[str] = field(default_factory=list)
+    # Latent consumed by the wastewater shedding convolution: "I" (prevalence)
+    # or "infection_flow" (incidence, as in renewal-based wastewater models).
+    ww_source: str = "I"
+    # Latent consumed by the cases delay kernel: "I" (prevalence) or
+    # "infection_flow" (incidence).
+    cases_source: str = "I"
+    # Real hospitalizations are weekly totals dated on their week start. When
+    # true the hospitalization head predicts the admission flow summed over days
+    # h..h+6 instead of one day's flow; the roll-forward runs six days past the
+    # horizon with the last rates held.
+    hosp_week_total: bool = False
 
     # Observation context dimension
     obs_context_dim: int = 96
@@ -718,13 +855,44 @@ class ObservationHeadConfig:
             raise ValueError(
                 f"residual_scale must be non-negative, got {self.residual_scale}"
             )
-        invalid_residual_heads = set(self.residual_disabled_heads).difference(
-            {"ww", "hosp", "cases", "deaths"}
+        for field_name, heads in (
+            ("residual_disabled_heads", self.residual_disabled_heads),
+            ("mechanistic_disabled_heads", self.mechanistic_disabled_heads),
+        ):
+            invalid_heads = set(heads).difference({"ww", "hosp", "cases", "deaths"})
+            if invalid_heads:
+                raise ValueError(
+                    f"{field_name} must contain only 'ww', 'hosp', 'cases', "
+                    f"or 'deaths', got {sorted(invalid_heads)!r}"
+                )
+        silent_heads = set(self.residual_disabled_heads).intersection(
+            self.mechanistic_disabled_heads
         )
-        if invalid_residual_heads:
+        if silent_heads:
             raise ValueError(
-                "residual_disabled_heads must contain only 'ww', 'hosp', 'cases', "
-                f"or 'deaths', got {sorted(invalid_residual_heads)!r}"
+                "A head cannot disable both its residual and mechanistic paths, "
+                f"got {sorted(silent_heads)!r}"
+            )
+        if self.ww_source not in {"I", "infection_flow"}:
+            raise ValueError(
+                f"ww_source must be 'I' or 'infection_flow', got {self.ww_source!r}"
+            )
+        if self.relevant_source_ww != self.ww_source:
+            raise ValueError(
+                "relevant_source_ww must equal ww_source so latent indicators "
+                f"use the latent the head consumes, got {self.relevant_source_ww!r} "
+                f"and {self.ww_source!r}"
+            )
+        if self.cases_source not in {"I", "infection_flow"}:
+            raise ValueError(
+                "cases_source must be 'I' or 'infection_flow', "
+                f"got {self.cases_source!r}"
+            )
+        if self.relevant_source_cases != self.cases_source:
+            raise ValueError(
+                "relevant_source_cases must equal cases_source so latent "
+                "indicators use the latent the head consumes, got "
+                f"{self.relevant_source_cases!r} and {self.cases_source!r}"
             )
 
         if self.residual_hidden_dim <= 0:
@@ -758,11 +926,20 @@ class ObservationHeadConfig:
                 "distribution_scale_floor must be positive, "
                 f"got {self.distribution_scale_floor}"
             )
+        for name, fraction in (
+            ("count_step_scale_floor_hosp", self.count_step_scale_floor_hosp),
+            ("count_step_scale_floor_cases", self.count_step_scale_floor_cases),
+            ("count_step_scale_floor_deaths", self.count_step_scale_floor_deaths),
+        ):
+            if not math.isfinite(float(fraction)) or fraction < 0:
+                raise ValueError(
+                    f"{name} must be finite and non-negative, got {fraction}"
+                )
 
         valid_relevant_sources = {
             "hosp": {"hospitalization_flow", "H"},
-            "ww": {"I"},
-            "cases": {"I"},
+            "ww": {"I", "infection_flow"},
+            "cases": {"I", "infection_flow"},
             "deaths": {"death_flow", "D"},
         }
         for head_name, source_name in self.relevant_source_mapping().items():
@@ -1035,6 +1212,23 @@ class ModelConfig:
                 f"{POSITIONAL_ENCODING_TYPES}, got {self.head_positional_encoding!r}"
             )
 
+        history_steps = self.sir_physics.rollforward_history_steps
+        if history_steps > 0:
+            heads = self.observation_heads
+            longest_kernel = max(
+                heads.kernel_length_ww,
+                heads.kernel_length_hosp,
+                heads.kernel_length_cases,
+                heads.kernel_length_deaths,
+            )
+            if not longest_kernel <= history_steps < self.input_window_length:
+                raise ValueError(
+                    "sir_physics.rollforward_history_steps must be at least the "
+                    f"longest observation kernel ({longest_kernel}) and below "
+                    f"input_window_length ({self.input_window_length}), "
+                    f"got {history_steps}"
+                )
+
 
 @dataclass
 class TrainingParams:
@@ -1092,6 +1286,11 @@ class TrainingParams:
     # Optional persisted exactly-once region membership. Production cross-validation
     # should use a checked-in manifest rather than regenerating folds per model seed.
     crossval_manifest_path: str | None = None
+    # Optional manifest region set (a key of the manifest's region_sets) that
+    # limits training and validation regions. Every fold region stays in the
+    # test role, so conditions with different training populations are scored
+    # on identical held-out support.
+    crossval_region_set: str | None = None
     # Which held-out fold the configured crossval_fold_index represents.
     # Validation always uses the next fold cyclically.
     crossval_holdout_role: str = "test"
@@ -1529,6 +1728,29 @@ class EpiForecasterConfig:
     training: TrainingParams = MISSING
     output: OutputConfig = MISSING
     env: str | None = None
+
+    def __post_init__(self) -> None:
+        # Structured-schema construction leaves blocks as MISSING placeholders.
+        if not isinstance(self.model, ModelConfig) or not isinstance(
+            self.training, TrainingParams
+        ):
+            return
+        joint = self.training.loss.joint
+        if (
+            joint.history_reconstruction_weight > 0
+            and self.model.sir_physics.rollforward_history_steps == 0
+        ):
+            raise ValueError(
+                "training.loss.joint.history_reconstruction_weight requires "
+                "model.sir_physics.rollforward_history_steps > 0"
+            )
+        disabled = self.model.observation_heads.mechanistic_disabled_heads
+        if joint.residual_penalty_weight > 0 and disabled:
+            raise ValueError(
+                "training.loss.joint.residual_penalty_weight penalizes the whole "
+                "prediction of a head without a mechanistic path; got "
+                f"mechanistic_disabled_heads={sorted(disabled)!r}"
+            )
 
     @classmethod
     def _reject_obsolete_mobility_fields(cls, data_dict: dict) -> None:

@@ -27,6 +27,7 @@ if sys_path not in __import__("sys").path:
     __import__("sys").path.append(sys_path)
 
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
+from data.preprocess.zarr_layout import open_zarr_store  # noqa: E402
 from utils.plotting import (  # noqa: E402
     Colors,
     Colormaps,
@@ -50,7 +51,7 @@ def _is_biomarker_value_var(name: str) -> bool:
 def _load_biomarkers(
     dataset_path: Path,
 ) -> tuple[dict[str, xr.DataArray], np.ndarray | None]:
-    dataset = xr.open_zarr(dataset_path)
+    dataset = open_zarr_store(dataset_path)
     variant_vars: dict[str, xr.DataArray] = {}
     for name in dataset.data_vars:
         name_str = str(name)
@@ -544,7 +545,7 @@ def plot_time_window_zoom(
 
 
 def plot_manuscript_support_summary(dataset_path: Path, output_path: Path) -> None:
-    dataset = xr.open_zarr(dataset_path)
+    dataset = open_zarr_store(dataset_path)
     source = dataset["edar_has_source"].values.astype(bool)
     total_regions = int(dataset.sizes[REGION_COORD])
     source_regions = int(source.sum())
@@ -964,7 +965,7 @@ def main() -> None:
 
         manuscript_mask: np.ndarray | None = None
         if args.manuscript_plots:
-            dataset = xr.open_zarr(args.dataset)
+            dataset = open_zarr_store(args.dataset)
             mask = _load_mask(dataset, variant_name)
             if mask is not None:
                 mask = mask.sel({REGION_COORD: region_ids})

@@ -329,6 +329,22 @@ def _set_residual_log_location_fraction_buffer(
         buffer.fill_(value)
 
 
+def _require_mechanistic_for_residual_budget(
+    module: nn.Module,
+    max_log_location_fraction: float | None,
+) -> None:
+    """Reject a relative residual budget on a head without a mechanistic path.
+
+    The budget is relative to the mechanistic log location, so on such a head
+    any finite budget would silence the prediction entirely.
+    """
+    if max_log_location_fraction is not None and not module._mechanistic_enabled:
+        raise ValueError(
+            "A residual log-location budget requires the mechanistic path; "
+            f"{type(module).__name__} has it disabled."
+        )
+
+
 def _compose_observation_prediction(
     *,
     mechanistic_raw: torch.Tensor,
@@ -337,13 +353,15 @@ def _compose_observation_prediction(
     anchor_mode: str,
     last_observed: torch.Tensor | None,
     last_observed_mask: torch.Tensor | None,
+    censored_location: bool,
 ) -> dict[str, torch.Tensor]:
     """Compose an exact mechanistic-plus-residual observation decomposition.
 
     For anchored delta forecasts, the mechanistic output is the prediction obtained
     with the residual path disabled. The residual contribution is defined as the
     exact difference between the full and residual-disabled predictions, including
-    interactions with the non-negativity clamp.
+    interactions with the non-negativity clamp. A censored head leaves the
+    anchored location unclamped; ``_split_distribution_location`` clips it.
     """
     full_raw = mechanistic_raw + residual_raw
     full = full_raw
@@ -362,14 +380,11 @@ def _compose_observation_prediction(
             posinf=0.0,
             neginf=0.0,
         ).unsqueeze(1)
-        full_anchored = torch.clamp(
-            last_obs_safe + full_raw - full_raw[:, 0:1],
-            min=0.0,
-        )
-        mechanistic_anchored = torch.clamp(
-            last_obs_safe + mechanistic_raw - mechanistic_raw[:, 0:1],
-            min=0.0,
-        )
+        full_anchored = last_obs_safe + full_raw - full_raw[:, 0:1]
+        mechanistic_anchored = last_obs_safe + mechanistic_raw - mechanistic_raw[:, 0:1]
+        if not censored_location:
+            full_anchored = full_anchored.clamp(min=0.0)
+            mechanistic_anchored = mechanistic_anchored.clamp(min=0.0)
         full = torch.where(valid_mask, full_anchored, full_raw)
         mechanistic = torch.where(
             valid_mask,
@@ -383,6 +398,24 @@ def _compose_observation_prediction(
         "mechanistic_loc": mechanistic,
         "residual_loc": residual,
     }
+
+
+def _split_distribution_location(
+    components: dict[str, torch.Tensor], censored_location: bool
+) -> None:
+    """Add ``distribution_loc``, the location of the predictive distribution.
+
+    A censored head keeps the composed location as that of a Normal censored at
+    zero, which may be negative, and reports the censored median
+    ``max(location, 0)`` as the point prediction ``loc``. The mechanistic
+    component is clipped likewise, so the residual stays the exact difference
+    between the full and residual-disabled predictions.
+    """
+    components["distribution_loc"] = components["loc"]
+    if censored_location:
+        components["loc"] = components["loc"].clamp_min(0.0)
+        components["mechanistic_loc"] = components["mechanistic_loc"].clamp_min(0.0)
+        components["residual_loc"] = components["loc"] - components["mechanistic_loc"]
 
 
 class DelayKernel(nn.Module):
@@ -1047,6 +1080,9 @@ class ClinicalObservationHead(nn.Module):
         alpha_init: Initial weight for residual connection
         residual_enabled: When False, retain the residual projection but freeze its
             contribution at zero.
+        mechanistic_enabled: When False, the mechanistic log location is an
+            exact zero, so the prediction is the (anchored) residual alone. The
+            kernel and scale stay present but receive no gradient.
 
     """
 
@@ -1062,21 +1098,42 @@ class ClinicalObservationHead(nn.Module):
         residual_dim: int = 0,
         alpha_init: float = 0.1,
         residual_enabled: bool = True,
+        mechanistic_enabled: bool = True,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
         kernel_mlp: bool = False,
         distribution_scale_init: float = 0.3,
         distribution_scale_floor: float = 1.0e-3,
+        count_step_scale_floor: float = 0.0,
+        censored_location: bool = False,
+        aggregation_window: int = 1,
     ):
         super().__init__()
+
+        if aggregation_window < 1:
+            raise ValueError(
+                f"aggregation_window must be >= 1, got {aggregation_window}"
+            )
+        # Output k is the scaled source summed over steps k..k+window-1, so the
+        # source must extend window-1 steps past the last output.
+        self.aggregation_window = aggregation_window
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
         self.distribution_scale_floor = float(distribution_scale_floor)
+        # Fraction of the log1p(per-100k) value of one count in the target
+        # region, log1p(100000 / population), used as a population-dependent
+        # floor of the predictive scale. Zero keeps the constant floor.
+        self.count_step_scale_floor = float(count_step_scale_floor)
+        self.censored_location = censored_location
         if distribution_scale_init <= 0:
             raise ValueError("distribution_scale_init must be positive")
         if distribution_scale_floor <= 0:
             raise ValueError("distribution_scale_floor must be positive")
+        if not math.isfinite(self.count_step_scale_floor) or (
+            self.count_step_scale_floor < 0
+        ):
+            raise ValueError("count_step_scale_floor must be finite and non-negative")
 
         if kernel_mlp:
             self.delay_kernel = MLPKernel(kernel_length=kernel_length, hidden_dim=32)
@@ -1115,6 +1172,7 @@ class ClinicalObservationHead(nn.Module):
             self.alpha = None
         # Immutable static disable: survives checkpoint alpha state loading.
         self._residual_location_enabled = residual_enabled
+        self._mechanistic_enabled = mechanistic_enabled
         _register_residual_log_location_fraction_buffer(self)
 
         self.log_distribution_scale = nn.Parameter(
@@ -1178,8 +1236,15 @@ class ClinicalObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
     ) -> dict[str, torch.Tensor]:
-        """Return the full, mechanistic-only, and residual prediction components."""
+        """Return the full, mechanistic-only, and residual prediction components.
+
+        ``I_trajectory`` may start ``origin_index`` steps before the forecast
+        origin. The prediction covers the steps from the origin on;
+        ``mechanistic_rollforward`` is the unanchored mechanistic log location of
+        every step.
+        """
         out_dtype = I_trajectory.dtype
         with _autocast_disabled_for(I_trajectory):
             delayed_infections = self.delay_kernel(I_trajectory.to(torch.float32))
@@ -1188,13 +1253,18 @@ class ClinicalObservationHead(nn.Module):
             if scale.dtype != per_100k.dtype:
                 scale = scale.to(per_100k.dtype)
             scaled = per_100k * scale
+            if self.aggregation_window > 1:
+                scaled = scaled.unfold(1, self.aggregation_window, 1).sum(dim=-1)
             scaled = torch.nan_to_num(
                 scaled,
                 nan=0.0,
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            mechanistic_raw = torch.log1p(scaled)
+            mechanistic_rollforward = torch.log1p(scaled)
+            if not self._mechanistic_enabled:
+                mechanistic_rollforward = torch.zeros_like(mechanistic_rollforward)
+        mechanistic_raw = mechanistic_rollforward[:, origin_index:]
 
         # Pre-bound residual raw: the parameter-side intermediate probed by
         # pathway-gradient telemetry. A statically disabled head contributes
@@ -1222,16 +1292,19 @@ class ClinicalObservationHead(nn.Module):
             anchor_mode=self.anchor_mode,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            censored_location=self.censored_location,
         )
         _bound_composed_residual(
             components,
             self.get_buffer("_residual_max_log_location_fraction"),
         )
+        _split_distribution_location(components, self.censored_location)
         output_components = {
             key: value if value.dtype == out_dtype else value.to(out_dtype)
             for key, value in components.items()
         }
         output_components["residual_input"] = residual_raw
+        output_components["mechanistic_rollforward"] = mechanistic_rollforward
         return output_components
 
     def forward_distribution(
@@ -1240,6 +1313,8 @@ class ClinicalObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
+        population: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
         components = self.forward_components(
@@ -1247,9 +1322,12 @@ class ClinicalObservationHead(nn.Module):
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            origin_index=origin_index,
         )
-        loc = components["loc"]
-        scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
+        loc = components["distribution_loc"]
+        scale = self.get_distribution_scale(
+            obs_context=obs_context, like=loc, population=population
+        )
         return {**components, "scale": scale}
 
     def get_scale(self) -> torch.Tensor:
@@ -1282,6 +1360,7 @@ class ClinicalObservationHead(nn.Module):
         head keeps its exact zero contribution even though its projection
         module remains present for structural compatibility.
         """
+        _require_mechanistic_for_residual_budget(self, max_log_location_fraction)
         _set_residual_log_location_fraction_buffer(
             self,
             max_log_location_fraction,
@@ -1292,16 +1371,36 @@ class ClinicalObservationHead(nn.Module):
         *,
         obs_context: torch.Tensor | None,
         like: torch.Tensor,
+        population: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Get positive predictive scale aligned to ``like``."""
+        floor = self._scale_floor(population)
         if self.distribution_scale_proj is not None and obs_context is not None:
             raw_scale = self.distribution_scale_proj(obs_context).squeeze(-1)
-            scale = F.softplus(raw_scale.float()) + self.distribution_scale_floor
+            scale = F.softplus(raw_scale.float()) + floor
         else:
             base = _safe_exp_from_log(self.log_distribution_scale).to(like.dtype)
-            scale = base + self.distribution_scale_floor
-            scale = scale.expand_as(like)
+            scale = (base + floor).expand_as(like)
         return scale.to(like.dtype)
+
+    def _scale_floor(self, population: torch.Tensor | None) -> torch.Tensor | float:
+        """Scale floor: the constant floor, or one per sample ``[B, 1]``.
+
+        A count of one in a region of ``N`` residents is ``log1p(100000 / N)`` in
+        target space, so a forecast sitting on zero with a collapsed scale misses
+        the next single count by that distance. Flooring the scale at a fraction
+        ``f`` of the count step bounds that miss at ``1 / f`` standard deviations
+        for every population.
+        """
+        if self.count_step_scale_floor == 0.0:
+            return self.distribution_scale_floor
+        if population is None:
+            raise ValueError("count_step_scale_floor requires the target population")
+        count_step = torch.log1p(100_000.0 / population.float().clamp_min(1.0))
+        floor = (self.count_step_scale_floor * count_step).clamp_min(
+            self.distribution_scale_floor
+        )
+        return floor.unsqueeze(-1)
 
     def __repr__(self) -> str:
         return (
@@ -1333,6 +1432,7 @@ class WastewaterObservationHead(nn.Module):
         learnable_scale: If True, scale is trainable
         residual_dim: Dimension of observation context for residual
         alpha_init: Initial weight for residual connection
+        mechanistic_enabled: See ``ClinicalObservationHead``.
     """
 
     def __init__(
@@ -1347,18 +1447,21 @@ class WastewaterObservationHead(nn.Module):
         residual_dim: int = 0,
         alpha_init: float = 0.1,
         residual_enabled: bool = True,
+        mechanistic_enabled: bool = True,
         strict: bool = True,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
         kernel_mlp: bool = False,
         distribution_scale_init: float = 0.3,
         distribution_scale_floor: float = 1.0e-3,
+        censored_location: bool = False,
     ):
         super().__init__()
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
         self.distribution_scale_floor = float(distribution_scale_floor)
+        self.censored_location = censored_location
         if distribution_scale_init <= 0:
             raise ValueError("distribution_scale_init must be positive")
         if distribution_scale_floor <= 0:
@@ -1405,6 +1508,7 @@ class WastewaterObservationHead(nn.Module):
 
         # Immutable static disable: survives checkpoint alpha state loading.
         self._residual_location_enabled = residual_enabled
+        self._mechanistic_enabled = mechanistic_enabled
         _register_residual_log_location_fraction_buffer(self)
 
         self.log_distribution_scale = nn.Parameter(
@@ -1473,8 +1577,12 @@ class WastewaterObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
     ) -> dict[str, torch.Tensor]:
-        """Return the full, mechanistic-only, and residual prediction components."""
+        """Return the full, mechanistic-only, and residual prediction components.
+
+        See ``ClinicalObservationHead.forward_components`` for ``origin_index``.
+        """
         out_dtype = I_trajectory.dtype
         viral_load = self.shedding_conv(I_trajectory.to(torch.float32), population)
 
@@ -1490,7 +1598,10 @@ class WastewaterObservationHead(nn.Module):
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            mechanistic_raw = torch.log1p(scaled)
+            mechanistic_rollforward = torch.log1p(scaled)
+            if not self._mechanistic_enabled:
+                mechanistic_rollforward = torch.zeros_like(mechanistic_rollforward)
+        mechanistic_raw = mechanistic_rollforward[:, origin_index:]
 
         # Pre-bound residual raw: the parameter-side intermediate probed by
         # pathway-gradient telemetry. A statically disabled head contributes
@@ -1518,16 +1629,19 @@ class WastewaterObservationHead(nn.Module):
             anchor_mode=self.anchor_mode,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            censored_location=self.censored_location,
         )
         _bound_composed_residual(
             components,
             self.get_buffer("_residual_max_log_location_fraction"),
         )
+        _split_distribution_location(components, self.censored_location)
         output_components = {
             key: value if value.dtype == out_dtype else value.to(out_dtype)
             for key, value in components.items()
         }
         output_components["residual_input"] = residual_raw
+        output_components["mechanistic_rollforward"] = mechanistic_rollforward
         return output_components
 
     def forward_distribution(
@@ -1537,6 +1651,7 @@ class WastewaterObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
         components = self.forward_components(
@@ -1545,8 +1660,9 @@ class WastewaterObservationHead(nn.Module):
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            origin_index=origin_index,
         )
-        loc = components["loc"]
+        loc = components["distribution_loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
         return {**components, "scale": scale}
 
@@ -1576,6 +1692,7 @@ class WastewaterObservationHead(nn.Module):
         See
         ``ClinicalObservationHead.set_residual_max_log_location_fraction``.
         """
+        _require_mechanistic_for_residual_budget(self, max_log_location_fraction)
         _set_residual_log_location_fraction_buffer(
             self,
             max_log_location_fraction,

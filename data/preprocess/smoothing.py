@@ -13,11 +13,12 @@ import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 if TYPE_CHECKING:
-    import pandas as pd
+    from .config import SmoothingConfig
 
 
 def fit_kalman_params(
@@ -40,8 +41,6 @@ def fit_kalman_params(
         ValueError: If no finite positive observations available for fitting
     """
     if fit_end_date is not None:
-        import pandas as pd
-
         if not isinstance(series.index, pd.DatetimeIndex):
             raise ValueError("Dated Kalman fitting requires a DatetimeIndex")
         cutoff = pd.Timestamp(fit_end_date)
@@ -93,6 +92,11 @@ class KalmanSmoother:
     Missing policy:
     - "predict": pure one-step prediction through missing spans
     - "momentum": decayed slope extrapolation using last two non-missing updates
+
+    Re-entry: after ``reentry_min_gap`` or more consecutive missing steps the
+    gain of the next ``reentry_steps`` observations is capped at
+    ``reentry_gain_cap``. Set ``reentry_min_gap`` above the sampling interval of
+    a series that is not observed daily; otherwise every observation is capped.
     """
 
     def __init__(
@@ -106,6 +110,7 @@ class KalmanSmoother:
         innovation_clip_sigma: float = 2.5,
         reentry_gain_cap: float = 0.35,
         reentry_steps: int = 2,
+        reentry_min_gap: int = 1,
         process_var_floor: float = 1e-6,
         measurement_var_floor: float = 1e-6,
     ) -> None:
@@ -118,6 +123,7 @@ class KalmanSmoother:
         self.innovation_clip_sigma = float(innovation_clip_sigma)
         self.reentry_gain_cap = float(reentry_gain_cap)
         self.reentry_steps = int(reentry_steps)
+        self.reentry_min_gap = int(reentry_min_gap)
 
         self.process_var_floor = float(process_var_floor)
         self.measurement_var_floor = float(measurement_var_floor)
@@ -161,7 +167,8 @@ class KalmanSmoother:
             self.state_var = pred_var
 
         self._consecutive_missing += 1
-        self._reentry_remaining = self.reentry_steps
+        if self._consecutive_missing >= self.reentry_min_gap:
+            self._reentry_remaining = self.reentry_steps
 
     def _apply_observed_update(
         self,
@@ -251,7 +258,8 @@ class TobitKalmanSmoother:
     Causal Tobit-Kalman filter for censored wastewater time series.
 
     Extends Kalman filtering to handle left-censored observations
-    (values below detection limit) while preserving causal updates.
+    (values below detection limit) while preserving causal updates. Re-entry
+    capping follows ``KalmanSmoother``.
     """
 
     def __init__(
@@ -266,6 +274,7 @@ class TobitKalmanSmoother:
         innovation_clip_sigma: float = 2.5,
         reentry_gain_cap: float = 0.35,
         reentry_steps: int = 2,
+        reentry_min_gap: int = 1,
         process_var_floor: float = 1e-6,
         measurement_var_floor: float = 1e-6,
     ) -> None:
@@ -278,6 +287,7 @@ class TobitKalmanSmoother:
         self.innovation_clip_sigma = float(innovation_clip_sigma)
         self.reentry_gain_cap = float(reentry_gain_cap)
         self.reentry_steps = int(reentry_steps)
+        self.reentry_min_gap = int(reentry_min_gap)
 
         self.process_var_floor = float(process_var_floor)
         self.measurement_var_floor = float(measurement_var_floor)
@@ -321,7 +331,8 @@ class TobitKalmanSmoother:
             self.state_var = pred_var
 
         self._consecutive_missing += 1
-        self._reentry_remaining = self.reentry_steps
+        if self._consecutive_missing >= self.reentry_min_gap:
+            self._reentry_remaining = self.reentry_steps
 
     def _apply_measurement_update(
         self,
@@ -503,3 +514,91 @@ class DampedHoltSmoother:
             filtered.append(float(self.level))
 
         return filtered, flags
+
+
+def fill_clinical_gaps(
+    daily_df: pd.DataFrame,
+    value_col: str,
+    smoothing: SmoothingConfig,
+    *,
+    fallback_process_var: float,
+    fallback_measurement_var: float,
+) -> pd.DataFrame:
+    """Fill the unobserved days of a daily clinical count table causally.
+
+    ``daily_df`` has columns ``date``, ``municipality_code`` and ``value_col``.
+    Every finite value, zero included, is an observation and is returned
+    unchanged; NaN marks an unobserved day. Unobserved days after the first
+    observation of a municipality are filled by ``smoothing.clinical_method``;
+    days before it stay NaN.
+
+    - ``locf`` carries the last observation forward.
+    - ``kalman_v2`` and ``holt_damped`` fill with the filter level. They work in
+      log space and skip zero observations, so their fill after an observed
+      zero is the level of the last positive counts, and NaN before the first
+      positive count.
+
+    Returns ``date``, ``municipality_code``, ``value_col`` and
+    ``{value_col}_observed`` (1.0 on observed days).
+    """
+    method = smoothing.clinical_method
+    frames: list[pd.DataFrame] = []
+    for muni_code, muni_data in daily_df.groupby("municipality_code", sort=False):
+        series = muni_data.set_index("date")[value_col].sort_index().astype(float)
+        values = series.to_numpy()
+        observed = np.isfinite(values)
+
+        if method == "locf":
+            filled = series.ffill().to_numpy()
+        else:
+            if method == "kalman_v2":
+                process_var = fallback_process_var
+                measurement_var = fallback_measurement_var
+                if smoothing.parameter_fit_mode == "per_series":
+                    try:
+                        process_var, measurement_var = fit_kalman_params(
+                            series.where(series > 0),
+                            fit_end_date=smoothing.parameter_fit_end_date,
+                        )
+                    except Exception as e:
+                        print(
+                            "    ! Falling back to configured variances for "
+                            f"{muni_code}: {e}"
+                        )
+                smoother: KalmanSmoother | DampedHoltSmoother = KalmanSmoother(
+                    process_var=process_var,
+                    measurement_var=measurement_var,
+                    missing_policy=smoothing.missing_policy,
+                    momentum_decay=smoothing.momentum_decay,
+                    momentum_max_steps=smoothing.momentum_max_steps,
+                    innovation_clip_sigma=smoothing.innovation_clip_sigma,
+                    reentry_gain_cap=smoothing.reentry_gain_cap,
+                    reentry_steps=smoothing.reentry_steps,
+                    reentry_min_gap=smoothing.reentry_min_gap,
+                    process_var_floor=smoothing.process_var_floor,
+                    measurement_var_floor=smoothing.measurement_var_floor,
+                )
+            elif method == "holt_damped":
+                smoother = DampedHoltSmoother(
+                    alpha=smoothing.holt_alpha,
+                    beta=smoothing.holt_beta,
+                    phi=smoothing.holt_phi,
+                    missing_trend_decay=smoothing.holt_missing_trend_decay,
+                )
+            else:
+                raise ValueError(f"Unsupported clinical smoothing method: {method}")
+            filtered_log, _ = smoother.filter_series(values)
+            filled = np.where(observed, values, np.exp(filtered_log))
+
+        frames.append(
+            pd.DataFrame(
+                {
+                    "date": series.index,
+                    "municipality_code": muni_code,
+                    value_col: filled,
+                    f"{value_col}_observed": observed.astype(float),
+                }
+            )
+        )
+
+    return pd.concat(frames, ignore_index=True)

@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
+from evaluation.distribution_scores import clipped_interval
 from evaluation.metrics import interval_level_name, standard_interval_half_width
 from utils.device import prepare_batch_for_device
 from utils.plotting import Palette
@@ -245,8 +246,9 @@ def _aligned_distribution_intervals(
             )
             * scale_series
         )
-        intervals[f"interval_low_{level_name}"] = loc_series - half_width
-        intervals[f"interval_high_{level_name}"] = loc_series + half_width
+        low, high = clipped_interval(loc_series, half_width)
+        intervals[f"interval_low_{level_name}"] = low
+        intervals[f"interval_high_{level_name}"] = high
     return intervals
 
 

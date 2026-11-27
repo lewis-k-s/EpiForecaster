@@ -8,7 +8,7 @@ The layout gives parallel writes during preprocessing, fast per-run reads
 during dataset construction, and one DVC object per dataset. The `mobility`
 variable is about 97% of the stored bytes, so its encoding sets the size.
 
-The real dataset (`real_with_id.zarr`) is not in this layout.
+The real dataset (`real_with_id.zarr.zip`) is not in this layout.
 
 ## 1. Why one packed file
 
@@ -97,24 +97,39 @@ matrices. This is not done.
 
 ## 3. Parallel write
 
-1. Write the template metadata with `to_zarr(compute=False)` into a directory
-   store on node-local NVMe. The `node_local_output` option does this.
-2. A process pool with W workers does the per-run work. For each run, a worker:
-   - reads the raw run;
-   - applies the existing transforms;
-   - runs the per-run QA;
-   - writes `region={"run_id": slice(i, i + 1)}`;
-   - returns its QA summary.
-3. The coordinator then does the remaining steps in order:
-   - write the run-level arrays;
-   - merge the per-run QA into `qa.json`;
-   - consolidate the metadata;
-   - pack the store into the ZIP64 file on local disk;
-   - compute sha256;
-   - copy the file into the attempt directory on GPFS.
+Every step of the synthetic preprocessing works on each run separately, so
+`data/preprocess/synthetic_runs.py` builds the corpus one run per process:
 
-Each worker needs about 6 GB: one dense run (1.6 GB) plus temporary arrays.
-Size `preprocessing.write_workers` from the node memory.
+1. The coordinator opens the raw corpus lazily, applies the run exclusions,
+   validates the schema and runs the mobility layout QA over a spread sample
+   of the whole corpus.
+2. It builds the first run to define the output (variables, dtypes,
+   attributes and the values without `run_id`), expands it to every run and
+   writes the template metadata into a directory store on node-local NVMe (the
+   `node_local_output` option). Dask-backed variables become empty arrays in
+   the template, so creating the store builds no task graph of the data.
+3. `preprocessing.write_workers` spawned processes each open the raw corpus
+   once. For each run, a worker:
+   - extracts, aligns and transforms that run alone;
+   - computes its positive-preservation counts;
+   - writes `region={"run_id": slice(i, i + 1)}`, mobility from one
+     preallocated array;
+   - reads every written region back and compares it, mobility in date slabs;
+   - checks that its variables without `run_id` equal the template's;
+   - returns its run-level values and counts.
+4. The coordinator writes the run-level arrays, sums the positive-preservation
+   counts into `positive_clinical_preservation_json` and packs the store into
+   the ZIP64 file with 16 MiB copy blocks.
+
+The workflow then copies the file into the attempt directory on GPFS. The
+packed dataset is identified by its byte size until publication; `dvc add`
+computes its MD5 once, and nothing else hashes the payload.
+
+A worker holds one run: 1.6 GB of mobility plus about 1.4 GB of other arrays
+and interpreter. Size `preprocessing.write_workers` from the memory of the
+allocation; the CPUs are shared out as `cpus // write_workers` Zarr codec
+threads per worker, which compress the inner chunks of a run in parallel.
+Spawned workers have one BLAS/OpenMP thread each.
 
 ## 4. BitRound
 

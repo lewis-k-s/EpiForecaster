@@ -8,6 +8,11 @@ SIF=""
 CPUS=""
 WORKER_GROUP=""
 WORKER_OFFSET="0"
+MPS_CLIENTS_PER_GPU="1"
+MPS_ROOT=""
+MPS_PIPE=""
+MPS_GPU_INDEX=""
+MPS_LEADER=0
 SCIENTIFIC_COMMAND=()
 CONTINUATION_EXIT_CODE=75
 
@@ -15,7 +20,8 @@ CONTINUATION_EXIT_CODE=75
 usage() {
   cat <<EOF
 Usage: $(basename "$0") --run-root PATH --source-root PATH --sif PATH \
-  --cpus N --worker-group NAME --worker-offset N -- COMMAND [ARG...]
+  --cpus N --worker-group NAME --worker-offset N \
+  [--mps-clients-per-gpu K] -- COMMAND [ARG...]
 EOF
 }
 
@@ -45,6 +51,10 @@ parse_arguments() {
         ;;
       --worker-offset)
         WORKER_OFFSET="$2"
+        shift 2
+        ;;
+      --mps-clients-per-gpu)
+        MPS_CLIENTS_PER_GPU="$2"
         shift 2
         ;;
       --)
@@ -79,6 +89,90 @@ validate_arguments() {
     echo "Worker offset must be a non-negative integer: $WORKER_OFFSET" >&2
     return 2
   fi
+  if [[ ! "$MPS_CLIENTS_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MPS clients per GPU must be a positive integer: $MPS_CLIENTS_PER_GPU" >&2
+    return 2
+  fi
+  if [ "$MPS_CLIENTS_PER_GPU" -gt 1 ] && [ "$WORKER_OFFSET" != "0" ]; then
+    echo "MPS packing requires every worker rank in one wave" >&2
+    return 2
+  fi
+}
+
+# Start (rank-group leader) or join the CUDA MPS daemon of this rank's GPU.
+# Rank r uses GPU r / K, selected by UUID. The daemon directories live under the
+# job-local TMPDIR, never under /tmp. Each GPU has its own daemon, started by
+# the first rank on that GPU and stopped after all K ranks on it have exited.
+mps_setup() {
+  local uuid listed waited=0
+
+  MPS_GPU_INDEX=$((WORKER_INDEX / MPS_CLIENTS_PER_GPU))
+  if [ -z "${TMPDIR:-}" ] || [ -z "${SLURM_STEP_ID:-}" ]; then
+    echo "MPS packing requires the job TMPDIR and a Slurm step" >&2
+    return 1
+  fi
+  listed="$(nvidia-smi --query-gpu=uuid --format=csv,noheader </dev/null)"
+  uuid="$(printf '%s\n' "$listed" | sed -n "$((MPS_GPU_INDEX + 1))p" | tr -d ' ')"
+  if [[ ! "$uuid" =~ ^GPU-[0-9a-fA-F-]+$ ]]; then
+    echo "No GPU UUID for MPS GPU index $MPS_GPU_INDEX in: $listed" >&2
+    return 1
+  fi
+  MPS_ROOT="$TMPDIR/mps/step${SLURM_STEP_ID}-gpu${MPS_GPU_INDEX}"
+  MPS_PIPE="$MPS_ROOT/pipe"
+  if [ $((WORKER_INDEX % MPS_CLIENTS_PER_GPU)) -eq 0 ]; then
+    MPS_LEADER=1
+    mkdir -p "$MPS_ROOT/log" "$MPS_ROOT/done"
+    mkdir -p "$MPS_PIPE"
+    env "CUDA_VISIBLE_DEVICES=$uuid" \
+      "CUDA_MPS_PIPE_DIRECTORY=$MPS_PIPE" \
+      "CUDA_MPS_LOG_DIRECTORY=$MPS_ROOT/log" \
+      nvidia-cuda-mps-control -d
+  fi
+  while [ ! -e "$MPS_PIPE/control" ]; do
+    if [ "$waited" -ge 120 ]; then
+      echo "MPS daemon for GPU $MPS_GPU_INDEX did not start: $MPS_PIPE" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  export "CUDA_VISIBLE_DEVICES=$uuid"
+  echo "MPS: rank $WORKER_INDEX uses GPU $MPS_GPU_INDEX ($uuid) via $MPS_PIPE"
+}
+
+# Record this rank as finished; the leader waits for its peers, then stops the
+# daemon and keeps the daemon logs next to the other run logs.
+mps_finish() {
+  local rank_status="$1"
+  local done_dir="$MPS_ROOT/done" log_target
+
+  mkdir -p "$done_dir" 2>/dev/null || true
+  : >"$done_dir/$WORKER_INDEX"
+  if [ "$MPS_LEADER" -ne 1 ]; then
+    return 0
+  fi
+  # A failed or signalled rank means srun is already stopping its peers.
+  while [ "$rank_status" -eq 0 ] \
+    && [ "$(find "$done_dir" -type f | wc -l)" -lt "$MPS_CLIENTS_PER_GPU" ]; do
+    sleep 1
+  done
+  echo quit | env "CUDA_MPS_PIPE_DIRECTORY=$MPS_PIPE" nvidia-cuda-mps-control \
+    >/dev/null 2>&1 || true
+  log_target="$RUN_ROOT/logs/mps/$WORKER_GROUP-step${SLURM_STEP_ID}-gpu${MPS_GPU_INDEX}"
+  mkdir -p "$log_target" 2>/dev/null || true
+  cp -r "$MPS_ROOT/log/." "$log_target/" 2>/dev/null || true
+  MPS_LEADER=0
+}
+
+# Preserve the rank status while MPS cleanup runs on every exit path.
+cleanup() {
+  local status=$?
+
+  trap - EXIT
+  if [ -n "$MPS_ROOT" ]; then
+    mps_finish "$status" || true
+  fi
+  exit "$status"
 }
 
 # Validate the scheduler-provided logical worker rank.
@@ -140,6 +234,11 @@ main() {
   WORKER_INDEX="${SLURM_PROCID:?SLURM_PROCID is required for a parallel worker}"
   WORKER_INDEX=$((WORKER_INDEX + WORKER_OFFSET))
   validate_worker_index
+  if [ "$MPS_CLIENTS_PER_GPU" -gt 1 ]; then
+    trap cleanup EXIT
+    trap 'exit 143' TERM INT
+    mps_setup
+  fi
   printf -v worker_id '%03d' "$WORKER_INDEX"
   marker="$RUN_ROOT/.state/workers/$WORKER_GROUP/$worker_id.done"
   continuation_marker="$RUN_ROOT/.state/workers/$WORKER_GROUP/$worker_id.partial"
@@ -150,6 +249,10 @@ main() {
   fi
 
   render_worker_arguments
+  MPS_ARGUMENTS=()
+  if [ "$MPS_CLIENTS_PER_GPU" -gt 1 ]; then
+    MPS_ARGUMENTS=(--mps-pipe-dir "$MPS_PIPE")
+  fi
 
   set +e
   "$SOURCE_ROOT/scripts/workflow/mn5_container_exec.sh" \
@@ -159,6 +262,7 @@ main() {
     --stage-data \
     --nv \
     --cpus "$CPUS" \
+    ${MPS_ARGUMENTS[@]+"${MPS_ARGUMENTS[@]}"} \
     -- env "EPIFORECASTER_WORKER_ID=$WORKER_INDEX" "${WORKER_ARGUMENTS[@]}"
   status=$?
   set -e
@@ -176,6 +280,7 @@ main() {
 
 WORKER_INDEX=""
 WORKER_ARGUMENTS=()
+MPS_ARGUMENTS=()
 # The close-out signal is for the scientific process only; see
 # mn5_container_exec.sh.
 trap '' USR1

@@ -129,7 +129,28 @@ def test_completed_attempt_restores_missing_outputs_and_rejects_corruption(tmp_p
     assert output.read_bytes() == b"completed work"
     output.unlink()
     payload.write_bytes(b"corrupt")
-    with pytest.raises(ValueError, match="SHA-256"):
+    with pytest.raises(ValueError, match="failed validation"):
+        attempts.restore_attempt(root, identity, run)
+    assert not output.exists()
+
+
+def test_size_only_attempt_restores_and_rejects_truncated_payload(tmp_path):
+    run = tmp_path / "run"
+    root = run / ".state/attempts/stage"
+    attempt = attempts.new_attempt(root)
+    payload = attempt / "dataset.zarr.zip"
+    payload.write_bytes(b"large dataset")
+    output = run / "outputs/dataset.zarr.zip"
+    identity = {"config": "abc"}
+    attempts.complete_attempt(
+        attempt, identity, {output: payload}, run, size_only={output}
+    )
+    output.unlink()
+    assert attempts.restore_attempt(root, identity, run)
+    assert output.read_bytes() == b"large dataset"
+    output.unlink()
+    payload.write_bytes(b"large")
+    with pytest.raises(ValueError, match="failed validation"):
         attempts.restore_attempt(root, identity, run)
     assert not output.exists()
 
@@ -225,7 +246,7 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
             if len(calls) == 1:
                 path.write_bytes(b"partial")
                 raise RuntimeError("preempted")
-            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path)
             return path
 
     monkeypatch.setattr(data.preprocess, "OfflinePreprocessingPipeline", Pipeline)
@@ -284,7 +305,7 @@ def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monke
         def run(self):
             path = Path(self.config.output_path) / "tiny-dated.zarr.zip"
             path.parent.mkdir(parents=True)
-            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path)
             built.append(path)
             return path
 
@@ -298,7 +319,17 @@ def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monke
     assert built[0].is_relative_to(local_tmp)
     output = run / "outputs/preprocessing/tiny.zarr.zip"
     record = json.loads(marker.read_text())
-    assert record["dataset_sha256"] == run_support.sha256_file(output)
+    assert record["dataset_bytes"] == output.stat().st_size
+    attempt_record = json.loads(
+        next(
+            (run / ".state/attempts/preprocessing").glob("*/complete.json")
+        ).read_text()
+    )
+    # The payload is recorded by size; DVC hashes it once at publication.
+    assert attempt_record["artifacts"]["outputs/preprocessing/tiny.zarr.zip"] == {
+        "path": "dataset/tiny-dated.zarr.zip",
+        "bytes": output.stat().st_size,
+    }
     assert not any(local_tmp.iterdir())
 
 
@@ -335,6 +366,7 @@ def _cache_environment(tmp_path):
         "SLURM_JOB_ID": "12345",
         "SLURM_PROCID": "0",
         "EPIFORECASTER_NODE_CACHE_ROOT": str(tmp_path / "cache"),
+        "EPIFORECASTER_NODE_STAGING_LOCK": str(tmp_path / "staging.lock"),
         "COPY_LOG": str(tmp_path / "copies"),
         "CAPTURE": str(tmp_path / "binds"),
         "FAIL_COPY": str(tmp_path / "fail-copy"),
@@ -430,6 +462,28 @@ def test_interrupted_copy_is_not_reused(tmp_path):
         )
         assert success.returncode == 0, success.stderr
         assert len(list((tmp_path / "cache").rglob(".ready"))) == 1
+    finally:
+        assert _clean_cache(run, env).returncode == 0
+
+
+def test_staging_fails_before_copying_when_node_disk_is_short(tmp_path):
+    run, env, command = _cache_environment(tmp_path)
+    payload = tmp_path / "dvc-cache/465d72394fba15addce1dd3c493754"
+    payload.parent.mkdir()
+    with payload.open("wb") as handle:
+        handle.truncate(1 << 30)
+    (run / ".state/dvc-workspace/data/files/dataset.zarr.zip").symlink_to(payload)
+    env = env | {"EPIFORECASTER_NODE_CACHE_RESERVE_BYTES": str(1 << 60)}
+    try:
+        result = subprocess.run(
+            command, env=env | {"SLURM_STEP_ID": "0"}, capture_output=True, text=True
+        )
+
+        assert result.returncode != 0
+        assert "staging needs 1.1 GB plus a" in result.stderr
+        assert not (tmp_path / "binds-0").exists()
+        assert not list((tmp_path / "cache").rglob(".ready"))
+        assert not list((tmp_path / "cache").rglob("dataset.zarr.zip"))
     finally:
         assert _clean_cache(run, env).returncode == 0
 

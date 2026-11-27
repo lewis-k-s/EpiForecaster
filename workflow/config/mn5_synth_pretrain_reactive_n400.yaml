@@ -1,0 +1,55 @@
+# Synthetic-pretraining MN5 workflow for the 440-run closed-loop reactive
+# 5a2262d corpus. Per-run paths and provenance fields are injected by
+# scripts/workflow/mn5_workflow.sh. The processed pointer was published by run
+# preprocess-5a2262d-reactive-n400-20261106e of
+# mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml.
+#
+# Measured in run synth-pretrain-5a2262d-n400-20261106b (job 48641327, 2
+# epochs): staging plus the light build of 440 runs (299 s) took 11 min, an
+# epoch of 177,063 batches about 35 min including validation, and the whole job
+# 98.5 min with the test evaluation. Its validation loss still fell from 2.105
+# to 1.522 between the two epochs. Ten epochs take about 6.2 h (11 min setup,
+# 10 x 35 min, about 10 min of test evaluation), so the run uses acc_bscls with
+# 7 h.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: train
+  target: train_evaluate
+
+dvc:
+  targets:
+    - data/processed/synthetic_sirhd_v1_5a2262d_reactive_n400_holt_damped.zarr.zip.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+  provenance_targets:
+    - data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip.dvc
+
+training:
+  base_config: configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n400.yaml
+  experiment_name: synthetic-pretrain-sirhd-v1-reactive-n400
+  model_id: model
+  max_batches: null
+  overrides:
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+    - output.checkpoint_frequency=1
+
+evaluation:
+  split: test
+  granular: true
+  overrides:
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 420
