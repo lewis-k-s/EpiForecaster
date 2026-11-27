@@ -1087,8 +1087,17 @@ class ClinicalObservationHead(nn.Module):
         kernel_mlp: bool = False,
         distribution_scale_init: float = 0.3,
         distribution_scale_floor: float = 1.0e-3,
+        aggregation_window: int = 1,
     ):
         super().__init__()
+
+        if aggregation_window < 1:
+            raise ValueError(
+                f"aggregation_window must be >= 1, got {aggregation_window}"
+            )
+        # Output k is the scaled source summed over steps k..k+window-1, so the
+        # source must extend window-1 steps past the last output.
+        self.aggregation_window = aggregation_window
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
@@ -1199,8 +1208,15 @@ class ClinicalObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
     ) -> dict[str, torch.Tensor]:
-        """Return the full, mechanistic-only, and residual prediction components."""
+        """Return the full, mechanistic-only, and residual prediction components.
+
+        ``I_trajectory`` may start ``origin_index`` steps before the forecast
+        origin. The prediction covers the steps from the origin on;
+        ``mechanistic_rollforward`` is the unanchored mechanistic log location of
+        every step.
+        """
         out_dtype = I_trajectory.dtype
         with _autocast_disabled_for(I_trajectory):
             delayed_infections = self.delay_kernel(I_trajectory.to(torch.float32))
@@ -1209,15 +1225,18 @@ class ClinicalObservationHead(nn.Module):
             if scale.dtype != per_100k.dtype:
                 scale = scale.to(per_100k.dtype)
             scaled = per_100k * scale
+            if self.aggregation_window > 1:
+                scaled = scaled.unfold(1, self.aggregation_window, 1).sum(dim=-1)
             scaled = torch.nan_to_num(
                 scaled,
                 nan=0.0,
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            mechanistic_raw = torch.log1p(scaled)
+            mechanistic_rollforward = torch.log1p(scaled)
             if not self._mechanistic_enabled:
-                mechanistic_raw = torch.zeros_like(mechanistic_raw)
+                mechanistic_rollforward = torch.zeros_like(mechanistic_rollforward)
+        mechanistic_raw = mechanistic_rollforward[:, origin_index:]
 
         # Pre-bound residual raw: the parameter-side intermediate probed by
         # pathway-gradient telemetry. A statically disabled head contributes
@@ -1255,6 +1274,7 @@ class ClinicalObservationHead(nn.Module):
             for key, value in components.items()
         }
         output_components["residual_input"] = residual_raw
+        output_components["mechanistic_rollforward"] = mechanistic_rollforward
         return output_components
 
     def forward_distribution(
@@ -1263,6 +1283,7 @@ class ClinicalObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
         components = self.forward_components(
@@ -1270,6 +1291,7 @@ class ClinicalObservationHead(nn.Module):
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            origin_index=origin_index,
         )
         loc = components["loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
@@ -1500,8 +1522,12 @@ class WastewaterObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
     ) -> dict[str, torch.Tensor]:
-        """Return the full, mechanistic-only, and residual prediction components."""
+        """Return the full, mechanistic-only, and residual prediction components.
+
+        See ``ClinicalObservationHead.forward_components`` for ``origin_index``.
+        """
         out_dtype = I_trajectory.dtype
         viral_load = self.shedding_conv(I_trajectory.to(torch.float32), population)
 
@@ -1517,9 +1543,10 @@ class WastewaterObservationHead(nn.Module):
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            mechanistic_raw = torch.log1p(scaled)
+            mechanistic_rollforward = torch.log1p(scaled)
             if not self._mechanistic_enabled:
-                mechanistic_raw = torch.zeros_like(mechanistic_raw)
+                mechanistic_rollforward = torch.zeros_like(mechanistic_rollforward)
+        mechanistic_raw = mechanistic_rollforward[:, origin_index:]
 
         # Pre-bound residual raw: the parameter-side intermediate probed by
         # pathway-gradient telemetry. A statically disabled head contributes
@@ -1557,6 +1584,7 @@ class WastewaterObservationHead(nn.Module):
             for key, value in components.items()
         }
         output_components["residual_input"] = residual_raw
+        output_components["mechanistic_rollforward"] = mechanistic_rollforward
         return output_components
 
     def forward_distribution(
@@ -1566,6 +1594,7 @@ class WastewaterObservationHead(nn.Module):
         obs_context: torch.Tensor | None = None,
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
+        origin_index: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
         components = self.forward_components(
@@ -1574,6 +1603,7 @@ class WastewaterObservationHead(nn.Module):
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            origin_index=origin_index,
         )
         loc = components["loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)

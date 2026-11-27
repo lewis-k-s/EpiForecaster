@@ -21,10 +21,19 @@ from .configs import (
 from .anchor_utils import resolve_last_valid_anchor
 from .mobility_gnn import MobilityDenseEncoder
 from .observation_heads import ClinicalObservationHead, WastewaterObservationHead
-from .sir_rollforward import SIRRollForward
+from .sir_rollforward import SIRRollForward, generation_interval_weights
 from .transformer_backbone import TransformerBackbone
 
 logger = logging.getLogger(__name__)
+
+_RATE_KEYS = (
+    "beta_t",
+    "gamma_t",
+    "mortality_t",
+    "hospitalization_rate_t",
+    "hospital_recovery_t",
+    "hospital_mortality_t",
+)
 
 
 class EpiForecaster(nn.Module):
@@ -165,7 +174,20 @@ class EpiForecaster(nn.Module):
             enforce_mass_conservation=sir_physics.enforce_mass_conservation,
             residual_clip=sir_physics.residual_clip,
             strict=self.strict,
+            generation_interval=(
+                generation_interval_weights(
+                    mean=sir_physics.generation_interval_mean,
+                    sd=sir_physics.generation_interval_sd,
+                    length=sir_physics.generation_interval_length,
+                )
+                if sir_physics.force_of_infection == "renewal"
+                else None
+            ),
         )
+        # Roll-forward steps before the forecast origin, and days past the
+        # horizon that the hospitalization week total reads.
+        self.history_steps = sir_physics.rollforward_history_steps
+        self.week_total_extension = 6 if observation_heads.hosp_week_total else 0
 
         # Stage 3: Observation Heads
         # Wastewater head
@@ -209,6 +231,7 @@ class EpiForecaster(nn.Module):
             kernel_mlp=observation_heads.kernel_mlp_hosp,
             distribution_scale_init=observation_heads.distribution_scale_init,
             distribution_scale_floor=observation_heads.distribution_scale_floor,
+            aggregation_window=7 if observation_heads.hosp_week_total else 1,
         )
 
         # Cases head (reported cases observation)
@@ -397,18 +420,20 @@ class EpiForecaster(nn.Module):
         if not torch.compiler.is_compiling() and logger.isEnabledFor(logging.DEBUG):
             logger.debug("EpiForecaster.forward: x_seq=%s", tuple(x_seq.shape))
 
-        # Stage 1: Encoder outputs SIR parameters and observation context
+        # Stage 1: Encoder outputs SIR parameters and observation context.
+        # Rates cover the L history steps and the H forecast steps.
         encoder_outputs = self.backbone(x_seq)
-        beta_t = encoder_outputs["beta_t"]  # [B, H]
-        mortality_t = encoder_outputs["mortality_t"]  # [B, H]
-        hospitalization_rate_t = encoder_outputs["hospitalization_rate_t"]  # [B, H]
-        hospital_recovery_t = encoder_outputs["hospital_recovery_t"]  # [B, H]
-        hospital_mortality_t = encoder_outputs["hospital_mortality_t"]  # [B, H]
-        gamma_t = encoder_outputs["gamma_t"]  # [B, H]
+        rates = {key: encoder_outputs[key] for key in _RATE_KEYS}  # [B, L+H]
         initial_states_logits = encoder_outputs["initial_states_logits"]  # [B, 4]
         obs_context = encoder_outputs["obs_context"]  # [B, H, C_obs]
+        origin = self.history_steps
+        horizon = self.forecast_horizon
+        states_end = origin + horizon + 1
+        flows_end = origin + horizon
 
-        # Convert logits to proportions (softmax ensures sum=1, nonnegative)
+        # Convert logits to proportions (softmax ensures sum=1, nonnegative).
+        # They are the state at the start of the roll-forward: the forecast
+        # origin, or `history_steps` days before it.
         initial_states = F.softmax(initial_states_logits, dim=-1)  # [B, 4]
 
         # Keep SIRH states in fraction space (sum to 1 per sample)
@@ -417,32 +442,55 @@ class EpiForecaster(nn.Module):
         H0 = initial_states[:, 2]  # [B]
         R0 = initial_states[:, 3]  # [B]
 
+        # The hospitalization week total reads days past the horizon; the last
+        # rates are held for them.
+        rollforward_rates = rates
+        if self.week_total_extension > 0:
+            rollforward_rates = {
+                key: torch.cat(
+                    [value, value[:, -1:].expand(-1, self.week_total_extension)],
+                    dim=1,
+                )
+                for key, value in rates.items()
+            }
+
         # Stage 2: SIR Roll-Forward
         sir_outputs = self.sir_rollforward(
-            beta_t=beta_t,
-            gamma_t=gamma_t,
-            mortality_t=mortality_t,
+            beta_t=rollforward_rates["beta_t"],
+            gamma_t=rollforward_rates["gamma_t"],
+            mortality_t=rollforward_rates["mortality_t"],
             S0=S0,
             I0=I0,
             R0=R0,
             H0=H0,
-            hospitalization_rate_t=hospitalization_rate_t,
-            hospital_recovery_t=hospital_recovery_t,
-            hospital_mortality_t=hospital_mortality_t,
+            hospitalization_rate_t=rollforward_rates["hospitalization_rate_t"],
+            hospital_recovery_t=rollforward_rates["hospital_recovery_t"],
+            hospital_mortality_t=rollforward_rates["hospital_mortality_t"],
             # SIRHD is modeled in fraction space (S+I+H+R=1 at t0), so population
             # N=1.0 ensures the standard equations work correctly with fractions.
-            population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
+            population=torch.ones(B, device=S0.device, dtype=S0.dtype),
         )
 
-        S_traj = sir_outputs["S_trajectory"]  # [B, H+1]
-        I_traj = sir_outputs["I_trajectory"]  # [B, H+1]
-        H_traj = sir_outputs["H_trajectory"]  # [B, H+1]
-        R_traj = sir_outputs["R_trajectory"]  # [B, H+1]
-        D_traj = sir_outputs["D_trajectory"]  # [B, H+1]
-        hospitalization_flow = sir_outputs["hospitalization_flow"]  # [B, H]
-        infection_flow = sir_outputs["infection_flow"]  # [B, H]
-        death_flow = sir_outputs["death_flow"]  # [B, H]
-        physics_residual = sir_outputs["physics_residual"]  # [B, H]
+        # Forecast part of the roll-forward: states [B, H+1] from the origin,
+        # flows and rates [B, H].
+        beta_t = rates["beta_t"][:, origin:]
+        S_traj = sir_outputs["S_trajectory"][:, origin:states_end]
+        I_traj = sir_outputs["I_trajectory"][:, origin:states_end]
+        H_traj = sir_outputs["H_trajectory"][:, origin:states_end]
+        R_traj = sir_outputs["R_trajectory"][:, origin:states_end]
+        D_traj = sir_outputs["D_trajectory"][:, origin:states_end]
+        hospitalization_flow = sir_outputs["hospitalization_flow"][:, origin:flows_end]
+        infection_flow = sir_outputs["infection_flow"][:, origin:flows_end]
+        death_flow = sir_outputs["death_flow"][:, origin:flows_end]
+        physics_residual = sir_outputs["physics_residual"][:, origin:flows_end]
+
+        # Head sources over the whole roll-forward, indexed like the states: a
+        # flow sits on the day it arrives, so index 0 has no flow of its own.
+        prevalence_source = sir_outputs["I_trajectory"][:, :states_end]
+        incidence_source = torch.cat(
+            [sir_outputs["infection_flow"][:, :1], sir_outputs["infection_flow"]],
+            dim=1,
+        )[:, :states_end]
 
         # Stage 3: Observation Heads
         # Note: I_traj includes I0 at index 0, so we use all of it
@@ -479,67 +527,97 @@ class EpiForecaster(nn.Module):
         # Wastewater prediction
         # SIR is modeled in fraction space (S+I+R=1), so population N=1.0.
         # With ww_source="infection_flow" the shedding kernel convolves
-        # incidence; the origin incidence (index 0) is the first step's flux,
-        # beta_0 S_0 I_0, because the roll-forward has no pre-origin flow.
+        # incidence; index 0 repeats the first step's flux because the
+        # roll-forward has no earlier flow.
         if self.observation_heads_config.ww_source == "infection_flow":
-            ww_source = torch.cat([infection_flow[:, :1], infection_flow], dim=1)
+            ww_source = incidence_source
         else:
-            ww_source = I_traj
+            ww_source = prevalence_source
         dist_ww = self.ww_head.forward_distribution(
             I_trajectory=ww_source,
             population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
             obs_context=obs_context_with_init,
             last_observed=ww_last,
             last_observed_mask=ww_last_mask,
+            origin_index=origin,
         )  # [B, H+1]
         pred_ww = dist_ww["loc"]
 
         # Hospitalization prediction. Observed hospitalizations are modeled as
         # reported admissions, so the clinical head consumes the I -> H flow.
+        # A week total also reads the `week_total_extension` days past the horizon.
         hospitalization_source = torch.cat(
             [
                 torch.zeros(B, 1, device=beta_t.device, dtype=beta_t.dtype),
-                hospitalization_flow,
+                sir_outputs["hospitalization_flow"],
             ],
             dim=1,
-        )
+        )[:, : states_end + self.week_total_extension]
         dist_hosp = self.hosp_head.forward_distribution(
             I_trajectory=hospitalization_source,
             obs_context=obs_context_with_init,
             last_observed=hosp_last,
             last_observed_mask=hosp_last_mask,
+            origin_index=origin,
         )  # [B, H+1]
         pred_hosp = dist_hosp["loc"]
 
         # Cases prediction (reported cases observation)
+        if self.observation_heads_config.cases_source == "infection_flow":
+            cases_source = incidence_source
+        else:
+            cases_source = prevalence_source
         dist_cases = self.cases_head.forward_distribution(
-            I_trajectory=I_traj,
+            I_trajectory=cases_source,
             obs_context=obs_context_with_init,
             last_observed=cases_last,
             last_observed_mask=cases_last_mask,
+            origin_index=origin,
         )  # [B, H+1]
         pred_cases = dist_cases["loc"]
 
         # Deaths prediction (mortality observation)
         # Input is death_flow (fraction dying)
         # Note: death_flow lacks t=0 nowcast, so we don't anchor it with delta_forecasting
+        deaths_source = sir_outputs["death_flow"][:, :flows_end]
         dist_deaths = self.deaths_head.forward_distribution(
-            I_trajectory=death_flow,
+            I_trajectory=deaths_source,
             obs_context=obs_context,
             last_observed=None,
+            origin_index=origin,
         )  # [B, H]
         pred_deaths = dist_deaths["loc"]
+
+        # Mechanistic log locations over the rolled history, for history
+        # reconstruction. Each ends on the last history day (the origin) and
+        # starts where its kernel first has a full window.
+        history_outputs: dict[str, torch.Tensor] = {}
+        if origin > 0:
+            heads = self.observation_heads_config
+            for head_name, distribution, kernel_length, history_end in (
+                ("ww", dist_ww, heads.kernel_length_ww, origin + 1),
+                ("hosp", dist_hosp, heads.kernel_length_hosp, origin + 1),
+                ("cases", dist_cases, heads.kernel_length_cases, origin + 1),
+                ("deaths", dist_deaths, heads.kernel_length_deaths, origin),
+            ):
+                if head_name in heads.mechanistic_disabled_heads:
+                    continue
+                history_outputs[f"mechanistic_history_{head_name}"] = distribution[
+                    "mechanistic_rollforward"
+                ][:, kernel_length - 1 : history_end]
 
         # Note: Predictions include t=0 (nowcast) and are [B, H+1] or [B, H].
         # Trainer/eval should slice as needed.
 
         return {
+            **history_outputs,
+            "beta_rollforward": rates["beta_t"],
             "beta_t": beta_t,
-            "gamma_t": gamma_t,
-            "mortality_t": mortality_t,
-            "hospitalization_rate_t": hospitalization_rate_t,
-            "hospital_recovery_t": hospital_recovery_t,
-            "hospital_mortality_t": hospital_mortality_t,
+            "gamma_t": rates["gamma_t"][:, origin:],
+            "mortality_t": rates["mortality_t"][:, origin:],
+            "hospitalization_rate_t": rates["hospitalization_rate_t"][:, origin:],
+            "hospital_recovery_t": rates["hospital_recovery_t"][:, origin:],
+            "hospital_mortality_t": rates["hospital_mortality_t"][:, origin:],
             "S_trajectory": S_traj,
             "I_trajectory": I_traj,
             "H_trajectory": H_traj,
@@ -573,10 +651,12 @@ class EpiForecaster(nn.Module):
             "mechanistic_deaths": dist_deaths["mechanistic_loc"],
             "residual_deaths": dist_deaths["residual_loc"],
             "residual_input_deaths": dist_deaths["residual_input"],
+            # The tensors the heads consumed, over the whole roll-forward:
+            # pathway-gradient probes differentiate with respect to them.
             "observation_source_ww": ww_source,
             "observation_source_hosp": hospitalization_source,
-            "observation_source_cases": I_traj,
-            "observation_source_deaths": death_flow,
+            "observation_source_cases": cases_source,
+            "observation_source_deaths": deaths_source,
             "obs_context": obs_context,
             "initial_states": initial_states,
         }

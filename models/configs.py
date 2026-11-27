@@ -199,6 +199,16 @@ class JointLossConfig:
     mask_input_hosp: bool = False
     mask_input_cases: bool = False
     mask_input_deaths: bool = False
+    # Regularizers added to the weighted observation and latent terms.
+    # Masked MSE between each head's mechanistic location over the rolled
+    # history and the observed history (needs sir_physics.rollforward_history_steps).
+    history_reconstruction_weight: float = 0.0
+    # Mean squared residual contribution to the forecast location over
+    # supervised points (minimum-norm residual, as in APHYNITY).
+    residual_penalty_weight: float = 0.0
+    # Mean squared first difference of log(beta) along the roll-forward
+    # (random-walk prior on transmission).
+    beta_smoothness_weight: float = 0.0
 
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
@@ -289,6 +299,13 @@ class JointLossConfig:
                 "gradnorm_min_weight is too large for gradnorm_obs_weight_sum "
                 "with four observation tasks"
             )
+        for name, value in [
+            ("history_reconstruction_weight", self.history_reconstruction_weight),
+            ("residual_penalty_weight", self.residual_penalty_weight),
+            ("beta_smoothness_weight", self.beta_smoothness_weight),
+        ]:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
 
 
 @dataclass
@@ -580,6 +597,20 @@ class SIRPhysicsConfig:
     hospital_mortality_max: float = 0.1
     # Physics residual clipping at source (prevents extreme gradients)
     residual_clip: float = 1e4
+    # Days of the input window the latent is rolled through before the forecast
+    # origin. 0 starts the roll-forward at the origin; a positive value places
+    # the initial state that many days earlier, with per-day history rates.
+    rollforward_history_steps: int = 0
+    # "all": all six rates vary per step. "beta": only the transmission rate
+    # varies; the other five are constant over a window.
+    time_varying_rates: str = "all"
+    # "mass_action": infections are beta*S*I. "renewal": infections are
+    # R_t * S * sum_s g_s * incidence_{t-s} with R_t = beta/(gamma+alpha+mu_I)
+    # and g a discretized Gamma generation interval.
+    force_of_infection: str = "mass_action"
+    generation_interval_mean: float = 5.0
+    generation_interval_sd: float = 2.0
+    generation_interval_length: int = 14
 
     def __post_init__(self) -> None:
         if self.dt <= 0:
@@ -617,6 +648,32 @@ class SIRPhysicsConfig:
         if self.residual_clip <= 0:
             raise ValueError(
                 f"residual_clip must be positive, got {self.residual_clip}"
+            )
+        if self.rollforward_history_steps < 0:
+            raise ValueError(
+                "rollforward_history_steps must be non-negative, "
+                f"got {self.rollforward_history_steps}"
+            )
+        if self.time_varying_rates not in {"all", "beta"}:
+            raise ValueError(
+                "time_varying_rates must be 'all' or 'beta', "
+                f"got {self.time_varying_rates!r}"
+            )
+        if self.force_of_infection not in {"mass_action", "renewal"}:
+            raise ValueError(
+                "force_of_infection must be 'mass_action' or 'renewal', "
+                f"got {self.force_of_infection!r}"
+            )
+        if self.generation_interval_mean <= 0 or self.generation_interval_sd <= 0:
+            raise ValueError(
+                "generation_interval_mean and generation_interval_sd must be "
+                f"positive, got {self.generation_interval_mean} and "
+                f"{self.generation_interval_sd}"
+            )
+        if self.generation_interval_length < 1:
+            raise ValueError(
+                "generation_interval_length must be >= 1, "
+                f"got {self.generation_interval_length}"
             )
 
 
@@ -722,6 +779,14 @@ class ObservationHeadConfig:
     # Latent consumed by the wastewater shedding convolution: "I" (prevalence)
     # or "infection_flow" (incidence, as in renewal-based wastewater models).
     ww_source: str = "I"
+    # Latent consumed by the cases delay kernel: "I" (prevalence) or
+    # "infection_flow" (incidence).
+    cases_source: str = "I"
+    # Real hospitalizations are weekly totals dated on their week start. When
+    # true the hospitalization head predicts the admission flow summed over days
+    # h..h+6 instead of one day's flow; the roll-forward runs six days past the
+    # horizon with the last rates held.
+    hosp_week_total: bool = False
 
     # Observation context dimension
     obs_context_dim: int = 96
@@ -834,6 +899,17 @@ class ObservationHeadConfig:
                 f"use the latent the head consumes, got {self.relevant_source_ww!r} "
                 f"and {self.ww_source!r}"
             )
+        if self.cases_source not in {"I", "infection_flow"}:
+            raise ValueError(
+                "cases_source must be 'I' or 'infection_flow', "
+                f"got {self.cases_source!r}"
+            )
+        if self.relevant_source_cases != self.cases_source:
+            raise ValueError(
+                "relevant_source_cases must equal cases_source so latent "
+                "indicators use the latent the head consumes, got "
+                f"{self.relevant_source_cases!r} and {self.cases_source!r}"
+            )
 
         if self.residual_hidden_dim <= 0:
             raise ValueError(
@@ -870,7 +946,7 @@ class ObservationHeadConfig:
         valid_relevant_sources = {
             "hosp": {"hospitalization_flow", "H"},
             "ww": {"I", "infection_flow"},
-            "cases": {"I"},
+            "cases": {"I", "infection_flow"},
             "deaths": {"death_flow", "D"},
         }
         for head_name, source_name in self.relevant_source_mapping().items():
@@ -1142,6 +1218,23 @@ class ModelConfig:
                 "head_positional_encoding must be one of "
                 f"{POSITIONAL_ENCODING_TYPES}, got {self.head_positional_encoding!r}"
             )
+
+        history_steps = self.sir_physics.rollforward_history_steps
+        if history_steps > 0:
+            heads = self.observation_heads
+            longest_kernel = max(
+                heads.kernel_length_ww,
+                heads.kernel_length_hosp,
+                heads.kernel_length_cases,
+                heads.kernel_length_deaths,
+            )
+            if not longest_kernel <= history_steps < self.input_window_length:
+                raise ValueError(
+                    "sir_physics.rollforward_history_steps must be at least the "
+                    f"longest observation kernel ({longest_kernel}) and below "
+                    f"input_window_length ({self.input_window_length}), "
+                    f"got {history_steps}"
+                )
 
 
 @dataclass
@@ -1645,17 +1738,33 @@ class EpiForecasterConfig:
     env: str | None = None
 
     def __post_init__(self) -> None:
-        # Partial configs (tests, tooling) may leave a section unset.
-        if self.model is MISSING or self.training is MISSING:
+        # Structured-schema construction leaves blocks as MISSING placeholders.
+        if not isinstance(self.model, ModelConfig) or not isinstance(
+            self.training, TrainingParams
+        ):
             return
-        heads = self.model.observation_heads
-        if self.training.residual_schedule.enabled and heads.mechanistic_disabled_heads:
+        joint = self.training.loss.joint
+        if (
+            joint.history_reconstruction_weight > 0
+            and self.model.sir_physics.rollforward_history_steps == 0
+        ):
+            raise ValueError(
+                "training.loss.joint.history_reconstruction_weight requires "
+                "model.sir_physics.rollforward_history_steps > 0"
+            )
+        disabled = self.model.observation_heads.mechanistic_disabled_heads
+        if self.training.residual_schedule.enabled and disabled:
             raise ValueError(
                 "training.residual_schedule.enabled is incompatible with "
-                "model.observation_heads.mechanistic_disabled_heads="
-                f"{heads.mechanistic_disabled_heads!r}: the residual budget is "
-                "relative to the mechanistic log location, so on such a head it "
-                "would silence the prediction."
+                f"model.observation_heads.mechanistic_disabled_heads={disabled!r}: "
+                "the residual budget is relative to the mechanistic log location, "
+                "so on such a head it would silence the prediction."
+            )
+        if joint.residual_penalty_weight > 0 and disabled:
+            raise ValueError(
+                "training.loss.joint.residual_penalty_weight penalizes the whole "
+                "prediction of a head without a mechanistic path; got "
+                f"mechanistic_disabled_heads={sorted(disabled)!r}"
             )
 
     @classmethod
