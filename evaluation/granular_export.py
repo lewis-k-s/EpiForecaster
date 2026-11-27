@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-GRANULAR_SCHEMA_VERSION = "4"
+GRANULAR_SCHEMA_VERSION = "5"
 GRANULAR_KEY_COLUMNS = ["split", "target", "node_id", "window_start", "horizon"]
 GRANULAR_INTERVAL_LEVEL_NAMES = ("50", "80", "95")
 GRANULAR_REQUIRED_FIELDNAMES = [

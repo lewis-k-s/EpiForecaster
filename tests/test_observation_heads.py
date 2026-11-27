@@ -5,6 +5,8 @@ These isolated checks cover mathematical behavior and edge cases that the
 bounded training and evaluation test cannot resolve precisely.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -904,6 +906,45 @@ class TestClinicalObservationHead:
             distribution["loc"],
         )
 
+    def test_count_step_scale_floor_follows_population(self):
+        trajectory = torch.full((3, 4), 0.001)
+        context = torch.zeros(3, 4, 1)
+        population = torch.tensor([3_000.0, 100_000.0, 1.0e9])
+
+        def collapsed_scale(count_step_scale_floor: float) -> torch.Tensor:
+            head = ClinicalObservationHead(
+                kernel_length=3,
+                learnable_kernel=False,
+                residual_dim=1,
+                distribution_scale_floor=0.05,
+                count_step_scale_floor=count_step_scale_floor,
+            )
+            assert head.distribution_scale_proj is not None
+            with torch.no_grad():
+                head.distribution_scale_proj.weight.zero_()
+                head.distribution_scale_proj.bias.fill_(-40.0)
+            return head.forward_distribution(
+                trajectory, obs_context=context, population=population
+            )["scale"]
+
+        constant = collapsed_scale(0.0)
+        assert torch.allclose(constant, torch.full_like(constant, 0.05))
+
+        scaled = collapsed_scale(0.1)
+        # One count is log1p(100000 / N); the largest region falls back to the
+        # constant floor.
+        expected = torch.tensor(
+            [0.1 * math.log1p(100_000 / 3_000), 0.1 * math.log1p(1.0), 0.05]
+        )
+        assert torch.allclose(scaled, expected.unsqueeze(-1).expand_as(scaled))
+
+    def test_count_step_scale_floor_requires_population(self):
+        head = ClinicalObservationHead(kernel_length=3, count_step_scale_floor=0.1)
+        with pytest.raises(ValueError, match="requires the target population"):
+            head.forward_distribution(torch.full((2, 4), 0.001))
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            ClinicalObservationHead(kernel_length=3, count_step_scale_floor=-0.1)
+
 
 class TestWastewaterObservationHead:
     """Tests for WastewaterObservationHead wrapper."""
@@ -1052,6 +1093,39 @@ class TestWastewaterObservationHead:
         assert distribution["residual_input"].shape == distribution["loc"].shape
         assert torch.allclose(distribution["mechanistic_loc"], residual_disabled)
 
+    def test_censored_location_keeps_the_latent_below_zero(self):
+        def build(censored_location: bool) -> WastewaterObservationHead:
+            head = WastewaterObservationHead(
+                kernel_length=3,
+                learnable_kernel=False,
+                residual_dim=1,
+                alpha_init=1.0,
+                delta_forecasting=True,
+                censored_location=censored_location,
+            )
+            assert head.residual_proj is not None
+            with torch.no_grad():
+                head.residual_proj.weight.fill_(1.0)
+                head.residual_proj.bias.zero_()
+            return head
+
+        trajectory = torch.tensor([[0.001, 0.002, 0.004, 0.003]])
+        kwargs = {
+            "population": torch.ones_like(trajectory),
+            "obs_context": torch.tensor([[[0.0], [-30.0], [-50.0], [1.0]]]),
+            "last_observed": torch.tensor([0.2]),
+            "last_observed_mask": torch.tensor([1.0]),
+        }
+        plain = build(False).forward_distribution(trajectory, **kwargs)
+        censored = build(True).forward_distribution(trajectory, **kwargs)
+
+        assert torch.equal(plain["distribution_loc"], plain["loc"])
+        assert (censored["distribution_loc"][0, 1:3] < 0).all()
+        assert torch.equal(censored["loc"], censored["distribution_loc"].clamp_min(0.0))
+        # The point prediction and its decomposition are those of the clamped head.
+        for key in ("loc", "mechanistic_loc", "residual_loc"):
+            assert torch.allclose(censored[key], plain[key])
+
 
 class TestIntegration:
     """Integration tests with realistic scenarios."""
@@ -1091,6 +1165,7 @@ class TestIntegration:
         # Wastewater should track infections more closely (shedding is immediate-ish)
         # but still has some delay from the convolution
         assert ww_peak >= infection_peak
+
 
 class TestEdgeCases:
     """Edge case tests."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv as csv_lib
 import logging
 import math
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +17,7 @@ import torch
 import wandb
 from torch.utils.data import DataLoader
 
+from data.crossval_manifest import load_manifest_region_sets
 from data.epi_dataset import EpiDataset
 from data.latent_supervision import latent_scales_from_checkpoint
 from evaluation.granular_export import (
@@ -44,6 +46,7 @@ from evaluation.pathway_metrics import (
     TorchPathwayMetricAccumulator,
     WindowSpearmanMetricResult,
 )
+from evaluation.selection_scores import compute_validation_selection_score
 from models.configs import EpiForecasterConfig, LatentInformationConfig
 from models.epiforecaster import EpiForecaster
 from models.observation_heads import DelayKernel, SheddingConvolution
@@ -312,6 +315,83 @@ def _add_probabilistic_metrics(
         )
 
 
+def _region_set_members(
+    region_sets: dict[str, frozenset[str]],
+    region_ids: Sequence[Any] | None,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Boolean node-index membership of each named region set."""
+    if region_ids is None:
+        raise ValueError("Region-set metrics need the dataset's region IDs")
+    ids = [str(region_id) for region_id in region_ids]
+    return {
+        name: torch.tensor(
+            [region_id in members for region_id in ids],
+            dtype=torch.bool,
+            device=device,
+        )
+        for name, members in sorted(region_sets.items())
+    }
+
+
+def _update_region_set_metrics(
+    accumulators: dict[str, dict[str, TorchDistributionMetricAccumulator]],
+    members: dict[str, torch.Tensor],
+    *,
+    head_name: str,
+    loc: torch.Tensor,
+    scale: torch.Tensor,
+    targets: torch.Tensor,
+    observed_mask: torch.Tensor | None,
+    sample_weights: torch.Tensor,
+    nodes: torch.Tensor,
+) -> None:
+    """Score one batch again with weights restricted to each region set."""
+    for name, member in members.items():
+        in_set = member[nodes.to(member.device)].to(sample_weights.dtype)
+        in_set = in_set.reshape(-1, *([1] * (sample_weights.dim() - 1)))
+        accumulators[name][head_name].update(
+            loc=loc,
+            scale=scale,
+            targets=targets,
+            observed_mask=observed_mask,
+            sample_weights=sample_weights * in_set,
+        )
+
+
+def _add_region_set_metrics(
+    *,
+    metrics: dict[str, Any],
+    accumulators: dict[str, dict[str, TorchDistributionMetricAccumulator]],
+) -> None:
+    """Add ``region_set_<name>_*`` probabilistic metrics and their WIS endpoint.
+
+    The endpoint follows the checkpoint-selection rule: the equal-head mean of
+    pooled per-head WIS, NaN when a head has no valid support in the set.
+    """
+    for name, head_accumulators in accumulators.items():
+        set_metrics: dict[str, Any] = {}
+        for head_name, accumulator in head_accumulators.items():
+            _add_probabilistic_metrics(
+                metrics=set_metrics,
+                head_name=head_name,
+                summary=accumulator.finalize(),
+            )
+        try:
+            mean_target_wis, _ = compute_validation_selection_score(
+                set_metrics,
+                observation_loss="wis",
+                selection_metric="mean_target_wis",
+                required_heads=tuple(_HEAD_CANONICAL_NAMES),
+            )
+        except ValueError:
+            mean_target_wis = float("nan")
+        set_metrics["mean_target_wis"] = mean_target_wis
+        metrics.update(
+            {f"region_set_{name}_{key}": value for key, value in set_metrics.items()}
+        )
+
+
 def _add_pathway_metrics(
     *,
     metrics: dict[str, Any],
@@ -463,6 +543,7 @@ def evaluate_loader(
     node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
     latent_information: LatentInformationConfig | None = None,
+    region_sets: dict[str, frozenset[str]] | None = None,
 ) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
     """Evaluate a loader and compute loss/metrics matching trainer behavior.
 
@@ -493,6 +574,8 @@ def evaluate_loader(
             indicators (``latent_info_*``); None skips them. They move every
             batch to CPU, so pass them for final evaluations, not per-epoch
             validation.
+        region_sets: Named region-ID sets; each adds ``region_set_<name>_*``
+            probabilistic metrics restricted to its regions' windows.
 
     Returns:
         Tuple of (mean_loss, metrics_dict, node_mae_dict) where:
@@ -538,6 +621,7 @@ def evaluate_loader(
         "distribution_df": criterion.distribution_df,
         "scale_floor": criterion.distribution_scale_floor,
         "interval_levels": criterion.interval_levels,
+        "censored": criterion.censored,
         "compile_step": compile_metrics,
     }
     hosp_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
@@ -629,6 +713,16 @@ def evaluate_loader(
     temporal_coords = getattr(dataset, "_temporal_coords", None)
     region_ids = getattr(dataset, "_region_ids", None)
     region_labels = getattr(dataset, "_region_labels", None)
+    region_set_members = (
+        _region_set_members(region_sets, region_ids, device) if region_sets else {}
+    )
+    region_set_prob_metrics = {
+        name: {
+            head_name: TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
+            for head_name in _HEAD_CANONICAL_NAMES
+        }
+        for name in region_set_members
+    }
     resolved_granular_format = (
         infer_granular_eval_format(granular_output_path, granular_eval_format)
         if granular_output_path is not None
@@ -846,6 +940,17 @@ def evaluate_loader(
                         observed_mask=hosp_mask,
                         sample_weights=hosp_weights,
                     )
+                    _update_region_set_metrics(
+                        region_set_prob_metrics,
+                        region_set_members,
+                        head_name="hosp",
+                        loc=hosp_loc,
+                        scale=hosp_scale,
+                        targets=hosp_targets,
+                        observed_mask=hosp_mask,
+                        sample_weights=hosp_weights,
+                        nodes=batch_data.target_node,
+                    )
                     hosp_mechanistic = _forecast_aligned_output(
                         model_outputs,
                         "mechanistic_hosp",
@@ -967,6 +1072,17 @@ def evaluate_loader(
                         targets=ww_targets,
                         observed_mask=ww_mask,
                         sample_weights=ww_weights,
+                    )
+                    _update_region_set_metrics(
+                        region_set_prob_metrics,
+                        region_set_members,
+                        head_name="ww",
+                        loc=ww_loc,
+                        scale=ww_scale,
+                        targets=ww_targets,
+                        observed_mask=ww_mask,
+                        sample_weights=ww_weights,
+                        nodes=batch_data.target_node,
                     )
                     ww_mechanistic = _forecast_aligned_output(
                         model_outputs,
@@ -1090,6 +1206,17 @@ def evaluate_loader(
                         observed_mask=cases_mask,
                         sample_weights=cases_weights,
                     )
+                    _update_region_set_metrics(
+                        region_set_prob_metrics,
+                        region_set_members,
+                        head_name="cases",
+                        loc=cases_loc,
+                        scale=cases_scale,
+                        targets=cases_targets,
+                        observed_mask=cases_mask,
+                        sample_weights=cases_weights,
+                        nodes=batch_data.target_node,
+                    )
                     cases_mechanistic = _forecast_aligned_output(
                         model_outputs,
                         "mechanistic_cases",
@@ -1211,6 +1338,17 @@ def evaluate_loader(
                         targets=deaths_targets,
                         observed_mask=deaths_mask,
                         sample_weights=deaths_weights,
+                    )
+                    _update_region_set_metrics(
+                        region_set_prob_metrics,
+                        region_set_members,
+                        head_name="deaths",
+                        loc=deaths_loc,
+                        scale=deaths_scale,
+                        targets=deaths_targets,
+                        observed_mask=deaths_mask,
+                        sample_weights=deaths_weights,
+                        nodes=batch_data.target_node,
                     )
                     deaths_mechanistic = _forecast_aligned_output(
                         model_outputs,
@@ -1555,6 +1693,7 @@ def evaluate_loader(
         head_name="deaths",
         summary=deaths_prob_summary,
     )
+    _add_region_set_metrics(metrics=metrics, accumulators=region_set_prob_metrics)
     for head_name in _HEAD_CANONICAL_NAMES:
         _add_pathway_metrics(
             metrics=metrics,
@@ -1754,6 +1893,11 @@ def eval_checkpoint(
             latent_information=(
                 config.training.latent_information
                 if config.training.latent_information.enabled
+                else None
+            ),
+            region_sets=(
+                load_manifest_region_sets(Path(config.training.crossval_manifest_path))
+                if split == "test" and config.training.crossval_manifest_path
                 else None
             ),
             granular_metadata={

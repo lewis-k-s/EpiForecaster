@@ -119,9 +119,14 @@ def test_operating_point_respects_probability_ties_and_support():
 
 @pytest.mark.parametrize("objective", ["coverage_80", "wis"])
 def test_scale_calibration_recovers_known_misscaling(objective):
-    target = 2 * stats.norm.ppf(np.linspace(0.0005, 0.9995, 1000))
+    # Targets cannot be negative; centre far from the bound so nothing is clipped.
+    target = 20 + 2 * stats.norm.ppf(np.linspace(0.0005, 0.9995, 1000))
     result = fit_scale_multiplier(
-        np.zeros(1000), np.ones(1000), target, family="normal", objective=objective
+        np.full(1000, 20.0),
+        np.ones(1000),
+        target,
+        family="normal",
+        objective=objective,
     )
     assert result["multiplier"] == pytest.approx(2.0, abs=0.02)
     assert result["count"] == 1000

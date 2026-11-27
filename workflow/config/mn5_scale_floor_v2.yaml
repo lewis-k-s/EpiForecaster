@@ -1,0 +1,43 @@
+# Scale-floor campaign (configs/campaigns/scale_floor_v2.yaml): 4 conditions x
+# 10 folds x 2 paired seeds = 80 identities, packed as 8 workers on 4 GPUs
+# (2 CUDA MPS clients per GPU) in one 2 h acc_debug allocation. The 80
+# identities of scale_floor_v1 took 54 min in the same packing. Trials
+# still running at close-out finish within the 15 min signal lead;
+# resubmitting the same run continues the remaining identities.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: ablation
+  target: ablation
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id_v2.zarr.zip.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+ablation:
+  study_name: epiforecaster_scale_floor_v2
+  campaign: configs/campaigns/scale_floor_v2.yaml
+  workers: 8
+  closeout_signal_seconds: 900
+  timeout_s: 6300
+  sampler_seed: 42
+  smoketest: false
+  recover_stale_running: true
+  requeue_running: false
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 8
+    cpus_per_task: 10
+    gres: gpu:4
+    mps_clients_per_gpu: 2
+    runtime: 120

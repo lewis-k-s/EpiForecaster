@@ -30,13 +30,13 @@ class BiomarkerPreprocessor:
     Features:
     - Value channel: already log1p-transformed from pipeline + robust scaling + clipping [-8, 8]
     - Mask channel: 1.0 if measured today (finite and positive), else 0.0 (required, pre-computed)
-    - Censor channel: 1.0 if censored at LD floor (from Kalman), else 0.0 (required, pre-computed)
+    - Censor channel: 0 sampled, 1 non-detect at the LD floor, 2 no sample (required, pre-computed)
     - Age channel: Days since last measurement, stored as uint8 (0-14), normalized to [0, 1] at load time
 
     Channel layout: [value, mask, censor, age] - 4 channels per variant
 
     NOTE: Mask, censor, and age channels must be pre-computed and present in the dataset.
-    Kalman filter already handles interpolation, so no LOCF is applied.
+    The pipeline already fills the days between samples, so no fill is applied here.
     Values are already log1p-transformed from the preprocessing pipeline.
 
     IMPORTANT: fit_scaler() requires {variant}_mask channels and only uses values where
@@ -184,10 +184,10 @@ class BiomarkerPreprocessor:
         """Preprocess biomarker values with pre-computed mask/censor/age.
 
         Values are already log1p-transformed from preprocessing pipeline.
-        Kalman filter handles interpolation, so no LOCF needed.
+        The pipeline fills the days between samples, so no fill is needed here.
 
         Args:
-            values: Biomarker values (T, N) - already log1p-transformed and Kalman-filtered
+            values: Biomarker values (T, N) - already log1p-transformed and gap-filled
             mask: Pre-computed mask channel (T, N) - MUST be provided
             censor: Pre-computed censor channel (T, N) - MUST be provided
             age: Pre-computed age channel (T, N) as uint8 (0-14) - MUST be provided

@@ -64,6 +64,29 @@ def test_distribution_metric_accumulator_preserves_negative_nll() -> None:
     assert summary.nll == pytest.approx(expected)
 
 
+def test_distribution_metric_accumulator_clips_intervals_at_zero() -> None:
+    accumulator = TorchDistributionMetricAccumulator(device=torch.device("cpu"))
+
+    batch_metrics = accumulator.update(
+        loc=torch.tensor([[0.0, 5.0]]),
+        scale=torch.ones((1, 2)),
+        targets=torch.tensor([[0.0, 5.0]]),
+        observed_mask=torch.ones((1, 2)),
+    )
+    summary = accumulator.finalize()
+
+    half_width = 1.959964
+    low, high = batch_metrics.intervals["95"]
+    assert low[0].tolist() == pytest.approx([0.0, 5.0 - half_width])
+    assert high[0].tolist() == pytest.approx([half_width, 5.0 + half_width])
+    assert summary.interval_width_by_level["95"] == pytest.approx(1.5 * half_width)
+    assert summary.coverage_by_level["95"] == 1.0
+    # A zero forecast of an observed zero pays only for the half above zero.
+    assert batch_metrics.wis[0, 0].item() == pytest.approx(
+        0.5 * batch_metrics.wis[0, 1].item()
+    )
+
+
 def _make_batch(*, with_residuals: bool = False) -> SimpleNamespace:
     batch = SimpleNamespace(
         target_node=torch.tensor([0, 1], dtype=torch.long),

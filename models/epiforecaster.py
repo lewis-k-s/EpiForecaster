@@ -210,6 +210,7 @@ class EpiForecaster(nn.Module):
             kernel_mlp=observation_heads.kernel_mlp_ww,
             distribution_scale_init=observation_heads.distribution_scale_init,
             distribution_scale_floor=observation_heads.distribution_scale_floor,
+            censored_location=observation_heads.censored_location,
         )
 
         # Hospitalization head
@@ -231,6 +232,8 @@ class EpiForecaster(nn.Module):
             kernel_mlp=observation_heads.kernel_mlp_hosp,
             distribution_scale_init=observation_heads.distribution_scale_init,
             distribution_scale_floor=observation_heads.distribution_scale_floor,
+            count_step_scale_floor=observation_heads.count_step_scale_floor_hosp,
+            censored_location=observation_heads.censored_location,
             aggregation_window=7 if observation_heads.hosp_week_total else 1,
         )
 
@@ -253,6 +256,8 @@ class EpiForecaster(nn.Module):
             kernel_mlp=observation_heads.kernel_mlp_cases,
             distribution_scale_init=observation_heads.distribution_scale_init,
             distribution_scale_floor=observation_heads.distribution_scale_floor,
+            count_step_scale_floor=observation_heads.count_step_scale_floor_cases,
+            censored_location=observation_heads.censored_location,
         )
 
         # Deaths head (mortality observation)
@@ -275,6 +280,8 @@ class EpiForecaster(nn.Module):
             kernel_mlp=observation_heads.kernel_mlp_deaths,
             distribution_scale_init=observation_heads.distribution_scale_init,
             distribution_scale_floor=observation_heads.distribution_scale_floor,
+            count_step_scale_floor=observation_heads.count_step_scale_floor_deaths,
+            censored_location=observation_heads.censored_location,
         )
 
         # Cast all parameters to the canonical model parameter dtype.
@@ -559,6 +566,7 @@ class EpiForecaster(nn.Module):
             last_observed=hosp_last,
             last_observed_mask=hosp_last_mask,
             origin_index=origin,
+            population=population,
         )  # [B, H+1]
         pred_hosp = dist_hosp["loc"]
 
@@ -573,6 +581,7 @@ class EpiForecaster(nn.Module):
             last_observed=cases_last,
             last_observed_mask=cases_last_mask,
             origin_index=origin,
+            population=population,
         )  # [B, H+1]
         pred_cases = dist_cases["loc"]
 
@@ -585,6 +594,7 @@ class EpiForecaster(nn.Module):
             obs_context=obs_context,
             last_observed=None,
             origin_index=origin,
+            population=population,
         )  # [B, H]
         pred_deaths = dist_deaths["loc"]
 
@@ -631,22 +641,22 @@ class EpiForecaster(nn.Module):
             "pred_hosp": pred_hosp,
             "pred_cases": pred_cases,
             "pred_deaths": pred_deaths,
-            "dist_ww_loc": dist_ww["loc"],
+            "dist_ww_loc": dist_ww["distribution_loc"],
             "dist_ww_scale": dist_ww["scale"],
             "mechanistic_ww": dist_ww["mechanistic_loc"],
             "residual_ww": dist_ww["residual_loc"],
             "residual_input_ww": dist_ww["residual_input"],
-            "dist_hosp_loc": dist_hosp["loc"],
+            "dist_hosp_loc": dist_hosp["distribution_loc"],
             "dist_hosp_scale": dist_hosp["scale"],
             "mechanistic_hosp": dist_hosp["mechanistic_loc"],
             "residual_hosp": dist_hosp["residual_loc"],
             "residual_input_hosp": dist_hosp["residual_input"],
-            "dist_cases_loc": dist_cases["loc"],
+            "dist_cases_loc": dist_cases["distribution_loc"],
             "dist_cases_scale": dist_cases["scale"],
             "mechanistic_cases": dist_cases["mechanistic_loc"],
             "residual_cases": dist_cases["residual_loc"],
             "residual_input_cases": dist_cases["residual_input"],
-            "dist_deaths_loc": dist_deaths["loc"],
+            "dist_deaths_loc": dist_deaths["distribution_loc"],
             "dist_deaths_scale": dist_deaths["scale"],
             "mechanistic_deaths": dist_deaths["mechanistic_loc"],
             "residual_deaths": dist_deaths["residual_loc"],

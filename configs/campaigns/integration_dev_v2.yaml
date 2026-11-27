@@ -1,0 +1,75 @@
+schema_version: 1
+campaign_id: epiforecaster_integration_dev_v2
+stage: ablation
+hypothesis: >-
+  Development screen of mechanistic integration variants under the production
+  defaults: the 280 population-floor targets of real_with_id_v2, the production
+  scale floors and the censored zero-clipped WIS objective. It repeats the
+  integration_dev_v1 real-data conditions, whose regularizer weights were set
+  against the Normal NLL, and sweeps the history reconstruction weight because
+  the WIS observation loss has a different scale. It uses the base-config
+  seed-42 node split without cross-validation folds, so it is development
+  evidence and cannot support model-selection claims.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: real-base
+fixed_overrides: {}
+smoke_overrides:
+  training:
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
+conditions:
+  - name: real-base
+    hypothesis: The production configuration trained from scratch on real data is the paired reference.
+    overrides: {}
+    allowed_difference_paths: []
+  - name: real-betaonly
+    hypothesis: Fixing every rate except the transmission rate over the horizon, with a smoothness penalty on it, constrains the latent without losing forecast skill.
+    overrides: {model: {sir_physics: {time_varying_rates: beta}}, training: {loss: {joint: {beta_smoothness_weight: 10.0}}}}
+    allowed_difference_paths: [model.sir_physics.time_varying_rates, training.loss.joint.beta_smoothness_weight]
+  - name: real-hist
+    hypothesis: Rolling the latent forward over 56 history days and reconstructing the observed history at the integration_dev_v1 weight anchors the origin state.
+    overrides: {model: {sir_physics: {rollforward_history_steps: 56}}, training: {loss: {joint: {history_reconstruction_weight: 0.5}}}}
+    allowed_difference_paths: [model.sir_physics.rollforward_history_steps, training.loss.joint.history_reconstruction_weight]
+  - name: real-hist-w0p1
+    hypothesis: A 0.1 reconstruction weight keeps the history anchor without the over-regularization seen at 0.5 in integration_dev_v1 real-combo.
+    overrides: {model: {sir_physics: {rollforward_history_steps: 56}}, training: {loss: {joint: {history_reconstruction_weight: 0.1}}}}
+    allowed_difference_paths: [model.sir_physics.rollforward_history_steps, training.loss.joint.history_reconstruction_weight]
+  - name: real-hist-w0p05
+    hypothesis: A 0.05 reconstruction weight bounds how weak the history anchor can be and still prevent latent collapse.
+    overrides: {model: {sir_physics: {rollforward_history_steps: 56}}, training: {loss: {joint: {history_reconstruction_weight: 0.05}}}}
+    allowed_difference_paths: [model.sir_physics.rollforward_history_steps, training.loss.joint.history_reconstruction_weight]
+  - name: real-hospweek
+    hypothesis: Summing the latent admission flow over each reporting week matches weekly hospitalization totals.
+    overrides: {model: {observation_heads: {hosp_week_total: true}}}
+    allowed_difference_paths: [model.observation_heads.hosp_week_total]
+  - name: real-renewal
+    hypothesis: A renewal force of infection, with cases and wastewater sourced from latent incidence, improves forecasts.
+    overrides: {model: {sir_physics: {force_of_infection: renewal}, observation_heads: {cases_source: infection_flow, relevant_source_cases: infection_flow, ww_source: infection_flow, relevant_source_ww: infection_flow}}}
+    allowed_difference_paths: [model.sir_physics.force_of_infection, model.observation_heads.cases_source, model.observation_heads.relevant_source_cases, model.observation_heads.ww_source, model.observation_heads.relevant_source_ww]
+  - name: real-combo
+    hypothesis: History roll-forward, beta-only rates, weekly hospitalization totals, wastewater incidence, and a residual penalty combine.
+    overrides:
+      model:
+        sir_physics: {rollforward_history_steps: 56, time_varying_rates: beta}
+        observation_heads: {hosp_week_total: true, ww_source: infection_flow, relevant_source_ww: infection_flow}
+      training:
+        loss: {joint: {history_reconstruction_weight: 0.5, beta_smoothness_weight: 10.0, residual_penalty_weight: 0.1}}
+    allowed_difference_paths: [model.sir_physics.rollforward_history_steps, model.sir_physics.time_varying_rates, model.observation_heads.hosp_week_total, model.observation_heads.ww_source, model.observation_heads.relevant_source_ww, training.loss.joint.history_reconstruction_weight, training.loss.joint.beta_smoothness_weight, training.loss.joint.residual_penalty_weight]
+# Paired stochastic-training replicates on the base-config split (split_seed 42).
+paired_model_seeds: [42, 43, 44, 45, 46]
+metrics:
+  primary: {name: mean_target_wis, direction: minimize}
+  secondary: [mae_median, rmse_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true

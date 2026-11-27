@@ -1,0 +1,10 @@
+outs:
+- md5: 0ff9ace36dce9637ab739a56c94ad910.dir
+  size: 3990067439
+  nfiles: 2070
+  hash: md5
+  path: dasymetric_mob_full-20261104b
+meta:
+  source: dasymetric_mob promotions/full-20261104b
+  source_pointer_sha256: b3c9d756a28dbe6cf283027ba768663b0c23a731b7b449a4c95f77f111b3f419
+  sealed_inputs_sha256: 09a2ca03c02fd735ac5ccf431c19fe03b5909e69aaafe5febb7c8abc5a4e1dba

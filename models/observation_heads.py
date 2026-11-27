@@ -353,13 +353,15 @@ def _compose_observation_prediction(
     anchor_mode: str,
     last_observed: torch.Tensor | None,
     last_observed_mask: torch.Tensor | None,
+    censored_location: bool,
 ) -> dict[str, torch.Tensor]:
     """Compose an exact mechanistic-plus-residual observation decomposition.
 
     For anchored delta forecasts, the mechanistic output is the prediction obtained
     with the residual path disabled. The residual contribution is defined as the
     exact difference between the full and residual-disabled predictions, including
-    interactions with the non-negativity clamp.
+    interactions with the non-negativity clamp. A censored head leaves the
+    anchored location unclamped; ``_split_distribution_location`` clips it.
     """
     full_raw = mechanistic_raw + residual_raw
     full = full_raw
@@ -378,14 +380,11 @@ def _compose_observation_prediction(
             posinf=0.0,
             neginf=0.0,
         ).unsqueeze(1)
-        full_anchored = torch.clamp(
-            last_obs_safe + full_raw - full_raw[:, 0:1],
-            min=0.0,
-        )
-        mechanistic_anchored = torch.clamp(
-            last_obs_safe + mechanistic_raw - mechanistic_raw[:, 0:1],
-            min=0.0,
-        )
+        full_anchored = last_obs_safe + full_raw - full_raw[:, 0:1]
+        mechanistic_anchored = last_obs_safe + mechanistic_raw - mechanistic_raw[:, 0:1]
+        if not censored_location:
+            full_anchored = full_anchored.clamp(min=0.0)
+            mechanistic_anchored = mechanistic_anchored.clamp(min=0.0)
         full = torch.where(valid_mask, full_anchored, full_raw)
         mechanistic = torch.where(
             valid_mask,
@@ -399,6 +398,24 @@ def _compose_observation_prediction(
         "mechanistic_loc": mechanistic,
         "residual_loc": residual,
     }
+
+
+def _split_distribution_location(
+    components: dict[str, torch.Tensor], censored_location: bool
+) -> None:
+    """Add ``distribution_loc``, the location of the predictive distribution.
+
+    A censored head keeps the composed location as that of a Normal censored at
+    zero, which may be negative, and reports the censored median
+    ``max(location, 0)`` as the point prediction ``loc``. The mechanistic
+    component is clipped likewise, so the residual stays the exact difference
+    between the full and residual-disabled predictions.
+    """
+    components["distribution_loc"] = components["loc"]
+    if censored_location:
+        components["loc"] = components["loc"].clamp_min(0.0)
+        components["mechanistic_loc"] = components["mechanistic_loc"].clamp_min(0.0)
+        components["residual_loc"] = components["loc"] - components["mechanistic_loc"]
 
 
 class DelayKernel(nn.Module):
@@ -1087,6 +1104,8 @@ class ClinicalObservationHead(nn.Module):
         kernel_mlp: bool = False,
         distribution_scale_init: float = 0.3,
         distribution_scale_floor: float = 1.0e-3,
+        count_step_scale_floor: float = 0.0,
+        censored_location: bool = False,
         aggregation_window: int = 1,
     ):
         super().__init__()
@@ -1102,10 +1121,19 @@ class ClinicalObservationHead(nn.Module):
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
         self.distribution_scale_floor = float(distribution_scale_floor)
+        # Fraction of the log1p(per-100k) value of one count in the target
+        # region, log1p(100000 / population), used as a population-dependent
+        # floor of the predictive scale. Zero keeps the constant floor.
+        self.count_step_scale_floor = float(count_step_scale_floor)
+        self.censored_location = censored_location
         if distribution_scale_init <= 0:
             raise ValueError("distribution_scale_init must be positive")
         if distribution_scale_floor <= 0:
             raise ValueError("distribution_scale_floor must be positive")
+        if not math.isfinite(self.count_step_scale_floor) or (
+            self.count_step_scale_floor < 0
+        ):
+            raise ValueError("count_step_scale_floor must be finite and non-negative")
 
         if kernel_mlp:
             self.delay_kernel = MLPKernel(kernel_length=kernel_length, hidden_dim=32)
@@ -1264,11 +1292,13 @@ class ClinicalObservationHead(nn.Module):
             anchor_mode=self.anchor_mode,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            censored_location=self.censored_location,
         )
         _bound_composed_residual(
             components,
             self.get_buffer("_residual_max_log_location_fraction"),
         )
+        _split_distribution_location(components, self.censored_location)
         output_components = {
             key: value if value.dtype == out_dtype else value.to(out_dtype)
             for key, value in components.items()
@@ -1284,6 +1314,7 @@ class ClinicalObservationHead(nn.Module):
         last_observed: torch.Tensor | None = None,
         last_observed_mask: torch.Tensor | None = None,
         origin_index: int = 0,
+        population: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
         components = self.forward_components(
@@ -1293,8 +1324,10 @@ class ClinicalObservationHead(nn.Module):
             last_observed_mask=last_observed_mask,
             origin_index=origin_index,
         )
-        loc = components["loc"]
-        scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
+        loc = components["distribution_loc"]
+        scale = self.get_distribution_scale(
+            obs_context=obs_context, like=loc, population=population
+        )
         return {**components, "scale": scale}
 
     def get_scale(self) -> torch.Tensor:
@@ -1338,16 +1371,36 @@ class ClinicalObservationHead(nn.Module):
         *,
         obs_context: torch.Tensor | None,
         like: torch.Tensor,
+        population: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Get positive predictive scale aligned to ``like``."""
+        floor = self._scale_floor(population)
         if self.distribution_scale_proj is not None and obs_context is not None:
             raw_scale = self.distribution_scale_proj(obs_context).squeeze(-1)
-            scale = F.softplus(raw_scale.float()) + self.distribution_scale_floor
+            scale = F.softplus(raw_scale.float()) + floor
         else:
             base = _safe_exp_from_log(self.log_distribution_scale).to(like.dtype)
-            scale = base + self.distribution_scale_floor
-            scale = scale.expand_as(like)
+            scale = (base + floor).expand_as(like)
         return scale.to(like.dtype)
+
+    def _scale_floor(self, population: torch.Tensor | None) -> torch.Tensor | float:
+        """Scale floor: the constant floor, or one per sample ``[B, 1]``.
+
+        A count of one in a region of ``N`` residents is ``log1p(100000 / N)`` in
+        target space, so a forecast sitting on zero with a collapsed scale misses
+        the next single count by that distance. Flooring the scale at a fraction
+        ``f`` of the count step bounds that miss at ``1 / f`` standard deviations
+        for every population.
+        """
+        if self.count_step_scale_floor == 0.0:
+            return self.distribution_scale_floor
+        if population is None:
+            raise ValueError("count_step_scale_floor requires the target population")
+        count_step = torch.log1p(100_000.0 / population.float().clamp_min(1.0))
+        floor = (self.count_step_scale_floor * count_step).clamp_min(
+            self.distribution_scale_floor
+        )
+        return floor.unsqueeze(-1)
 
     def __repr__(self) -> str:
         return (
@@ -1401,12 +1454,14 @@ class WastewaterObservationHead(nn.Module):
         kernel_mlp: bool = False,
         distribution_scale_init: float = 0.3,
         distribution_scale_floor: float = 1.0e-3,
+        censored_location: bool = False,
     ):
         super().__init__()
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
         self.distribution_scale_floor = float(distribution_scale_floor)
+        self.censored_location = censored_location
         if distribution_scale_init <= 0:
             raise ValueError("distribution_scale_init must be positive")
         if distribution_scale_floor <= 0:
@@ -1574,11 +1629,13 @@ class WastewaterObservationHead(nn.Module):
             anchor_mode=self.anchor_mode,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
+            censored_location=self.censored_location,
         )
         _bound_composed_residual(
             components,
             self.get_buffer("_residual_max_log_location_fraction"),
         )
+        _split_distribution_location(components, self.censored_location)
         output_components = {
             key: value if value.dtype == out_dtype else value.to(out_dtype)
             for key, value in components.items()
@@ -1605,7 +1662,7 @@ class WastewaterObservationHead(nn.Module):
             last_observed_mask=last_observed_mask,
             origin_index=origin_index,
         )
-        loc = components["loc"]
+        loc = components["distribution_loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
         return {**components, "scale": scale}
 

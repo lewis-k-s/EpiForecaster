@@ -93,7 +93,14 @@ class MobilityProcessor:
 
             print(f"Reconstructed mobility tensor: {ds['mobility'].shape}")
 
-        ds = ds.rename({"target": "destination"})
+        # Real municipality stores name the second region dimension `destination`;
+        # the legacy packed store and synthetic corpora name it `target`.
+        if "target" in ds.dims:
+            ds = ds.rename({"target": "destination"})
+
+        # `source_version` labels each date's upstream source; it is provenance,
+        # not an OD signal, so it must not enter alignment or the dataset.
+        ds = ds.drop_vars("source_version", errors="ignore")
 
         # For real (non-synthetic) data, add run_id dimension to match synthetic format
         if "run_id" not in ds.dims:

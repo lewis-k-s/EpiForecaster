@@ -177,6 +177,54 @@ class TestPipelineMasksAndMetadata:
         assert bool(mask.sel(run_id=0, region_id="R1"))
         assert not bool(mask.sel(run_id=0, region_id="R2"))
 
+    def test_compute_valid_targets_mask_positive_basis(self, mock_config):
+        """With observed zeros, density counts the days with a positive count."""
+        dates = pd.date_range("2022-01-01", periods=10)
+        cases_data = np.zeros((1, 10, 2), dtype=np.float32)
+        cases_data[0, :6, 0] = 3.0
+        cases_data[0, :2, 1] = 3.0
+        ds = xr.Dataset(
+            {
+                "cases": (["run_id", "date", REGION_COORD], cases_data),
+                "cases_mask": (
+                    ["run_id", "date", REGION_COORD],
+                    np.ones((1, 10, 2), dtype=bool),
+                ),
+            },
+            coords={"run_id": [0], "date": dates, REGION_COORD: ["R1", "R2"]},
+        )
+        mock_config.min_density_threshold = 0.5
+
+        observed = OfflinePreprocessingPipeline(
+            mock_config
+        )._compute_valid_targets_mask(ds)
+        assert observed.sel(run_id=0).values.tolist() == [1, 1]
+
+        mock_config.valid_target_density_basis = "positive"
+        positive = OfflinePreprocessingPipeline(
+            mock_config
+        )._compute_valid_targets_mask(ds)
+        assert positive.sel(run_id=0).values.tolist() == [1, 0]
+
+    def test_compute_valid_targets_mask_population_floor(self, mock_config):
+        """A population floor selects targets without reading case counts."""
+        dates = pd.date_range("2022-01-01", periods=4)
+        cases_data = np.zeros((1, 4, 3), dtype=np.float32)
+        cases_data[0, :, 2] = 9.0  # the active region is the smallest one
+        ds = xr.Dataset(
+            {
+                "cases": (["run_id", "date", REGION_COORD], cases_data),
+                "population": ([REGION_COORD], [3000.0, np.nan, 2999.0]),
+            },
+            coords={"run_id": [0], "date": dates, REGION_COORD: ["R1", "R2", "R3"]},
+        )
+        mock_config.valid_target_min_population = 3000.0
+
+        mask = OfflinePreprocessingPipeline(mock_config)._compute_valid_targets_mask(ds)
+
+        assert mask.dims == ("run_id", REGION_COORD)
+        assert mask.sel(run_id=0).values.tolist() == [1, 0, 0]
+
     @patch("xarray.open_dataarray")
     def test_compute_edar_region_mask(self, mock_open_da, mock_config):
         """Test edar_has_source mask alignment/reindex."""

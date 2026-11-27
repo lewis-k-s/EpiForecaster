@@ -9,6 +9,9 @@ import numpy as np
 import torch
 
 from evaluation.distribution_scores import (
+    censored_normal_crps,
+    censored_normal_nll,
+    clipped_interval,
     distribution_wis,
     standard_wis_half_widths,
     student_t_crps,
@@ -371,6 +374,7 @@ def _distribution_metric_step(
     scale_floor: float,
     wis_half_widths: torch.Tensor,
     interval_half_widths: dict[str, torch.Tensor],
+    censored: bool,
 ) -> tuple[MetricSums, ProbabilisticBatchMetrics]:
     """Add one batch of probabilistic scores to ``sums``."""
     loc_clean = _clean_values(loc)
@@ -390,22 +394,27 @@ def _distribution_metric_step(
     invalid = (~torch.isfinite(loc) | ~torch.isfinite(scale) | (scale <= 0)) & active
     per_h = "per_h_nll" in sums
 
-    nll = torch.nan_to_num(
-        _distribution_nll(
+    if censored:
+        raw_nll = censored_normal_nll(loc_clean, scale_clean, target_clean)
+        crps = censored_normal_crps(loc_clean, scale_clean, target_clean)
+    else:
+        raw_nll = _distribution_nll(
             loc=loc_clean,
             scale=scale_clean,
             target=target_clean,
             distribution_family=distribution_family,
             distribution_df=distribution_df,
-        ),
+        )
+        if distribution_family == "normal":
+            crps = _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean)
+        else:
+            crps = student_t_crps(loc_clean, scale_clean, target_clean, distribution_df)
+    nll = torch.nan_to_num(
+        raw_nll,
         nan=_VALUE_CLAMP,
         posinf=_VALUE_CLAMP,
         neginf=-_VALUE_CLAMP,
     ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-    if distribution_family == "normal":
-        crps = _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean)
-    else:
-        crps = student_t_crps(loc_clean, scale_clean, target_clean, distribution_df)
     wis = distribution_wis(loc_clean, scale_clean, target_clean, wis_half_widths)
     weighted_nll = nll * mask
     weighted_crps = crps * mask
@@ -428,13 +437,13 @@ def _distribution_metric_step(
 
     intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for level_name, standard_half_width in interval_half_widths.items():
-        half_width = scale_clean * standard_half_width.to(scale_clean.dtype)
-        low = loc_clean - half_width
-        high = loc_clean + half_width
+        low, high = clipped_interval(
+            loc_clean, scale_clean * standard_half_width.to(scale_clean.dtype)
+        )
         intervals[level_name] = (low, high)
         covered = ((target_clean >= low) & (target_clean <= high)).to(mask.dtype)
         weighted_covered = covered * mask
-        weighted_width = (high - low).clamp_min(0.0) * mask
+        weighted_width = (high - low) * mask
         new_sums[f"coverage_{level_name}"] = (
             sums[f"coverage_{level_name}"] + weighted_covered.sum()
         )
@@ -471,12 +480,14 @@ class TorchDistributionMetricAccumulator:
         scale_floor: float = 1.0e-3,
         interval_levels: list[float] | tuple[float, ...] = (0.5, 0.8, 0.95),
         compile_step: bool = False,
+        censored: bool = False,
     ) -> None:
         self.device = device
         self.horizon = horizon
         self.distribution_family = distribution_family.lower()
         self.distribution_df = float(distribution_df)
         self.scale_floor = float(scale_floor)
+        self.censored = censored
         self.interval_levels = tuple(float(level) for level in interval_levels)
         if self.distribution_family not in {"normal", "student_t"}:
             raise ValueError(
@@ -489,6 +500,11 @@ class TorchDistributionMetricAccumulator:
             )
         if self.scale_floor <= 0:
             raise ValueError(f"scale_floor must be positive, got {self.scale_floor}")
+        if self.censored and self.distribution_family != "normal":
+            raise ValueError(
+                "censored scores require distribution_family='normal', "
+                f"got {self.distribution_family!r}"
+            )
 
         self.level_names = tuple(
             interval_level_name(level) for level in self.interval_levels
@@ -562,6 +578,7 @@ class TorchDistributionMetricAccumulator:
             scale_floor=self.scale_floor,
             wis_half_widths=self.wis_half_widths,
             interval_half_widths=self.interval_half_widths,
+            censored=self.censored,
         )
         return batch
 

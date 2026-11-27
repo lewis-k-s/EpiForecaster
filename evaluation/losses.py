@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 
 from evaluation.distribution_scores import (
+    censored_normal_crps,
+    censored_normal_nll,
     distribution_wis,
     standard_wis_half_widths,
     student_t_crps,
@@ -86,6 +88,7 @@ def get_loss_from_config(
         distribution_family=joint_cfg.distribution_family,
         distribution_df=joint_cfg.distribution_df,
         distribution_scale_floor=observation_heads_config.distribution_scale_floor,
+        censored=observation_heads_config.censored_location,
         interval_levels=joint_cfg.interval_levels,
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
         latent_total_weight=joint_cfg.latent.total_weight,
@@ -187,6 +190,7 @@ class JointInferenceLoss(nn.Module):
         distribution_family: str = "normal",
         distribution_df: float = 5.0,
         distribution_scale_floor: float = 1.0e-3,
+        censored: bool = False,
         interval_levels: list[float] | tuple[float, ...] | None = None,
         obs_weight_sum: float = 0.95,
         latent_total_weight: float = 0.0,
@@ -221,6 +225,7 @@ class JointInferenceLoss(nn.Module):
         self.distribution_family = distribution_family.lower()
         self.distribution_df = float(distribution_df)
         self.distribution_scale_floor = float(distribution_scale_floor)
+        self.censored = censored
         self.interval_levels = tuple(
             float(v) for v in (interval_levels or (0.5, 0.8, 0.95))
         )
@@ -293,6 +298,11 @@ class JointInferenceLoss(nn.Module):
             )
         if not math.isfinite(self.distribution_df):
             raise ValueError("distribution_df must be finite")
+        if self.censored and self.distribution_family != "normal":
+            raise ValueError(
+                "model.observation_heads.censored_location requires "
+                f"distribution_family='normal', got {self.distribution_family!r}"
+            )
         self.register_buffer(
             "wis_half_widths",
             torch.tensor(
@@ -594,6 +604,8 @@ class JointInferenceLoss(nn.Module):
         target: torch.Tensor,
     ) -> torch.Tensor:
         if self.observation_loss == "nll":
+            if self.censored:
+                return censored_normal_nll(loc, scale, target)
             if self.distribution_family == "normal":
                 z = (target - loc) / scale
                 return 0.5 * z**2 + torch.log(scale) + 0.5 * _LOG_TWO_PI
@@ -607,6 +619,8 @@ class JointInferenceLoss(nn.Module):
             return -dist.log_prob(target)
 
         if self.observation_loss == "crps":
+            if self.censored:
+                return censored_normal_crps(loc, scale, target)
             if self.distribution_family == "student_t":
                 return student_t_crps(loc, scale, target, self.distribution_df)
             return self._normal_crps(loc=loc, scale=scale, target=target)
