@@ -16,6 +16,7 @@ import seaborn as sns
 import xarray as xr
 
 from data.preprocess.config import REGION_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from dataviz.granular_comparison import (
     TARGET_ORDER,
     _format_target_label,
@@ -275,7 +276,7 @@ def _compute_canonical_sparsity(
     dataset_path: Path,
     run_id: Any,
 ) -> pd.DataFrame:
-    dataset = xr.open_zarr(dataset_path)
+    dataset = open_zarr_store(dataset_path)
     try:
         dataset = _select_run(dataset, run_id)
         region_ids = dataset[REGION_COORD].values

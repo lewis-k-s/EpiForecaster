@@ -1224,9 +1224,9 @@ def _run_preprocessing_attempt(
         output_root / f"{preprocessing_dataset_name(config)}{PROCESSED_DATASET_SUFFIX}"
     )
 
-    from data.epi_dataset import open_processed_dataset
+    from data.preprocess.zarr_layout import open_zarr_store
 
-    dataset = open_processed_dataset(built_dataset)
+    dataset = open_zarr_store(built_dataset)
     try:
         qa_record = {
             "schema_version": 2,

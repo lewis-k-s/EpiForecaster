@@ -16,6 +16,7 @@ import xarray as xr
 
 from data.dataset_factory import split_nodes_by_ratio
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 
 
@@ -108,7 +109,7 @@ def load_valid_mobility(
     if not 0.0 < high_flow_event_quantile < 1.0:
         raise ValueError("high_flow_event_quantile must be between zero and one")
 
-    dataset = xr.open_zarr(dataset_path, consolidated=True)
+    dataset = open_zarr_store(dataset_path)
     try:
         selected = _select_run(dataset, run_id)
         valid_mask = np.asarray(selected["valid_targets"].values, dtype=bool)
@@ -176,7 +177,7 @@ def build_independent_seed_splits(
     ]
     config = EpiForecasterConfig.load(str(config_path), overrides=overrides)
     dataset = _select_run(
-        xr.open_zarr(dataset_path, consolidated=True),
+        open_zarr_store(dataset_path),
         run_id,
     )
     try:
@@ -467,7 +468,7 @@ def load_balance_features(
     import geopandas as gpd
     from libpysal.weights import Queen
 
-    dataset = xr.open_zarr(dataset_path, consolidated=True)
+    dataset = open_zarr_store(dataset_path)
     try:
         selected = _select_run(dataset, run_id)
         selected = selected.sel(region_id=network.region_ids)

@@ -50,8 +50,8 @@ def _write_run(
     provenance = run_dir / "training_provenance.json"
     evaluation_manifest = run_dir / "evaluation_manifest.json"
 
-    dataset_pointer = "data/processed/real_with_id.zarr.dvc"
-    dataset_output = "data/processed/real_with_id.zarr"
+    dataset_pointer = "data/processed/real_with_id.zarr.zip.dvc"
+    dataset_output = "data/processed/real_with_id.zarr.zip"
     dvc_md5 = "c" * 32 + ".dir"
     identity = {
         "git_sha": "a" * 40,
@@ -427,7 +427,7 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
     assert inventory[0]["init_checkpoint_sha256"] == ""
     assert inventory[1]["init_checkpoint_sha256"] == "f" * 64
     assert (
-        "data/processed/real_with_id.zarr.dvc"
+        "data/processed/real_with_id.zarr.zip.dvc"
         in inventory[0]["evaluation_dvc_targets_json"]
     )
     assert {

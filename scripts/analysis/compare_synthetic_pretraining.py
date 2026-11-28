@@ -18,7 +18,7 @@ import yaml
 
 SCHEMA_VERSION = 1
 DATASET_ROLE_POINTERS = {
-    "real": "data/processed/real_with_id.zarr.dvc",
+    "real": "data/processed/real_with_id.zarr.zip.dvc",
     "synthetic": (
         "data/processed/"
         "synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip.dvc"

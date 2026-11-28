@@ -33,18 +33,10 @@ from .mobility_preprocessor import (  # noqa: E402
     MobilityPreprocessorConfig,
 )
 from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
-from .preprocess.zarr_layout import is_zarr_zip, open_zarr_zip  # noqa: E402
+from .preprocess.zarr_layout import open_zarr_store  # noqa: E402
 from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
-
-
-def open_processed_dataset(path: Path | str, **kwargs: Any) -> xr.Dataset:
-    """Open a processed dataset (packed ``*.zarr.zip`` or Zarr directory)."""
-    p = Path(path)
-    if is_zarr_zip(p):
-        return open_zarr_zip(p, **kwargs)
-    return xr.open_zarr(str(p), **kwargs)
 
 
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")
@@ -735,7 +727,7 @@ class EpiDataset(Dataset):
             return self._dataset
 
         # Reload dataset after unpickling
-        ds = open_processed_dataset(self.aligned_data_path)
+        ds = open_zarr_store(self.aligned_data_path)
         # Re-apply run_id filter (critical for DataLoader workers)
         effective_run_id = (
             self.run_id if self.run_id is not None else self.config.data.run_id
@@ -1893,7 +1885,7 @@ class EpiDataset(Dataset):
         # Always chunk by run_id to prevent loading entire dataset into memory
         chunks = {"run_id": run_id_chunk_size}
 
-        dataset = open_processed_dataset(aligned_data_path, chunks=chunks)
+        dataset = open_zarr_store(aligned_data_path, chunks=chunks)
 
         # Validate run_id exists in dataset
         if "run_id" not in dataset.coords and "run_id" not in dataset.dims:
@@ -1936,7 +1928,7 @@ class EpiDataset(Dataset):
             ValueError: If the dataset does not have a run_id dimension or coordinate.
         """
         # Use chunking to prevent loading all data
-        dataset = open_processed_dataset(aligned_data_path, chunks={"run_id": 1})
+        dataset = open_zarr_store(aligned_data_path, chunks={"run_id": 1})
 
         try:
             if "run_id" not in dataset.coords and "run_id" not in dataset.dims:

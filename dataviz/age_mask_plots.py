@@ -30,6 +30,7 @@ import xarray as xr
 from matplotlib.figure import Figure
 
 from data.preprocess.config import REGION_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 from utils.logging import setup_logging, suppress_zarr_warnings
 from utils.plotting import Colormaps, Palette
@@ -61,7 +62,7 @@ def load_dataset_for_viz(config: EpiForecasterConfig) -> xr.Dataset | None:
         if not zarr_path.exists():
             logger.error(f"Dataset not found: {zarr_path}")
             return None
-        return xr.open_zarr(zarr_path)
+        return open_zarr_store(zarr_path)
     except Exception as e:
         logger.error(f"Failed to load dataset: {e}")
         return None

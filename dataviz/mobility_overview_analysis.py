@@ -1,6 +1,6 @@
 """Overview diagnostics for raw OD mobility matrices.
 
-This script reads ``data/files/mobility.zarr`` with xarray and produces a compact
+This script reads ``data/files/mobility.zarr.zip`` with xarray and produces a compact
 set of mobility indicators useful before deeper regime or epidemiological
 coupling analyses.
 """
@@ -23,6 +23,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+from data.preprocess.zarr_layout import open_zarr_store
 
 logger = logging.getLogger("mobility_overview_analysis")
 
@@ -47,7 +49,7 @@ class MobilityOverviewConfig:
 
 def open_mobility_dataset(path: Path) -> xr.Dataset:
     """Open a mobility Zarr dataset and normalize destination naming."""
-    ds = xr.open_zarr(path, chunks={"date": 1})
+    ds = open_zarr_store(path, chunks={"date": 1})
     if "target" in ds.dims:
         ds = ds.rename({"target": "destination"})
     if "mobility" not in ds:
@@ -358,7 +360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mobility-path",
         type=Path,
-        default=Path("data/files/mobility.zarr"),
+        default=Path("data/files/mobility.zarr.zip"),
         help="Path to the mobility Zarr store",
     )
     parser.add_argument(

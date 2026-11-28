@@ -112,7 +112,7 @@ def preprocess_cli(debug: bool):
 @click.option(
     "--mobility-zarr",
     type=click.Path(path_type=Path),
-    default=Path("data/files/mobility.zarr"),
+    default=Path("data/files/mobility.zarr.zip"),
     show_default=True,
     help="Path to mobility Zarr dataset for OD flows",
 )

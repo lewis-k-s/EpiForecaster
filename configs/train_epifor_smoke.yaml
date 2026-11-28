@@ -2,7 +2,7 @@
 # through the immutable Snakemake workflow.
 
 data:
-  dataset_path: data/processed/real_with_id.zarr
+  dataset_path: data/processed/real_with_id.zarr.zip
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_min_flow_raw: 10.0

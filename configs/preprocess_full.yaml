@@ -22,7 +22,7 @@ vaccination_file: "data/files/vaccination_municipality.csv"
 wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
 region_metadata_file: "data/files/edar_muni_edges.nc"
 population_file: "data/files/fl_population_por_municipis.csv"
-mobility_path: "data/files/mobility.zarr"
+mobility_path: "data/files/mobility.zarr.zip"
 
 # Temporal processing parameters - maximum coverage
 start_date: "2020-03-01" # Earliest case data available

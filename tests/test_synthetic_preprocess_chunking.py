@@ -8,13 +8,16 @@ import pytest
 import warnings
 import xarray as xr
 
-from data.epi_dataset import open_processed_dataset
 from data.preprocess.processors.synthetic_processor import (
     SyntheticProcessor,
     _split_attr_list,
 )
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
-from data.preprocess.zarr_layout import pack_store, with_variable_length_strings
+from data.preprocess.zarr_layout import (
+    open_zarr_store,
+    pack_store,
+    with_variable_length_strings,
+)
 from tests.dataset_test_helpers import make_preprocessing_config
 
 
@@ -866,7 +869,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = open_processed_dataset(output_path)
+    saved = open_zarr_store(output_path)
 
     # One shard per run, whatever the in-memory run_id chunking.
     shards = saved["edar_biomarker_N1_mask"].encoding.get("shards")
@@ -906,7 +909,7 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
     output_path = pipeline.run()
 
-    ds = open_processed_dataset(output_path)
+    ds = open_zarr_store(output_path)
     assert "run_id" in ds.dims
     assert "mobility" in ds
     assert "temporal_covariates" in ds
@@ -979,7 +982,7 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = open_processed_dataset(output_path)
+    saved = open_zarr_store(output_path)
 
     saved_mob = saved["mobility"].isel(
         run_id=0, date=0, origin=slice(0, 2), destination=slice(0, 2)

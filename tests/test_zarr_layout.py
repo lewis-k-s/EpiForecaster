@@ -10,12 +10,12 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from data.epi_dataset import open_processed_dataset
 from data.preprocess.zarr_layout import (
     LAYOUT_VERSION,
     MOBILITY_DATE_CHUNK,
     bitround,
     build_encoding,
+    open_zarr_store,
     open_zarr_zip,
     write_dataset,
 )
@@ -85,6 +85,19 @@ def test_write_dataset_round_trips_values_with_any_worker_count(tmp_path, worker
     assert sorted(p.name for p in tmp_path.iterdir()) == ["tiny.zarr.zip"]
 
 
+def test_parallel_write_reads_a_packed_source_correctly(tmp_path):
+    # The synthetic preprocess opens the packed raw corpus before its workers
+    # fork, so every worker must read through its own archive handle.
+    source = _dataset(runs=8, dates=130, regions=60)
+    packed = tmp_path / "source.zarr.zip"
+    write_dataset(source, packed, workers=1)
+    destination = tmp_path / "copy.zarr.zip"
+
+    write_dataset(open_zarr_zip(packed, chunks={"run_id": 1}), destination, workers=4)
+
+    _assert_same_values(open_zarr_zip(destination), source)
+
+
 def test_parallel_and_serial_outputs_hold_the_same_members(tmp_path):
     source = _dataset().chunk({"run_id": 1})
     serial, parallel = tmp_path / "s.zarr.zip", tmp_path / "p.zarr.zip"
@@ -129,11 +142,11 @@ def test_write_dataset_requires_packed_suffix(tmp_path):
         write_dataset(_dataset(), tmp_path / "tiny.zarr", workers=1)
 
 
-def test_open_processed_dataset_dispatches_packed_zarr(tmp_path):
+def test_open_zarr_store_dispatches_packed_zarr(tmp_path):
     destination = tmp_path / "tiny.zarr.zip"
     write_dataset(_dataset(), destination, workers=1)
 
-    saved = open_processed_dataset(destination)
+    saved = open_zarr_store(destination)
     assert saved.mobility.encoding["shards"] == (1, 130, 6, 6)
 
 

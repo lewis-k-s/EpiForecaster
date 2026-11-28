@@ -16,6 +16,7 @@ from utils.logging import suppress_zarr_warnings
 suppress_zarr_warnings()
 
 from ..config import TEMPORAL_COORD, PreprocessingConfig  # noqa: E402
+from ..zarr_layout import is_zarr_zip, open_zarr_store  # noqa: E402
 
 
 class MobilityProcessor:
@@ -51,8 +52,8 @@ class MobilityProcessor:
                 chunks={"run_id": self.config.run_id_chunk_size},
             )
         else:
-            ds = xr.open_zarr(  # type: ignore[arg-type]
-                str(path),
+            ds = open_zarr_store(
+                path,
                 chunks={"run_id": self.config.run_id_chunk_size},
             )
 
@@ -147,8 +148,10 @@ class MobilityProcessor:
 
         mobility_dir = Path(mobility_path)  # type: ignore[assignment]
 
-        if not mobility_dir.is_dir():
-            raise ValueError(f"Mobility path must be a Zarr directory: {mobility_dir}")
+        if not (mobility_dir.is_dir() or is_zarr_zip(mobility_dir)):
+            raise ValueError(
+                f"Mobility path must be a Zarr directory or .zarr.zip: {mobility_dir}"
+            )
 
         mobility_data = self._open_dataset(str(mobility_dir))
 
