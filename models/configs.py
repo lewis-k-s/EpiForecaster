@@ -46,6 +46,35 @@ class ProfilerConfig:
     with_stack: bool = False
 
 
+@dataclass
+class LatentInformationConfig:
+    """Latent-information indicators from ``training.latent_information``.
+
+    The indicators (``latent_info_*``) move every evaluation batch to CPU and
+    run permutation and bootstrap resamples, so they run only in final test
+    evaluations (trainer test split and ``eval_checkpoint``).
+    """
+
+    enabled: bool = True
+    # Permutations and bootstrap resamples behind the ``_null95``, ``_q05`` and
+    # ``_q95`` bounds.
+    resample_count: int = 200
+    # Cap on windows entering the resamples; a seeded subsample is drawn above it.
+    max_resample_windows: int = 20_000
+
+    def __post_init__(self) -> None:
+        if self.resample_count < 1:
+            raise ValueError(
+                f"latent_information.resample_count must be >= 1, got "
+                f"{self.resample_count}"
+            )
+        if self.max_resample_windows < 1:
+            raise ValueError(
+                f"latent_information.max_resample_windows must be >= 1, got "
+                f"{self.max_resample_windows}"
+            )
+
+
 _LATENT_TASKS = ("s", "i", "h", "r", "death_flow")
 
 
@@ -1219,6 +1248,9 @@ class TrainingParams:
         10  # Log progress every N steps to reduce CPU-GPU sync
     )
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    latent_information: LatentInformationConfig = field(
+        default_factory=LatentInformationConfig
+    )
     # Horizon metric aggregation strategy for W&B logging.
     # - "individual": Log per-timestep metrics (H1, H2, H3, ...)
     # - "weekly": Aggregate into weekly buckets (week1, week2, week3, ...)
@@ -1327,6 +1359,9 @@ class TrainingParams:
         if isinstance(self.profiler, (dict, DictConfig)):
             profiler_dict = cast(dict[str, Any], self.profiler)
             self.profiler = ProfilerConfig(**profiler_dict)
+        if isinstance(self.latent_information, (dict, DictConfig)):
+            latent_information_dict = cast(dict[str, Any], self.latent_information)
+            self.latent_information = LatentInformationConfig(**latent_information_dict)
 
         loss_name = (self.loss.name or "").lower()
         if loss_name != "joint_inference":
@@ -1608,6 +1643,20 @@ class EpiForecasterConfig:
     training: TrainingParams = MISSING
     output: OutputConfig = MISSING
     env: str | None = None
+
+    def __post_init__(self) -> None:
+        # Partial configs (tests, tooling) may leave a section unset.
+        if self.model is MISSING or self.training is MISSING:
+            return
+        heads = self.model.observation_heads
+        if self.training.residual_schedule.enabled and heads.mechanistic_disabled_heads:
+            raise ValueError(
+                "training.residual_schedule.enabled is incompatible with "
+                "model.observation_heads.mechanistic_disabled_heads="
+                f"{heads.mechanistic_disabled_heads!r}: the residual budget is "
+                "relative to the mechanistic log location, so on such a head it "
+                "would silence the prediction."
+            )
 
     @classmethod
     def _reject_obsolete_mobility_fields(cls, data_dict: dict) -> None:

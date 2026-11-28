@@ -5,10 +5,12 @@ import math
 import pytest
 import torch
 
+import evaluation.latent_information as latent_information
 from evaluation.latent_information import (
     MAX_LAG_DAYS,
     TorchLatentInformationAccumulator,
 )
+from models.configs import LatentInformationConfig
 
 pytestmark = pytest.mark.epiforecaster
 
@@ -40,7 +42,9 @@ def _accumulate(
     week_total_heads: tuple[str, ...] = (),
     true_log: torch.Tensor | None = None,
 ) -> dict[str, float | int]:
-    accumulator = TorchLatentInformationAccumulator(week_total_heads=week_total_heads)
+    accumulator = TorchLatentInformationAccumulator(
+        LatentInformationConfig(), week_total_heads=week_total_heads
+    )
     nodes = torch.arange(WINDOWS) % NODES
     for rows in torch.arange(WINDOWS).chunk(batches):
         accumulator.update(
@@ -230,7 +234,7 @@ def test_weekly_blocks_separate_day_of_week_residual_from_dynamics() -> None:
 
 
 def test_heads_without_updates_report_zero_windows_only() -> None:
-    metrics = TorchLatentInformationAccumulator().finalize()
+    metrics = TorchLatentInformationAccumulator(LatentInformationConfig()).finalize()
 
     assert metrics == {
         "latent_info_hosp_window_count": 0,
@@ -294,7 +298,9 @@ def test_week_total_metrics_need_a_declared_head() -> None:
 
     assert not any("week_total" in key for key in metrics)
     with pytest.raises(ValueError, match="Unknown latent-information heads"):
-        TorchLatentInformationAccumulator(week_total_heads=("icu",))
+        TorchLatentInformationAccumulator(
+            LatentInformationConfig(), week_total_heads=("icu",)
+        )
 
 
 def test_true_latent_gives_ceiling_and_latent_recovery() -> None:
@@ -342,7 +348,7 @@ def test_true_latent_gives_ceiling_and_latent_recovery() -> None:
 def test_true_latent_is_optional_but_all_or_none_per_head() -> None:
     series = torch.ones(2, HORIZON, dtype=torch.float64)
     nodes = torch.zeros(2, dtype=torch.long)
-    accumulator = TorchLatentInformationAccumulator()
+    accumulator = TorchLatentInformationAccumulator(LatentInformationConfig())
     batch = {
         "head": "deaths",
         "latent": series,
@@ -358,13 +364,13 @@ def test_true_latent_is_optional_but_all_or_none_per_head() -> None:
     with pytest.raises(ValueError, match="every batch or on none"):
         accumulator.update(**batch, true_latent=series)
     with pytest.raises(ValueError, match="one \\[B, H\\] shape"):
-        TorchLatentInformationAccumulator().update(
+        TorchLatentInformationAccumulator(LatentInformationConfig()).update(
             **batch, true_latent=torch.ones(2, HORIZON + 1)
         )
 
 
 def test_update_rejects_mismatched_shapes_and_unknown_heads() -> None:
-    accumulator = TorchLatentInformationAccumulator()
+    accumulator = TorchLatentInformationAccumulator(LatentInformationConfig())
     series = torch.zeros(2, HORIZON)
     with pytest.raises(ValueError, match="Unknown latent-information head"):
         accumulator.update(
@@ -396,3 +402,38 @@ def test_update_rejects_mismatched_shapes_and_unknown_heads() -> None:
             weights=series,
             nodes=torch.zeros(3, dtype=torch.long),
         )
+
+
+def test_resample_options_set_draw_count_and_window_cap(monkeypatch) -> None:
+    draws: list[int] = []
+    original = latent_information._percentile
+    monkeypatch.setattr(
+        latent_information,
+        "_percentile",
+        lambda values, level: draws.append(len(values)) or original(values, level),
+    )
+    series = _random_walks(torch.Generator().manual_seed(4))
+    nodes = torch.arange(WINDOWS) % NODES
+    accumulator = TorchLatentInformationAccumulator(
+        LatentInformationConfig(resample_count=7, max_resample_windows=50)
+    )
+    accumulator.update(
+        head="cases",
+        latent=_latent_fraction(series),
+        observed=series,
+        prediction=series,
+        residual=series,
+        weights=torch.ones(WINDOWS, HORIZON),
+        nodes=nodes,
+    )
+    metrics = accumulator.finalize()
+
+    assert metrics["latent_info_cases_window_count"] == WINDOWS
+    assert metrics["latent_info_cases_resample_window_count"] == 50
+    assert draws and set(draws) == {7}
+
+
+@pytest.mark.parametrize("field", ["resample_count", "max_resample_windows"])
+def test_resample_options_must_be_positive(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        LatentInformationConfig(**{field: 0})

@@ -6,9 +6,11 @@ import pytest
 import torch
 from types import SimpleNamespace
 
+import evaluation.latent_information as latent_information
 from evaluation.losses import JointInferenceLoss
 from evaluation.metrics import TorchDistributionMetricAccumulator
 from evaluation.epiforecaster_eval import evaluate_loader
+from models.configs import LatentInformationConfig
 
 
 class _DummyLoader:
@@ -113,7 +115,7 @@ def _evaluate(batch: SimpleNamespace, **kwargs):  # noqa: ANN202
 def test_latent_information_indicators_follow_their_flag():
     _loss, disabled, _ = _evaluate(_make_batch(with_residuals=True))
     _loss, enabled, _ = _evaluate(
-        _make_batch(with_residuals=True), latent_information=True
+        _make_batch(with_residuals=True), latent_information=LatentInformationConfig()
     )
 
     assert not any(key.startswith("latent_info_") for key in disabled)
@@ -126,13 +128,29 @@ def test_latent_information_indicators_follow_their_flag():
     assert enabled["latent_info_hosp_observation_count"] == 4
 
 
+def test_latent_information_resample_count_reaches_the_accumulator(monkeypatch):
+    draws: list[int] = []
+    original = latent_information._percentile
+    monkeypatch.setattr(
+        latent_information,
+        "_percentile",
+        lambda values, level: draws.append(len(values)) or original(values, level),
+    )
+    _evaluate(
+        _make_batch(with_residuals=True),
+        latent_information=LatentInformationConfig(resample_count=5),
+    )
+
+    assert draws and set(draws) == {5}
+
+
 def test_latent_information_uses_stored_true_latents_of_the_relevant_source():
     batch = _make_batch(with_residuals=True)
     # [B, H + 1] state target; index 0 is the forecast origin.
     batch.targets_dict["I_target"] = torch.tensor(
         [[0.01, 0.02, 0.04], [0.02, 0.01, 0.03]]
     )
-    _loss, metrics, _ = _evaluate(batch, latent_information=True)
+    _loss, metrics, _ = _evaluate(batch, latent_information=LatentInformationConfig())
 
     # Wastewater and cases read I, which has a stored truth; the admission flow
     # behind hospitalizations has none.

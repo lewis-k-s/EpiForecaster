@@ -15,7 +15,7 @@ import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
-from models.configs import ObservationHeadConfig
+from models.configs import LatentInformationConfig, ObservationHeadConfig
 from models.observation_heads import ClinicalObservationHead, WastewaterObservationHead
 from tests.eval_test_helpers import make_granular_row, write_granular_fixture
 
@@ -577,6 +577,7 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         ),
         training=SimpleNamespace(
             loss=SimpleNamespace(),
+            latent_information=LatentInformationConfig(),
             node_split_population_bins=5,
             node_split_strategy="random",
             test_split=0.2,

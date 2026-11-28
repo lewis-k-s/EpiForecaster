@@ -189,6 +189,25 @@ class TestResidualScheduleConfig:
         rebuilt = EpiForecasterConfig.from_dict(cfg.to_dict())
         assert rebuilt.training.residual_schedule == cfg.training.residual_schedule
 
+    def test_budget_with_mechanistic_disabled_head_is_rejected_at_load(self):
+        overrides = [
+            "model.observation_heads.mechanistic_disabled_heads=[cases]",
+            "training.residual_schedule.enabled=true",
+            (
+                "training.residual_schedule.schedule=[{start_epoch: 0, "
+                "end_epoch: 2, max_log_location_fraction: 0.1}]"
+            ),
+        ]
+        with pytest.raises(Exception, match="mechanistic_disabled_heads"):
+            EpiForecasterConfig.load(
+                Path("configs/train_epifor_smoke.yaml"), overrides=overrides
+            )
+        # Without a schedule the same head selection loads.
+        cfg = EpiForecasterConfig.load(
+            Path("configs/train_epifor_smoke.yaml"), overrides=overrides[:1]
+        )
+        assert cfg.model.observation_heads.mechanistic_disabled_heads == ["cases"]
+
 
 _HEAD_FACTORIES = (
     lambda: ClinicalObservationHead(

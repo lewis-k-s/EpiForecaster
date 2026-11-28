@@ -354,7 +354,10 @@ recorded identity against the bundled `config.yaml`.
 
 Each trial also writes `test_summary.json` beside its aggregate tables. It holds
 every run-level test metric, including the `latent_plausibility_*` and
-`latent_info_*` indicators that the aggregate tables omit. It is not an input to
+`latent_info_*` indicators that the aggregate tables omit. Validation passes
+compute the plausibility indicators too, but only this test summary and the CLI
+`--summary-json` file write them. `training.latent_information.enabled=false`
+drops the `latent_info_*` keys. It is not an input to
 endpoint aggregation.
 
 Each data, training, evaluation, cross-validation, HPO, ablation, selection,

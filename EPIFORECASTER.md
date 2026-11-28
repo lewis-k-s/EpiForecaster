@@ -173,10 +173,12 @@ all five finite, nonnegative targets; other runs use a zero latent weight.
 
 Real data has no latent targets, so evaluation emits ground-truth-free
 indicators of whether the inferred SIRHD latents are epidemiologically
-plausible. They use every forecast window, are computed by
-`TorchLatentPlausibilityAccumulator` in the evaluation loop, and are written to
-`test_summary.json` `metrics` with prefix `latent_plausibility_` next to the
-`latent_*` and `observation_latent_*` metrics. Quantile suffixes are `q05`,
+plausible. They use every forecast window and are computed by
+`TorchLatentPlausibilityAccumulator` in every evaluation pass, including
+per-epoch validation. Only two outputs write them, with prefix
+`latent_plausibility_` next to the `latent_*` and `observation_latent_*`
+metrics: the trainer test summary (`test_summary.json` `metrics`) and the CLI
+`eval epiforecaster --summary-json` file. Quantile suffixes are `q05`,
 `q25`, `median`, `q75`, `q95` (exact `torch.quantile` across windows; NaN and
 non-finite windows excluded). All quantities are population fractions ($N=1$).
 
@@ -227,7 +229,14 @@ forecast. `TorchLatentInformationAccumulator`
 (`evaluation/latent_information.py`) runs in final test evaluations (trainer
 test split and `eval_checkpoint`, not per-epoch validation) and writes
 `latent_info_<head>_*` keys, `head` in `hosp`, `ww`, `cases`, `deaths`, to
-`test_summary.json` `metrics`.
+`test_summary.json` `metrics` and the CLI `--summary-json` file.
+
+The `training.latent_information` block controls it: `enabled` (default `true`;
+`false` omits every `latent_info_*` key), `resample_count` (default `200`
+permutations and bootstrap resamples behind the `_null95`, `_q05` and `_q95`
+bounds) and `max_resample_windows` (default `20000`; above it a seeded
+subsample enters the resamples). The indicators move every batch to CPU, so
+`enabled: false` also removes that cost from a test evaluation.
 
 Each series is centred within its forecast window over supervised days, so a
 region's level and the delta-forecasting anchor carry no information. The latent
@@ -245,10 +254,10 @@ is the head's `relevant_source` compared as $\log(1 + 10^5 x)$.
 |`<metric>_week_total`|Hospitalizations with `relevant_source_hosp: hospitalization_flow`: the four latent-observation metrics and `r2_lat_pred` with the latent summed over days $h..h+6$, the days a weekly total dated on its week start covers. Weeks leaving the horizon are dropped (`week_total_window_count`, `week_total_observation_count`)|
 |`r2_true_obs`, `mi_true_obs`, `te_true_obs`, `sign_true_obs`, `r2_true_obs_weekly`, `lag_r2_true_obs_<m\|p><d>`, `best_lag_true_obs`, `best_lag_r2_true_obs`|Synthetic corpora: the latent-observation metrics with the stored true latent in place of the inferred one, the ceiling of an exactly recovered latent (`true_window_count`, `true_observation_count`)|
 |`r2_lat_true`|Synthetic corpora: within-window squared correlation of the inferred and the true latent|
-|`<metric>_null95`|95th percentile over 200 permutations pairing each window's observations with another window's latent (latent-observation metrics)|
-|`<metric>_q05`, `<metric>_q95`|Region-bootstrap interval, 200 resamples; region sampling only|
+|`<metric>_null95`|95th percentile over `resample_count` permutations pairing each window's observations with another window's latent (latent-observation metrics)|
+|`<metric>_q05`, `<metric>_q95`|Region-bootstrap interval, `resample_count` resamples; region sampling only|
 
-Permutations and bootstraps use at most 20,000 seeded windows
+Permutations and bootstraps use at most `max_resample_windows` seeded windows
 (`resample_window_count`). Overlapping windows make the effective sample smaller
 than `observation_count`.
 

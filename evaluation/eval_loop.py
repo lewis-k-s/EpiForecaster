@@ -44,7 +44,7 @@ from evaluation.pathway_metrics import (
     TorchPathwayMetricAccumulator,
     WindowSpearmanMetricResult,
 )
-from models.configs import EpiForecasterConfig
+from models.configs import EpiForecasterConfig, LatentInformationConfig
 from models.epiforecaster import EpiForecaster
 from models.observation_heads import DelayKernel, SheddingConvolution
 from utils.device import (
@@ -462,7 +462,7 @@ def evaluate_loader(
     output_csv_path: Path | None = None,
     node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
-    latent_information: bool = False,
+    latent_information: LatentInformationConfig | None = None,
 ) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
     """Evaluate a loader and compute loss/metrics matching trainer behavior.
 
@@ -489,9 +489,10 @@ def evaluate_loader(
         output_csv_path: Deprecated alias for node_metrics_csv_path
         node_metrics_target: Canonical target name for the legacy node metrics CSV
         log_every: Progress logging cadence in batches
-        latent_information: Compute the within-window latent-information
-            indicators (``latent_info_*``). They move every batch to CPU, so
-            enable them for final evaluations, not per-epoch validation.
+        latent_information: Options for the within-window latent-information
+            indicators (``latent_info_*``); None skips them. They move every
+            batch to CPU, so pass them for final evaluations, not per-epoch
+            validation.
 
     Returns:
         Tuple of (mean_loss, metrics_dict, node_mae_dict) where:
@@ -577,13 +578,14 @@ def evaluate_loader(
     }
     latent_information_metrics = (
         TorchLatentInformationAccumulator(
+            latent_information,
             week_total_heads=[
                 head
                 for head, source in _WEEK_TOTAL_FLOW_SOURCES.items()
                 if resolved_relevant_sources[head] == source
-            ]
+            ],
         )
-        if latent_information
+        if latent_information is not None
         else None
     )
     loss_ww_sum = torch.tensor(0.0, device=device)
@@ -1731,7 +1733,11 @@ def eval_checkpoint(
             granular_eval_format=resolved_granular_format,
             node_metrics_target=node_metrics_target,
             log_every=log_every,
-            latent_information=True,
+            latent_information=(
+                config.training.latent_information
+                if config.training.latent_information.enabled
+                else None
+            ),
             granular_metadata={
                 "batch_size": batch_size
                 if batch_size is not None

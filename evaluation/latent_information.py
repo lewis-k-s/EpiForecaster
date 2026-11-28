@@ -36,10 +36,10 @@ Metrics, per head ``<head>`` in hosp, ww, cases, deaths (prefix
   7-day steps for hospitalizations and wastewater. ``best_lag_lat_obs`` and
   ``best_lag_r2_lat_obs`` give the maximising lag and its ``r2``.
 * ``<metric>_null95`` for the four latent-observation metrics: the 95th
-  percentile over ``RESAMPLE_COUNT`` permutations that pair each window's
+  percentile over ``options.resample_count`` permutations that pair each window's
   observations with another window's latent trajectory.
 * ``<metric>_q05`` / ``<metric>_q95``: 5th and 95th percentiles over
-  ``RESAMPLE_COUNT`` bootstrap resamples of whole regions. They cover region
+  ``options.resample_count`` bootstrap resamples of whole regions. They cover region
   sampling only, not training randomness.
 * ``<metric>_week_total`` (heads in ``week_total_heads``, the four
   latent-observation metrics and ``r2_lat_pred``): the latent is its forward
@@ -60,7 +60,7 @@ Metrics, per head ``<head>`` in hosp, ww, cases, deaths (prefix
   count their resampled windows.
 * ``window_count``, ``node_count``, ``observation_count`` and
   ``resample_window_count`` (windows entering permutations and bootstraps; a
-  seeded subsample of at most ``MAX_RESAMPLE_WINDOWS``).
+  seeded subsample of at most ``options.max_resample_windows``).
 
 Overlapping windows (stride below the horizon) make the effective sample
 smaller than the observation count.
@@ -73,13 +73,14 @@ from collections.abc import Callable, Collection
 
 import torch
 import torch.nn.functional as F
+from einops import reduce
+
+from models.configs import LatentInformationConfig
 
 LATENT_INFORMATION_PREFIX = "latent_info"
 LATENT_INFORMATION_HEADS = ("hosp", "ww", "cases", "deaths")
 STEP_DAYS = {"hosp": 7, "ww": 7, "cases": 1, "deaths": 1}
 MAX_LAG_DAYS = {"hosp": 21, "ww": 21, "cases": 14, "deaths": 14}
-RESAMPLE_COUNT = 200
-MAX_RESAMPLE_WINDOWS = 20_000
 RESAMPLE_SEED = 0
 _FIELDS = ("latent", "observed", "prediction", "residual", "weights")
 _SERIES_TENSORS = (
@@ -190,8 +191,8 @@ def _weekly_block_means(
     pad = blocks * 7 - horizon
     filled = F.pad(torch.where(valid, values, torch.zeros_like(values)), (0, pad))
     counts = F.pad(valid.to(values.dtype), (0, pad))
-    sums = filled.reshape(-1, blocks, 7).sum(dim=2)
-    days = counts.reshape(-1, blocks, 7).sum(dim=2)
+    sums = reduce(filled, "b (w d) -> b w", "sum", d=7)
+    days = reduce(counts, "b (w d) -> b w", "sum", d=7)
     return sums / days.clamp_min(1.0), days > 0
 
 
@@ -381,14 +382,20 @@ class TorchLatentInformationAccumulator:
     """Collect per-window head series and compute latent-information indicators.
 
     ``update`` moves each batch to CPU float64, so enable this accumulator for
-    final evaluations rather than per-epoch validation.
+    final evaluations rather than per-epoch validation. ``options`` sets the
+    resample count and the cap on resampled windows.
 
     ``week_total_heads`` names heads whose observation is a weekly total dated
     on its week start and whose latent is a daily flow; they also get the
     ``_week_total`` metrics.
     """
 
-    def __init__(self, week_total_heads: Collection[str] = ()) -> None:
+    def __init__(
+        self,
+        options: LatentInformationConfig,
+        week_total_heads: Collection[str] = (),
+    ) -> None:
+        self.options = options
         unknown = sorted(set(week_total_heads) - set(LATENT_INFORMATION_HEADS))
         if unknown:
             raise ValueError(f"Unknown latent-information heads {unknown}")
@@ -513,6 +520,7 @@ class TorchLatentInformationAccumulator:
                     prefix,
                     series,
                     nodes,
+                    self.options,
                     metrics=_HeadSeries.metrics,
                     null_metrics=_HeadSeries.latent_observation_metrics,
                     count_name="resample_window_count",
@@ -525,6 +533,7 @@ class TorchLatentInformationAccumulator:
                         prefix,
                         "week_total",
                         *self._series(head, data, total),
+                        self.options,
                         metrics=_week_total_metrics,
                         null_metrics=_week_total_null_metrics,
                     )
@@ -539,6 +548,7 @@ class TorchLatentInformationAccumulator:
                         "true",
                         true_series,
                         true_nodes,
+                        self.options,
                         metrics=_true_metrics,
                         null_metrics=_true_null_metrics,
                     )
@@ -559,6 +569,7 @@ def _variant(
     name: str,
     series: _HeadSeries,
     nodes: torch.Tensor,
+    options: LatentInformationConfig,
     *,
     metrics: _SeriesMetrics,
     null_metrics: _SeriesMetrics,
@@ -575,6 +586,7 @@ def _variant(
             prefix,
             series,
             nodes,
+            options,
             metrics=metrics,
             null_metrics=null_metrics,
             count_name=f"{name}_resample_window_count",
@@ -587,6 +599,7 @@ def _resampled(
     prefix: str,
     series: _HeadSeries,
     nodes: torch.Tensor,
+    options: LatentInformationConfig,
     *,
     metrics: _SeriesMetrics,
     null_metrics: _SeriesMetrics,
@@ -594,18 +607,19 @@ def _resampled(
 ) -> dict[str, float | int]:
     generator = torch.Generator().manual_seed(RESAMPLE_SEED)
     window_count = int(nodes.numel())
-    if window_count > MAX_RESAMPLE_WINDOWS:
+    max_windows = options.max_resample_windows
+    if window_count > max_windows:
         rows = (
-            torch.randperm(window_count, generator=generator)[:MAX_RESAMPLE_WINDOWS]
+            torch.randperm(window_count, generator=generator)[:max_windows]
             .sort()
             .values
         )
         series, nodes = series.subset(rows), nodes[rows]
-        window_count = MAX_RESAMPLE_WINDOWS
+        window_count = max_windows
     results: dict[str, float | int] = {f"{prefix}_{count_name}": window_count}
 
     null_draws: dict[str, list[float]] = {}
-    for _ in range(RESAMPLE_COUNT):
+    for _ in range(options.resample_count):
         donors = torch.randperm(window_count, generator=generator)
         draw = null_metrics(series.with_latent(series.latent_raw[donors]))
         for name, value in draw.items():
@@ -619,7 +633,7 @@ def _resampled(
         for i in range(int(node_index.max()) + 1)
     ]
     boot_draws: dict[str, list[float]] = {}
-    for _ in range(RESAMPLE_COUNT):
+    for _ in range(options.resample_count):
         picks = torch.randint(
             len(windows_by_node), (len(windows_by_node),), generator=generator
         )
