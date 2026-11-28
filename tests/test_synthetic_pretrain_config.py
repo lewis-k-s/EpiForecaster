@@ -209,3 +209,88 @@ def test_a97c812_preprocessing_pins_corpus_and_state_space_contract() -> None:
     assert config["start_date"] == "2020-02-10"
     assert config["end_date"] == "2021-05-09"
     assert provenance["raw_corpus_dvc_md5"] == "cfdd2a02c7a81a8f9e008339b693b1a5"
+
+
+N400_RAW_POINTER = (
+    "data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip.dvc"
+)
+SIRHD_V2_CONTRACT_SHA256 = (
+    "2e133e67d9278a9e05e2689961f17339497440530d5a88deee106323abe6ca54"
+)
+
+
+def test_n400_raw_pointer_pins_the_published_corpus() -> None:
+    pointer = yaml.safe_load(Path(N400_RAW_POINTER).read_text())
+
+    (dependency,) = pointer["deps"]
+    assert dependency["repo"]["url"] == "../EpiSim.jl"
+    assert dependency["repo"]["rev_lock"] == "2d05b2d1fdae9c42825fbb196694cb9a7de2267a"
+    (output,) = pointer["outs"]
+    assert output["md5"] == "afda29837a0e7c77b48e86a5429f6812"
+    assert output["size"] == 239065027536
+    assert not Path(N400_RAW_POINTER.removesuffix(".dvc")).exists()
+
+
+def test_n400_preprocessing_pins_corpus_and_v2_state_space_contract() -> None:
+    workflow = yaml.safe_load(
+        Path(
+            "workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml"
+        ).read_text()
+    )
+    preprocessing = workflow["preprocessing"]
+    config = PreprocessingConfig._load_config_dict(
+        Path(preprocessing["base_config"]), seen_paths=set()
+    )
+    provenance = config["source_provenance"]
+
+    assert validate_workflow_contract(workflow) == "preprocess"
+    assert N400_RAW_POINTER in workflow["dvc"]["targets"]
+    assert config["synthetic_path"] == N400_RAW_POINTER.removesuffix(".dvc")
+    assert preprocessing["dataset_name"] == config["dataset_name"]
+    assert preprocessing["expected_run_count"] == 440
+    assert config["bitround_keepbits"] == {"mobility": 10}
+    assert config["synthetic_state_space_schema_version"] == "epiforecaster_sirhd_v2"
+    assert config["synthetic_state_space_contract_sha256"] == SIRHD_V2_CONTRACT_SHA256
+    assert provenance["state_space_contract_sha256"] == SIRHD_V2_CONTRACT_SHA256
+    assert config["start_date"] == "2020-02-10"
+    assert config["end_date"] == "2021-05-09"
+    assert provenance["raw_corpus_dvc_md5"] == "afda29837a0e7c77b48e86a5429f6812"
+
+
+def test_n400_pretraining_consumes_the_n400_corpus_with_n100_settings() -> None:
+    workflow = load_template(
+        Path("workflow/config/mn5_synth_pretrain_reactive_n400.yaml")
+    )
+    preprocessing = yaml.safe_load(
+        Path(
+            "workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml"
+        ).read_text()
+    )
+    processed_path = (
+        f"data/processed/{preprocessing['preprocessing']['dataset_name']}.zarr.zip"
+    )
+    training = EpiForecasterConfig.load(
+        Path(workflow["training"]["base_config"]),
+        overrides=workflow["training"]["overrides"],
+    )
+
+    assert validate_workflow_contract(workflow) == "train"
+    assert f"{processed_path}.dvc" in workflow["dvc"]["targets"]
+    assert workflow["dvc"]["provenance_targets"] == [N400_RAW_POINTER]
+    assert training.data.dataset_path == processed_path
+    (phase,) = training.training.curriculum.schedule
+    assert phase.end_epoch == training.training.epochs
+
+    n400 = yaml.safe_load(Path(workflow["training"]["base_config"]).read_text())
+    n100 = yaml.safe_load(
+        Path(
+            "configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml"
+        ).read_text()
+    )
+    for config in (n400, n100):
+        del config["data"]["dataset_path"]
+        del config["output"]["experiment_name"]
+        del config["output"]["wandb_tags"]
+        del config["training"]["epochs"]
+        del config["training"]["curriculum"]["schedule"]
+    assert n400 == n100

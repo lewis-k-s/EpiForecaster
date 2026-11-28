@@ -187,15 +187,22 @@ preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
 
 Synthetic pretraining uses the same `train` entity through
-`workflow/config/mn5_synth_pretrain_reactive_n100.yaml`. Its processed Zarr is
-materialized for training, while the raw synthetic Zarr is a provenance-only DVC
-target. The raw corpus DVC pointer is the corpus identity.
+`workflow/config/mn5_synth_pretrain_reactive_n100.yaml` and, for the n400
+corpus, `workflow/config/mn5_synth_pretrain_reactive_n400.yaml`. Its processed
+Zarr is materialized for training, while the raw synthetic Zarr is a
+provenance-only DVC target. The raw corpus DVC pointer is the corpus identity.
 
 The a97c812 corpus uses
 `workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml`. The immutable
 run owns the processed dataset, QA record, generated DVC pointer, and publication
 receipt. Promote the pointer to the source repository only after these records
 pass review.
+
+The 5a2262d n400 corpus uses
+`workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml` on one
+`gp_debug` GPP node (120 minutes, 64 CPUs). Its raw object is 239 GB, so hard-link
+it from the EpiSim.jl DVC store on GPFS into both the `storage` and `cache`
+directories of the EpiForecaster DVC root, as for the a97c812 corpus.
 
 The real dataset `real_with_id_v2` is rebuilt with
 `workflow/config/mn5_preprocess_real.yaml` on one `gp_debug` GPP node (90 minutes,
@@ -208,8 +215,8 @@ store into `EpiForecaster-DVC/storage`, and preprocessing reads
 `real_with_id_v2.zarr.zip.dvc` pointer. After review, copy it to `data/processed/`
 and repoint the consuming templates and `data.dataset_path` (see the template
 header). The production config, the standing templates in `workflow/config/`
-and the campaigns `ablation_default_v2` and `ablation_smoke_v1` use
-`real_with_id_v2` with `configs/crossval/representative_10fold_pop3000.json`.
+and the campaigns `ablation_default_v2`, `ablation_smoke_v1` and `transfer_v2`
+use `real_with_id_v2` with `configs/crossval/representative_10fold_pop3000.json`.
 
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
