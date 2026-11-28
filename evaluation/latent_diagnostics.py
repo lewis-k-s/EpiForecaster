@@ -33,7 +33,13 @@ def build_latent_diagnostic_protocols(
     str,
     tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]],
 ]:
-    """Build oracle-X0 rollout and teacher-forced one-step predictions."""
+    """Build oracle-X0 rollout and teacher-forced one-step predictions.
+
+    The teacher-forced protocol rolls each day as its own one-step batch item.
+    Under the renewal force of infection every such call seeds the generation
+    lags from its own initial state, so the flux would equal mass action
+    instead of the model's renewal flux. The protocol is omitted then.
+    """
     required_targets = [target_key for _output_key, target_key in _STATE_TASKS.values()]
     required_targets.append("death_flow_target")
     if any(targets.get(key) is None for key in required_targets):
@@ -84,6 +90,10 @@ def build_latent_diagnostic_protocols(
     }
     oracle_targets["death_flow_target"] = death_flow_target
 
+    protocols = {"oracle_x0": (oracle_outputs, oracle_targets)}
+    if rollforward.generation_interval_oldest_first is not None:
+        return protocols
+
     # Treat each (sample, horizon) pair as a one-step batch item.
     teacher = rollforward(
         beta_t=rearrange(beta, "b h -> (b h) 1"),
@@ -119,7 +129,5 @@ def build_latent_diagnostic_protocols(
     }
     teacher_targets["death_flow_target"] = death_flow_target
 
-    return {
-        "oracle_x0": (oracle_outputs, oracle_targets),
-        "teacher_forced_one_step": (teacher_outputs, teacher_targets),
-    }
+    protocols["teacher_forced_one_step"] = (teacher_outputs, teacher_targets)
+    return protocols

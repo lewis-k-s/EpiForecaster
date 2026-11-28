@@ -113,3 +113,38 @@ def test_oracle_horizon_one_is_scored_and_keys_match_teacher_forced():
         assert f"latent_diag_{protocol}_mae_i_horizon_03" not in metrics
 
     assert keys["oracle_x0"] == keys["teacher_forced_one_step"]
+
+
+@pytest.mark.epiforecaster
+def test_teacher_forced_one_step_is_omitted_under_renewal():
+    generation_interval = torch.tensor([0.5, 0.3, 0.2])
+    rollforward = SIRRollForward(generation_interval=generation_interval)
+    rates = {
+        "beta_t": torch.tensor([[0.2, 0.25]]),
+        "gamma_t": torch.tensor([[0.1, 0.1]]),
+        "mortality_t": torch.zeros(1, 2),
+        "hospitalization_rate_t": torch.tensor([[0.02, 0.02]]),
+        "hospital_recovery_t": torch.tensor([[0.05, 0.05]]),
+        "hospital_mortality_t": torch.zeros(1, 2),
+    }
+    truth = rollforward(
+        **rates,
+        S0=torch.tensor([0.9]),
+        I0=torch.tensor([0.08]),
+        H0=torch.tensor([0.01]),
+        R0=torch.tensor([0.01]),
+        population=torch.ones(1),
+    )
+    protocols = build_latent_diagnostic_protocols(
+        model=SimpleNamespace(sir_rollforward=rollforward),
+        model_outputs={**rates},
+        targets={
+            "S_target": truth["S_trajectory"],
+            "I_target": truth["I_trajectory"],
+            "H_target": truth["H_trajectory"],
+            "R_target": truth["R_trajectory"],
+            "death_flow_target": truth["death_flow"],
+        },
+    )
+
+    assert set(protocols) == {"oracle_x0"}

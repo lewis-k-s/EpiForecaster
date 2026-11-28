@@ -92,6 +92,22 @@ def test_get_loss_from_config_passes_observation_loss() -> None:
     assert criterion.observation_loss == "mae"
 
 
+def test_get_loss_from_config_passes_regularizer_weights() -> None:
+    loss_cfg = LossConfig(name="joint_inference")
+    loss_cfg.joint.history_reconstruction_weight = 0.3
+    loss_cfg.joint.residual_penalty_weight = 0.2
+    loss_cfg.joint.beta_smoothness_weight = 0.1
+
+    criterion = get_loss_from_config(
+        loss_cfg,
+        observation_heads_config=ObservationHeadConfig(),
+    )
+
+    assert criterion.history_reconstruction_weight == pytest.approx(0.3)
+    assert criterion.residual_penalty_weight == pytest.approx(0.2)
+    assert criterion.beta_smoothness_weight == pytest.approx(0.1)
+
+
 def test_get_loss_from_config_uses_observation_head_scale_floor() -> None:
     criterion = get_loss_from_config(
         LossConfig(),
