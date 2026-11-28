@@ -65,6 +65,15 @@ def load_manifest_region_sets(path: Path) -> dict[str, frozenset[str]]:
     return parse_region_sets(payload, assigned_region_ids=assigned)
 
 
+def region_sets_for_split(
+    split_name: str, manifest_path: str | None
+) -> dict[str, frozenset[str]] | None:
+    """Region sets to score a split on: only the test split, only with a manifest."""
+    if split_name.lower() != "test" or not manifest_path:
+        return None
+    return load_manifest_region_sets(Path(manifest_path))
+
+
 def hash_region_ids(region_ids: list[str]) -> str:
     """Hash ordered region IDs using the manifest's stable newline contract."""
     return hashlib.sha256("\n".join(region_ids).encode("utf-8")).hexdigest()

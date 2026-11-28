@@ -34,7 +34,7 @@ from torch.profiler import (
 )
 from torch.utils.data import ConcatDataset, DataLoader
 
-from data.crossval_manifest import load_manifest_region_sets
+from data.crossval_manifest import region_sets_for_split
 from data.dataset_factory import build_datasets
 from data.epi_batch import EpiBatch
 from data.latent_supervision import (
@@ -3134,13 +3134,8 @@ class EpiForecasterTrainer:
                 and self.config.training.latent_information.enabled
                 else None
             ),
-            region_sets=(
-                load_manifest_region_sets(
-                    Path(self.config.training.crossval_manifest_path)
-                )
-                if split_name.lower() == "test"
-                and self.config.training.crossval_manifest_path
-                else None
+            region_sets=region_sets_for_split(
+                split_name, self.config.training.crossval_manifest_path
             ),
             relevant_source_mapping=(
                 self.config.model.observation_heads.relevant_source_mapping()

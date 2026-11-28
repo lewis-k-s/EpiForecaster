@@ -121,7 +121,7 @@ Running the pipeline always yields a Zarr dataset whose arrays follow this layou
 | `vaccination_rate` | `(run_id, time, region)` | float16 | Cumulative first-dose vaccination coverage, clipped to `[0, 1]`. |
 | `vaccination_rate_mask` | `(run_id, time, region)` | bool | True if the source had administered first-dose rows for the municipality-date. |
 | `vaccination_rate_age` | `(run_id, time, region)` | uint8 | Days since last source first-dose observation (0-14). |
-| `edar_biomarker_<variant>` | `(run_id, time, region)` | float16 | Per-variant biomarker intensity (log1p; reported value on sample days, Tobit-Kalman level between samples). |
+| `edar_biomarker_<variant>` | `(run_id, time, region)` | float16 | Per-variant biomarker intensity (log1p; reported value on sample days, causal fill between samples: LOCF or Tobit-Kalman level, per `wastewater_method`). |
 | `edar_biomarker_<variant>_mask` | `(run_id, time, region)` | bool | True if sampled (finite and positive, non-detects included), False otherwise. |
 | `edar_biomarker_<variant>_censor` | `(run_id, time, region)` | uint8 | 0=uncensored, 1=censored at LOD, 2=missing/imputed. |
 | `edar_biomarker_<variant>_age` | `(run_id, time, region)` | uint8 | Days since last measurement (0-14). 14 = no EDAR coverage. |

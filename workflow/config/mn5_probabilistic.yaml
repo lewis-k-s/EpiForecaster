@@ -1,4 +1,7 @@
-# Production HPO configuration for Normal-NLL probabilistic forecasting.
+# HPO configuration for censored-Normal NLL probabilistic forecasting on
+# real_with_id_v2. The base config sets censored_location: true and its scale
+# floors; the overrides below keep the NLL objective. The v1 study (Normal NLL,
+# zero-clamped location, real_with_id) is not comparable to this one.
 # Per-run paths and provenance fields are injected by
 # scripts/workflow/mn5_workflow.sh.
 
@@ -17,7 +20,7 @@ dvc:
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 optuna:
-  study_name: epiforecaster_probabilistic_hpo_v1
+  study_name: epiforecaster_probabilistic_hpo_censored_v2
   base_config: configs/production_only/train_epifor_mn5_full.yaml
   workers: 4
   trials_per_worker: 10

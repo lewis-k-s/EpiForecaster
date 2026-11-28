@@ -18,8 +18,9 @@
 # The run owns outputs/preprocessing/real_with_id_v2.zarr.zip, qa.json and
 # outputs/preprocessing/publication/{real_with_id_v2.zarr.zip.dvc,receipt.json}.
 # After the receipt passes review, copy the pointer to
-# data/processed/real_with_id_v2.zarr.zip.dvc in a Git branch. The previous
-# real_with_id dataset keeps its own pointer; consumers move to v2 explicitly.
+# data/processed/real_with_id_v2.zarr.zip.dvc in a Git branch. The v1
+# real_with_id pointer is deleted from the branch; it is kept only at the Git tag
+# archive/study-prereqs-run-configs.
 
 run: {}
 source: {}

@@ -1,6 +1,6 @@
-# Lightweight end-to-end acceptance configuration for Normal-NLL probabilistic
-# forecasting. Per-run paths and provenance fields are injected by
-# scripts/workflow/mn5_workflow.sh.
+# Lightweight end-to-end acceptance configuration for censored-Normal NLL
+# probabilistic forecasting on real_with_id_v2. Per-run paths and provenance
+# fields are injected by scripts/workflow/mn5_workflow.sh.
 
 run: {}
 source: {}
@@ -17,7 +17,7 @@ dvc:
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 optuna:
-  study_name: epiforecaster_probabilistic_hpo_smoke_v1
+  study_name: epiforecaster_probabilistic_hpo_smoke_censored_v2
   base_config: configs/production_only/train_epifor_mn5_full.yaml
   workers: 1
   trials_per_worker: 1

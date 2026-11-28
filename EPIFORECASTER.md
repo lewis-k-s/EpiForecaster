@@ -154,6 +154,13 @@ the PIT of an observed zero is drawn uniformly on its probability mass (seeded
 randomized PIT). Its 80% coverage multiplier treats a target on the bound as
 covered once the clipped lower end reaches it.
 
+Known limitation of the WIS objective under `censored_location: true`: nothing
+bounds the latent location from below. When $\mu + z_{0.99}\sigma < 0$
+($z_{0.99} \approx 2.33$, the widest WIS quantile), every forecast quantile
+clips to zero, the WIS is constant in $\mu$ and $\sigma$, and a positive target
+gives no gradient. NLL and CRPS keep a gradient there, because the Normal
+density and the closed-form CRPS stay smooth in $\mu$.
+
 Every head's scale is a softplus plus `model.observation_heads.distribution_scale_floor`.
 The floor is the only bound on the Normal density of an observed zero: an
 anchored location sits exactly on the zero clamp, so a collapsed scale earns

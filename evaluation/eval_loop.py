@@ -17,7 +17,7 @@ import torch
 import wandb
 from torch.utils.data import DataLoader
 
-from data.crossval_manifest import load_manifest_region_sets
+from data.crossval_manifest import region_sets_for_split
 from data.epi_dataset import EpiDataset
 from data.latent_supervision import latent_scales_from_checkpoint
 from evaluation.granular_export import (
@@ -1895,10 +1895,8 @@ def eval_checkpoint(
                 if config.training.latent_information.enabled
                 else None
             ),
-            region_sets=(
-                load_manifest_region_sets(Path(config.training.crossval_manifest_path))
-                if split == "test" and config.training.crossval_manifest_path
-                else None
+            region_sets=region_sets_for_split(
+                split, config.training.crossval_manifest_path
             ),
             granular_metadata={
                 "batch_size": batch_size
