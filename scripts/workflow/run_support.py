@@ -6,7 +6,6 @@ import argparse
 import copy
 import csv
 import errno
-import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -25,6 +24,7 @@ from typing import Any
 
 import yaml
 
+from scripts.workflow import dvc_workspace
 from scripts.workflow.attempts import complete_attempt, new_attempt, restore_attempt
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
@@ -150,36 +150,6 @@ def write_dependency_contract(
     return output_path
 
 
-def dvc_output(pointer_path: Path) -> dict[str, Any]:
-    document = load_yaml(pointer_path)
-    outputs = document.get("outs")
-    if not isinstance(outputs, list) or len(outputs) != 1:
-        raise ValueError(f"Expected one DVC output in {pointer_path}")
-    output = outputs[0]
-    if not isinstance(output, dict) or "md5" not in output or "path" not in output:
-        raise ValueError(f"Malformed DVC output in {pointer_path}")
-    return output
-
-
-def is_dvc_import(pointer_path: Path) -> bool:
-    """Return whether a DVC pointer has a Git-backed import dependency."""
-    document = load_yaml(pointer_path)
-    dependencies = document.get("deps", [])
-    return any(
-        isinstance(dependency, dict) and isinstance(dependency.get("repo"), dict)
-        for dependency in dependencies
-    )
-
-
-def md5_file(path: Path) -> str:
-    """Return the content MD5 for a DVC-tracked regular file."""
-    digest = hashlib.md5()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _package_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -243,14 +213,15 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         str(target) for target in config["dvc"].get("provenance_targets", [])
     ]
     for target in [*materialized_targets, *provenance_targets]:
-        pointer = source_root / str(target)
-        output = dvc_output(pointer)
-        output_path = pointer.parent / str(output["path"])
+        pointer_path = source_root / str(target)
+        pointer = dvc_workspace.read_pointer(pointer_path)
         dvc_identities[str(target)] = {
-            "md5": output["md5"],
-            "size": output.get("size"),
-            "nfiles": output.get("nfiles"),
-            "output": str(output_path.relative_to(source_root)),
+            "md5": pointer.md5,
+            "size": pointer.size,
+            "nfiles": pointer.nfiles,
+            "output": str(
+                (pointer_path.parent / pointer.path).relative_to(source_root)
+            ),
             "role": (
                 "materialized" if str(target) in materialized_targets else "provenance"
             ),
@@ -847,124 +818,18 @@ def finalize_crossval(config_path: Path, run_root: Path) -> Path:
     return manifest
 
 
-def _with_cache_lock(cache_path: Path):
-    cache_path.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_path / ".dvc-workflow.lock"
-    lock_path.touch(mode=0o664, exist_ok=True)
-    lock_handle = lock_path.open("r+")
-    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-    return lock_handle
-
-
-def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path]:
+def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> None:
     config = load_yaml(config_path)
-    workspace = run_root / ".state/dvc-workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
-    if not (workspace / ".dvc").is_dir():
-        _run(["dvc", "init", "--no-scm"], cwd=workspace)
-
-    targets: list[str] = []
-    imported_targets: list[tuple[str, Path, dict[str, Any]]] = []
-    output_paths: list[Path] = []
-    for target_value in config["dvc"]["targets"]:
-        target = Path(str(target_value))
-        source_pointer = source_root / target
-        workspace_pointer = workspace / target
-        workspace_pointer.parent.mkdir(parents=True, exist_ok=True)
-        # A retried attempt finds the read-only pointer copied by the last one.
-        workspace_pointer.unlink(missing_ok=True)
-        shutil.copy2(source_pointer, workspace_pointer)
-        output = dvc_output(source_pointer)
-        output_relative = target.parent / str(output["path"])
-        output_paths.append(output_relative)
-        target_name = target.as_posix()
-        targets.append(target_name)
-        if is_dvc_import(source_pointer):
-            imported_targets.append((target_name, output_relative, output))
-
-    remote = Path(str(config["dvc"]["remote"]))
-    cache = Path(str(config["dvc"]["cache"]))
-    _run(["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)], cwd=workspace)
-    _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=workspace)
-    # Keep DVC's SQLite/index state off the cluster home and off GPFS: one
-    # SQLite update per file on GPFS made checkout take about 1 s per file.
-    # TMPDIR is the execution's node-local scratch inside the container.
-    site_cache = tempfile.mkdtemp(prefix="dvc-site-cache-")
-    _run(["dvc", "config", "--local", "core.site_cache_dir", site_cache], cwd=workspace)
-    _run(["dvc", "config", "cache.dir", str(cache)], cwd=workspace)
-    _run(["dvc", "config", "cache.shared", "group"], cwd=workspace)
-    _run(["dvc", "config", "cache.type", "symlink"], cwd=workspace)
-
-    lock_handle = _with_cache_lock(cache)
-    try:
-        _run(["dvc", "pull", *targets], cwd=workspace)
-    finally:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        lock_handle.close()
-    status_targets = [
-        target
-        for target in targets
-        if target not in {item[0] for item in imported_targets}
-    ]
-    if status_targets:
-        _run(["dvc", "status", *status_targets], cwd=workspace)
-
-    for output_path in output_paths:
-        if not (workspace / output_path).exists():
-            raise FileNotFoundError(f"DVC output was not materialized: {output_path}")
-
-    # DVC content-addresses the cache, so the imported object is trusted by its
-    # path. Rehashing a 173 GB corpus over GPFS cost ~8 min per run; a size
-    # check still catches a truncated or wrong object.
-    for target, output_path, output in imported_targets:
-        expected_md5 = str(output["md5"])
-        materialized = workspace / output_path
-        if expected_md5.endswith(".dir") or not materialized.is_file():
-            raise ValueError(
-                "Git-backed DVC imports must materialize one regular file for "
-                f"offline validation: {target}"
-            )
-        expected_size = output.get("size")
-        actual_size = materialized.stat().st_size
-        if expected_size is not None and actual_size != int(expected_size):
-            raise ValueError(
-                f"Imported DVC output size mismatch for {target}: "
-                f"{actual_size} != {expected_size}"
-            )
-
-    bind_roots = sorted({path.parent for path in output_paths})
-    for bind_root in bind_roots:
-        if not (source_root / bind_root).is_dir():
-            raise FileNotFoundError(
-                f"DVC bind root must exist in the source snapshot: {bind_root}"
-            )
-    (run_root / ".state/dvc_paths.txt").write_text(
-        "".join(f"{path.as_posix()}\n" for path in output_paths)
+    data_record = dvc_workspace.pull(
+        dvc_workspace.DvcStore.from_config(config),
+        source_root,
+        config["dvc"]["targets"],
+        run_root,
     )
-    (run_root / ".state/dvc_bind_roots.txt").write_text(
-        "".join(f"{path.as_posix()}\n" for path in bind_roots)
-    )
-    data_manifest = run_root / ".state/data_manifest.json"
-    data_record = {
-        "schema_version": 1,
-        "workspace": str(workspace),
-        "targets": {
-            target: {
-                "md5": dvc_output(source_root / target)["md5"],
-                "output": output_path.as_posix(),
-            }
-            for target, output_path in zip(targets, output_paths, strict=True)
-        },
-        "outputs": [path.as_posix() for path in output_paths],
-        "bind_roots": [path.as_posix() for path in bind_roots],
-        "completed_at": datetime.now(UTC).isoformat(),
-    }
-    write_json(data_manifest, data_record)
     write_json(
         run_root / ".state/data_staged.done",
-        {"data_manifest": str(data_manifest), **data_record},
+        {"data_manifest": str(run_root / dvc_workspace.DATA_MANIFEST), **data_record},
     )
-    return output_paths
 
 
 def _load_preprocessing_document(
@@ -1322,26 +1187,12 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
                 raise ValueError(
                     "Publication staging copy of the dataset is incomplete"
                 )
-        remote = Path(str(config["dvc"]["remote"]))
-        cache = Path(str(config["dvc"]["cache"]))
-        _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)
-        _run(
-            ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
-            cwd=scratch_staging,
+        pointer_identity = dvc_workspace.publish(
+            dvc_workspace.DvcStore.from_config(config),
+            scratch_staging,
+            publication_payload,
         )
-        _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=scratch_staging)
-        _run(["dvc", "config", "cache.dir", str(cache)], cwd=scratch_staging)
-        _run(["dvc", "config", "cache.shared", "group"], cwd=scratch_staging)
-        _run(["dvc", "config", "cache.type", "symlink"], cwd=scratch_staging)
-        lock_handle = _with_cache_lock(cache)
-        try:
-            _run(["dvc", "add", publication_payload], cwd=scratch_staging)
-            _run(["dvc", "push", dataset_pointer], cwd=scratch_staging)
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            lock_handle.close()
         pointer = scratch_staging / dataset_pointer
-        pointer_identity = dvc_output(pointer)
         receipt = {
             "schema_version": 1,
             "run_id": str(config["run"]["id"]),
@@ -1357,7 +1208,7 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
                 )["targets"].items()
             },
             "dvc_pointer": dataset_pointer,
-            "dvc_md5": str(pointer_identity["md5"]),
+            "dvc_md5": pointer_identity.md5,
             "dataset_bytes": int(marker["dataset_bytes"]),
             "qa": str(qa_path),
             "qa_sha256": str(marker["qa_sha256"]),
@@ -2199,27 +2050,9 @@ def retain_training_evidence(
             },
         )
 
-        remote = Path(str(config["dvc"]["remote"]))
-        cache = Path(str(config["dvc"]["cache"]))
-        _run(["dvc", "init", "--no-scm"], cwd=staging)
-        _run(
-            ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
-            cwd=staging,
+        pointer_identity = dvc_workspace.publish(
+            dvc_workspace.DvcStore.from_config(config), staging, "artifacts"
         )
-        _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=staging)
-        _run(["dvc", "config", "cache.dir", str(cache)], cwd=staging)
-        _run(["dvc", "config", "cache.shared", "group"], cwd=staging)
-        _run(["dvc", "config", "cache.type", "symlink"], cwd=staging)
-        lock_handle = _with_cache_lock(cache)
-        try:
-            _run(["dvc", "add", "artifacts"], cwd=staging)
-            _run(["dvc", "push", "artifacts.dvc"], cwd=staging)
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            lock_handle.close()
-
-        pointer = staging / "artifacts.dvc"
-        pointer_identity = dvc_output(pointer)
         if artifacts.is_symlink():
             artifacts.unlink()
         else:
@@ -2229,7 +2062,7 @@ def retain_training_evidence(
             "run_id": config["run"]["id"],
             "retention_class": "dvc_retained",
             "dvc_pointer": "artifacts.dvc",
-            "dvc_md5": pointer_identity["md5"],
+            "dvc_md5": pointer_identity.md5,
             "artifacts": artifact_hashes,
             "created_at": datetime.now(UTC).isoformat(),
         }
@@ -2303,25 +2136,10 @@ def promote_artifacts(config_path: Path, run_root: Path) -> Path:
     ):
         raise ValueError("Promotion staging changed the selected checkpoint")
 
-    remote = Path(str(config["dvc"]["remote"]))
-    cache = Path(str(config["dvc"]["cache"]))
     try:
-        _run(["dvc", "init", "--no-scm"], cwd=staging)
-        _run(
-            ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
-            cwd=staging,
+        dvc_workspace.publish(
+            dvc_workspace.DvcStore.from_config(config), staging, "artifacts"
         )
-        _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=staging)
-        _run(["dvc", "config", "cache.dir", str(cache)], cwd=staging)
-        _run(["dvc", "config", "cache.shared", "group"], cwd=staging)
-        _run(["dvc", "config", "cache.type", "symlink"], cwd=staging)
-        lock_handle = _with_cache_lock(cache)
-        try:
-            _run(["dvc", "add", "artifacts"], cwd=staging)
-            _run(["dvc", "push", "artifacts.dvc"], cwd=staging)
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            lock_handle.close()
 
         promotion_record = {
             "run_id": run_id,

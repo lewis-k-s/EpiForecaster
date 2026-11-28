@@ -11,7 +11,7 @@ import pytest
 import xarray as xr
 import yaml
 
-from scripts.workflow import run_config, run_support
+from scripts.workflow import dvc_workspace, run_config, run_support
 
 
 def _preprocess_workflow() -> dict:
@@ -222,30 +222,24 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     monkeypatch.setattr(run_support.shutil, "copy2", observe_copy2)
     staged_inodes: list[tuple[Path, int]] = []
 
-    def fake_run(command: list[str], *, cwd: Path | None = None, **_: object) -> None:
-        assert cwd is not None
-        if command[1:3] == ["init", "--no-scm"]:
-            (cwd / ".dvc").mkdir()
-        elif command[1:3] == ["add", "synthetic_smoke.zarr.zip"]:
-            staged_inodes.append(
-                (cwd.parent, (cwd / "synthetic_smoke.zarr.zip").stat().st_ino)
-            )
-            (cwd / "synthetic_smoke.zarr.zip.dvc").write_text(
-                yaml.safe_dump(
-                    {
-                        "outs": [
-                            {"md5": "published.md5", "path": "synthetic_smoke.zarr.zip"}
-                        ]
-                    }
-                )
-            )
+    publish = dvc_workspace.publish
 
-    monkeypatch.setattr(run_support, "_run", fake_run)
+    def observe_publish(
+        store: dvc_workspace.DvcStore, workspace: Path, payload: str
+    ) -> dvc_workspace.Pointer:
+        staged_inodes.append((workspace.parent, (workspace / payload).stat().st_ino))
+        return publish(store, workspace, payload)
+
+    monkeypatch.setattr(dvc_workspace, "publish", observe_publish)
 
     receipt_path = run_support.publish_preprocessed_dataset(config_path, run_root)
 
     receipt = json.loads(receipt_path.read_text())
-    assert receipt["dvc_md5"] == "published.md5"
+    pointer = dvc_workspace.read_pointer(
+        receipt_path.parent / "synthetic_smoke.zarr.zip.dvc"
+    )
+    assert receipt["dvc_md5"] == pointer.md5
+    assert (tmp_path / "remote/files/md5" / pointer.md5[:2] / pointer.md5[2:]).is_file()
     assert receipt["input_dvc_hashes"] == {"data/files/raw.zarr.dvc": "raw.dir"}
     assert (receipt_path.parent / "synthetic_smoke.zarr.zip.dvc").is_file()
     assert not (receipt_path.parent / "synthetic_smoke.zarr.zip").exists()

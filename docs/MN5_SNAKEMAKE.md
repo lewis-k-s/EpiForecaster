@@ -418,6 +418,14 @@ coverage, run-context, aggregate table, and artifact manifest. Completion
 markers remain receipts rather than the sole scientific output contract.
 
 `stage_data` materializes the pinned DVC payloads once in the run workspace.
+`scripts/workflow/dvc_workspace.py` owns every DVC operation of the workflow:
+`pull` for staging and `publish` for the preprocessed dataset, the training
+evidence and promotion. It configures each no-SCM workspace for the shared cache
+and remote, holds the cache lock during transfers, and keeps the DVC site cache
+in node-local `TMPDIR`. After a pull it requires `dvc status --quiet` to pass
+for every target that is not a Git import, because `dvc pull` exits 0 when an
+object is missing. Git imports are checked by size. The module also writes the
+bind-root and data-manifest files that the launchers read.
 The first scientific step copies them to an allocation-local cache on the node:
 rsync copies files below 1 GiB and `scripts/workflow/parallel_copy.py` copies
 larger files with 16 concurrent 64 MiB block readers, because one stream reads
