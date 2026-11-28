@@ -219,6 +219,21 @@ for optional_site_path in /opt/.snoopy/lib /opt/EAR/current; do
   fi
 done
 
+# prepare_run pins checkpoints of earlier runs (init, resume, evaluation), which
+# --containall hides. Bind each directory named by the sealed dispatch request.
+# Once prepare is done, workers read the pinned copies under inputs/, so a
+# coordinator restart for a later allocation no longer needs the source paths.
+if [ ! -f "$RUN_ROOT/.state/prepared.done" ]; then
+  while IFS=$'\t' read -r field value; do
+    [ "$field" = checkpoint_input_dir ] || continue
+    if [ ! -d "$value" ]; then
+      echo "Checkpoint input directory not found: $value" >&2
+      exit 1
+    fi
+    container_args+=(--bind "$value:$value:ro")
+  done <"$RUN_ROOT/.state/dispatch.tsv"
+fi
+
 # Clean environments do not automatically preserve the allocation identity
 # needed by the host srun client exposed above.
 while IFS= read -r variable_name; do

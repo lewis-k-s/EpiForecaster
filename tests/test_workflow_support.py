@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import optuna
 import pytest
+import torch
 import yaml
 
 from scripts.hpo.trial_artifacts import (
@@ -395,7 +397,7 @@ def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
     dispatch_path = tmp_path / "dispatch.tsv"
     config_path.write_text(yaml.safe_dump(config))
 
-    request = run_config.write_dispatch_request(config_path, dispatch_path)
+    request = run_config.write_dispatch_request(config_path, dispatch_path, tmp_path)
 
     assert request["run_id"] == "test-run"
     assert request["run_root"] == str(run_root)
@@ -431,9 +433,45 @@ def test_dispatch_request_carries_ablation_closeout_signal(tmp_path: Path) -> No
     dispatch_path = tmp_path / "ablation-dispatch.tsv"
     config_path.write_text(yaml.safe_dump(config))
 
-    request = run_config.write_dispatch_request(config_path, dispatch_path)
+    request = run_config.write_dispatch_request(config_path, dispatch_path, REPO_ROOT)
 
     assert request["closeout_signal_seconds"] == "600"
+
+
+def test_dispatch_request_lists_checkpoint_input_directories(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/test-run"
+    config = _workflow_config(run_root, run_root / "source")
+    config["workflow"]["kind"] = "train"
+    config["training"] = {
+        "base_config": "configs/train.yaml",
+        "experiment_name": "pretrain",
+        "model_id": "model",
+        "resume_checkpoint": "/gpfs/prev/checkpoints/checkpoint_epoch_0002.pt",
+        "resume_best_checkpoint": "/gpfs/prev/checkpoints/best_model.pt",
+    }
+    config["resources"]["allocation"].update({"tasks": 1, "gres": "gpu:1"})
+    config["container"] = {
+        "sif": "/containers/runtime.sif",
+        "digest_file": "/containers/runtime.sif.sha256",
+    }
+    config_path = tmp_path / "config.yaml"
+    dispatch_path = tmp_path / "dispatch.tsv"
+    config_path.write_text(yaml.safe_dump(config))
+
+    run_config.write_dispatch_request(config_path, dispatch_path, tmp_path)
+
+    lines = dispatch_path.read_text().splitlines()
+    assert [line for line in lines if line.startswith("checkpoint_input_dir")] == [
+        "checkpoint_input_dir\t/gpfs/prev/checkpoints"
+    ]
+
+    config["workflow"]["kind"] = "evaluate"
+    config["evaluation"] = {"checkpoint": "/gpfs/eval/model/best_model.pt"}
+    assert run_config.checkpoint_input_dirs(config, tmp_path) == [
+        Path("/gpfs/eval/model")
+    ]
+    config["workflow"]["kind"] = "hpo"
+    assert run_config.checkpoint_input_dirs(config, tmp_path) == []
 
 
 def test_copied_source_snapshot_verifies_after_worktree_changes(tmp_path: Path) -> None:
@@ -699,6 +737,165 @@ def test_prepare_run_pins_training_initialization_checkpoint(
     assert manifest["identity"]["init_checkpoint_sha256"] == (
         run_support.sha256_file(pinned)
     )
+
+
+def _write_resume_pair(
+    directory: Path,
+    *,
+    resume_epoch: int = 2,
+    best_epoch: int = 1,
+    best_score: float = 0.5,
+    resume_best_score: float = 0.5,
+    best_metric: str = "mean_target_wis",
+    resume_best_metric: str = "mean_target_wis",
+) -> tuple[Path, Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    resume = directory / "checkpoint_epoch_0002.pt"
+    best = directory / "best_model.pt"
+    torch.save(
+        {
+            "epoch": resume_epoch,
+            "val_selection_score": 0.7,
+            "val_selection_metric": resume_best_metric,
+            "best_val_selection_score": resume_best_score,
+            "best_val_selection_metric": resume_best_metric,
+        },
+        resume,
+    )
+    torch.save(
+        {
+            "epoch": best_epoch,
+            "val_selection_score": best_score,
+            "val_selection_metric": best_metric,
+            "best_val_selection_score": best_score,
+            "best_val_selection_metric": best_metric,
+        },
+        best,
+    )
+    return resume, best
+
+
+def test_prepare_run_pins_training_resume_checkpoints(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/continuation"
+    source_root = run_root / "source"
+    _write_pointer(
+        source_root,
+        "data/files/raw.zarr.dvc",
+        md5="raw.dir",
+        output_name="raw.zarr",
+    )
+    _write_pointer(
+        source_root,
+        "data/processed/processed.zarr.dvc",
+        md5="processed.dir",
+        output_name="processed.zarr",
+    )
+    external_resume, external_best = _write_resume_pair(tmp_path / "previous")
+    config = _workflow_config(run_root, source_root)
+    config["workflow"].update({"kind": "train", "target": "train"})
+    config["training"] = {
+        "base_config": "configs/production_only/train_epifor_mn5_full.yaml",
+        "experiment_name": "pretrain",
+        "model_id": "model",
+        "resume_checkpoint": str(external_resume),
+        "resume_best_checkpoint": str(external_best),
+        "overrides": [],
+    }
+    config.pop("optuna")
+    config.pop("promotion")
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_published_run_contract(run_root, config_path, config)
+    config_path.chmod(0o444)
+    source_root.chmod(0o555)
+
+    try:
+        manifest_path = run_support.prepare_run(config_path, source_root, run_root)
+    finally:
+        source_root.chmod(0o755)
+
+    pinned_resume = run_root / "inputs/training_resume_checkpoint.pt"
+    pinned_best = run_root / "inputs/training_resume_best_checkpoint.pt"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    assert pinned_resume.read_bytes() == external_resume.read_bytes()
+    assert pinned_best.read_bytes() == external_best.read_bytes()
+    assert not pinned_resume.stat().st_mode & 0o222
+    assert not pinned_best.stat().st_mode & 0o222
+    resume_input = manifest["training_resume_input"]
+    assert resume_input["resume"]["pinned_checkpoint"] == str(pinned_resume)
+    assert resume_input["best"]["pinned_checkpoint"] == str(pinned_best)
+    assert manifest["identity"]["resume_checkpoint_sha256"] == (
+        run_support.sha256_file(pinned_resume)
+    )
+    assert manifest["identity"]["resume_best_checkpoint_sha256"] == (
+        run_support.sha256_file(pinned_best)
+    )
+    assert "training_input" not in manifest
+    assert "init_checkpoint_sha256" not in manifest["identity"]
+
+
+@pytest.mark.parametrize(
+    ("training_update", "message"),
+    [
+        ({"resume_checkpoint": "/gpfs/run/checkpoint_epoch_0002.pt"}, "together"),
+        ({"resume_best_checkpoint": "/gpfs/run/best_model.pt"}, "together"),
+        (
+            {
+                "resume_checkpoint": "relative/checkpoint_epoch_0002.pt",
+                "resume_best_checkpoint": "/gpfs/run/best_model.pt",
+            },
+            "training.resume_checkpoint must be an absolute",
+        ),
+        (
+            {
+                "resume_checkpoint": "/gpfs/run/checkpoint_epoch_0002.pt",
+                "resume_best_checkpoint": "relative/best_model.pt",
+            },
+            "training.resume_best_checkpoint must be an absolute",
+        ),
+        (
+            {
+                "resume_checkpoint": "/gpfs/run/checkpoint_epoch_0002.pt",
+                "resume_best_checkpoint": "/gpfs/run/best_model.pt",
+                "init_checkpoint": "/gpfs/pretrain/best_model.pt",
+            },
+            "mutually exclusive",
+        ),
+        (
+            {
+                "resume_checkpoint": "/gpfs/run/checkpoint_epoch_0002.pt",
+                "resume_best_checkpoint": "/gpfs/run/best_model.pt",
+                "require_init_checkpoint": True,
+            },
+            "training.init_checkpoint is required",
+        ),
+    ],
+)
+def test_workflow_contract_rejects_invalid_training_resume(
+    training_update: dict[str, object], message: str
+) -> None:
+    config = yaml.safe_load(
+        (
+            REPO_ROOT / "workflow/config/mn5_synth_pretrain_reactive_n100.yaml"
+        ).read_text()
+    )
+    config["training"].update(training_update)
+
+    with pytest.raises(ValueError, match=message):
+        run_config.validate_workflow_contract(config)
+
+
+def test_workflow_contract_accepts_training_resume_pair() -> None:
+    config = yaml.safe_load(
+        (
+            REPO_ROOT / "workflow/config/mn5_synth_pretrain_reactive_n100.yaml"
+        ).read_text()
+    )
+    config["training"]["resume_checkpoint"] = "/gpfs/run/checkpoint_epoch_0002.pt"
+    config["training"]["resume_best_checkpoint"] = "/gpfs/run/best_model.pt"
+
+    assert run_config.validate_workflow_contract(config) == "train"
 
 
 def test_production_workflow_tracks_required_region_embedding() -> None:
@@ -2140,6 +2337,155 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
     assert expected_override in command
 
 
+def _resume_training_run(
+    tmp_path: Path, **pair_options: object
+) -> tuple[dict, Path, Path, Path, Path]:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    base_config = source_root / "configs/train.yaml"
+    base_config.parent.mkdir(parents=True)
+    base_config.write_text("env: test\n")
+    pinned_resume, pinned_best = _write_resume_pair(run_root / "inputs", **pair_options)
+    pinned_resume = pinned_resume.rename(
+        run_root / "inputs/training_resume_checkpoint.pt"
+    )
+    pinned_best = pinned_best.rename(
+        run_root / "inputs/training_resume_best_checkpoint.pt"
+    )
+    config = {
+        "training": {
+            "base_config": "configs/train.yaml",
+            "experiment_name": "pretrain",
+            "model_id": "model",
+            "resume_checkpoint": "/gpfs/previous/checkpoint_epoch_0002.pt",
+            "resume_best_checkpoint": "/gpfs/previous/best_model.pt",
+            "overrides": [],
+        }
+    }
+    config_path = run_root / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    (run_root / "manifest.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "training_resume_input": {
+                    "resume": {
+                        "checkpoint_sha256": run_support.sha256_file(pinned_resume)
+                    },
+                    "best": {"checkpoint_sha256": run_support.sha256_file(pinned_best)},
+                }
+            }
+        )
+    )
+    return config, config_path, run_root, source_root, pinned_best
+
+
+@pytest.mark.parametrize("stale_best", [None, b"stale best from an earlier attempt"])
+def test_train_model_resumes_from_pinned_checkpoint_and_seeds_best(
+    monkeypatch,
+    tmp_path: Path,
+    stale_best: bytes | None,
+) -> None:
+    config, config_path, run_root, source_root, pinned_best = _resume_training_run(
+        tmp_path
+    )
+    checkpoint, model_root = run_support.training_artifact_paths(config, run_root)
+    if stale_best is not None:
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(stale_best)
+    captured: dict[str, object] = {}
+
+    def fake_run(command, *, cwd=None, env=None):
+        captured["command"] = command
+        captured["best_at_launch"] = checkpoint.read_bytes()
+        _complete_training_dynamics(model_root)
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+
+    run_support.train_model(config_path, source_root, run_root)
+
+    pinned_resume = run_root / "inputs/training_resume_checkpoint.pt"
+    assert f"training.resume_checkpoint_path={pinned_resume}" in captured["command"]
+    assert not any(
+        str(item).startswith("training.init_checkpoint_path=")
+        for item in captured["command"]
+    )
+    assert captured["best_at_launch"] == pinned_best.read_bytes()
+    assert checkpoint.stat().st_mode & 0o200
+
+
+@pytest.mark.parametrize("failed_status", [None, "failed"])
+def test_train_model_retry_clears_stale_training_dynamics(
+    monkeypatch, tmp_path: Path, failed_status: str | None
+) -> None:
+    config, config_path, run_root, source_root, _ = _resume_training_run(tmp_path)
+    _, model_root = run_support.training_artifact_paths(config, run_root)
+    # A failed earlier attempt leaves its dynamics past the pinned epoch.
+    stale = TrainingDynamicsWriter(
+        model_root,
+        progress_log_frequency=10,
+        grad_norm_log_frequency=10,
+        mobility_enabled=True,
+    )
+    stale.append(step=500, epoch=3, values={"loss_train_step": 1.0})
+    if failed_status is not None:
+        stale.finalize(failed_status)
+
+    def fake_run(command, *, cwd=None, env=None):
+        # The trainer starts a fresh artifact; a stale one makes it raise.
+        _complete_training_dynamics(model_root)
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+
+    run_support.train_model(config_path, source_root, run_root)
+
+    rows = (model_root / "training_dynamics.jsonl").read_text().splitlines()
+    assert len(rows) == 1
+    assert '"step": 0' in rows[0]
+
+
+@pytest.mark.parametrize(
+    ("pair_options", "message"),
+    [
+        ({"best_epoch": 3}, "later than the resume checkpoint"),
+        ({"best_score": 0.4}, "val_selection_score"),
+        ({"best_metric": "mean_target_crps"}, "val_selection_metric"),
+    ],
+)
+def test_train_model_rejects_inconsistent_resume_pair(
+    monkeypatch,
+    tmp_path: Path,
+    pair_options: dict[str, object],
+    message: str,
+) -> None:
+    config, config_path, run_root, source_root, _ = _resume_training_run(
+        tmp_path, **pair_options
+    )
+    checkpoint, _ = run_support.training_artifact_paths(config, run_root)
+
+    def fail_run(command, *, cwd=None, env=None):
+        raise AssertionError("training must not start for an inconsistent pair")
+
+    monkeypatch.setattr(run_support, "_run", fail_run)
+
+    with pytest.raises(ValueError, match=message):
+        run_support.train_model(config_path, source_root, run_root)
+    assert not checkpoint.exists()
+
+
+def test_train_model_rejects_tampered_resume_checkpoint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config, config_path, run_root, source_root, pinned_best = _resume_training_run(
+        tmp_path
+    )
+    pinned_best.chmod(0o644)
+    pinned_best.write_bytes(b"tampered")
+    monkeypatch.setattr(run_support, "_run", lambda *a, **k: None)
+
+    with pytest.raises(ValueError, match="training resume best checkpoint"):
+        run_support.train_model(config_path, source_root, run_root)
+
+
 @pytest.mark.parametrize(
     ("resource_name", "resource_value"),
     [
@@ -2397,6 +2743,8 @@ def _make_remote_run_staging(
 
     for relative in (
         "scripts/__init__.py",
+        "scripts/hpo/__init__.py",
+        "scripts/hpo/campaign_init.py",
         "scripts/workflow/__init__.py",
         "scripts/workflow/run_config.py",
         "scripts/workflow/remote_run.sh",
@@ -2443,7 +2791,7 @@ def _make_remote_run_staging(
         configure(config)
     config_path = staging / "config.yaml"
     config_path.write_text(yaml.safe_dump(config))
-    run_config.write_dispatch_request(config_path, state / "dispatch.tsv")
+    run_config.write_dispatch_request(config_path, state / "dispatch.tsv", source_root)
 
     request = (state / "dispatch.tsv").read_text()
     expected = f"tooling_python\t{tooling_python}\n"
@@ -2781,12 +3129,33 @@ def test_transferred_runner_attaches_without_sbatch(
 def test_container_coordinator_preserves_capacity_and_completion(
     tmp_path: Path, mode: str, exit_code: int
 ) -> None:
+    _run_container_coordinator(tmp_path, mode, exit_code, prepared=False)
+
+
+def test_container_coordinator_restart_skips_missing_checkpoint_source(
+    tmp_path: Path,
+) -> None:
+    _run_container_coordinator(tmp_path, "batch", 0, prepared=True)
+
+
+def _run_container_coordinator(
+    tmp_path: Path, mode: str, exit_code: int, *, prepared: bool
+) -> None:
     run_root = tmp_path / "run"
     attempt_root = run_root / ".state/executions/attempt"
     source_root = run_root / "source"
     attempt_root.mkdir(parents=True)
     source_root.mkdir()
     (run_root / "config.yaml").write_text("{}\n")
+    checkpoint_dir = tmp_path / "previous-run/checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    (run_root / ".state/dispatch.tsv").write_text(
+        f"run_id\trun\ncheckpoint_input_dir\t{checkpoint_dir}\n"
+    )
+    if prepared:
+        # Pinned checkpoints replace the source directory after prepare.
+        (run_root / ".state/prepared.done").write_text("{}\n")
+        checkpoint_dir.rmdir()
     capture = tmp_path / "capacity.txt"
     sif = tmp_path / "runtime.sif"
     sif.touch()
@@ -2840,6 +3209,9 @@ def test_container_coordinator_preserves_capacity_and_completion(
     assert Path(f"{capture}.mode").read_text().strip() == mode
     container_arguments = Path(f"{capture}.container").read_text().splitlines()
     assert f"{sif.parent}:{sif.parent}:ro" in container_arguments
+    assert (f"{checkpoint_dir}:{checkpoint_dir}:ro" in container_arguments) is (
+        not prepared
+    )
     arguments = Path(f"{capture}.args").read_text().splitlines()
     assert arguments[arguments.index("--cores") + 1] == "40"
     assert arguments[arguments.index("--jobs") + 1] == "2"
@@ -3270,3 +3642,144 @@ def test_hpo_worker_arguments_emit_pruning_startup_trials() -> None:
 
     flag = arguments.index("--pruning-startup-trials")
     assert arguments[flag + 1] == 7
+
+
+def _write_init_campaign(
+    source_root: Path, checkpoints: dict[str, Path], *, use: dict[str, str | None]
+) -> str:
+    """Write a campaign declaration subset that carries init checkpoints."""
+    relative = "configs/campaigns/transfer.yaml"
+    path = source_root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "campaign_id": "transfer",
+                "init_checkpoints": {name: str(p) for name, p in checkpoints.items()},
+                "conditions": [
+                    {"name": name, "init_checkpoint": checkpoint}
+                    for name, checkpoint in use.items()
+                ],
+            }
+        )
+    )
+    return relative
+
+
+def _ablation_init_config(run_root: Path, source_root: Path, campaign: str) -> dict:
+    config = _workflow_config(run_root, source_root)
+    config["workflow"].update({"kind": "ablation", "target": "ablation"})
+    config["ablation"] = {
+        "study_name": "transfer",
+        "campaign": campaign,
+        "workers": 4,
+        "timeout_s": 3000,
+        "closeout_signal_seconds": 600,
+        "recover_stale_running": True,
+    }
+    config.pop("optuna")
+    config.pop("promotion")
+    return config
+
+
+def test_dispatch_request_lists_campaign_init_checkpoint_directories(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/test-run"
+    source_root = tmp_path / "snapshot"
+    campaign = _write_init_campaign(
+        source_root,
+        {"a": Path("/gpfs/synth/a/best.pt"), "b": Path("/gpfs/synth/b/best.pt")},
+        use={"real-only": None, "ft-a": "a", "ft-b": "b"},
+    )
+    config = _ablation_init_config(run_root, run_root / "source", campaign)
+    config["container"] = {
+        "sif": "/containers/runtime.sif",
+        "digest_file": "/containers/runtime.sif.sha256",
+    }
+    config_path = tmp_path / "config.yaml"
+    dispatch_path = tmp_path / "dispatch.tsv"
+    config_path.write_text(yaml.safe_dump(config))
+
+    run_config.write_dispatch_request(config_path, dispatch_path, source_root)
+
+    lines = dispatch_path.read_text().splitlines()
+    assert [line for line in lines if line.startswith("checkpoint_input_dir")] == [
+        "checkpoint_input_dir\t/gpfs/synth/a",
+        "checkpoint_input_dir\t/gpfs/synth/b",
+    ]
+    assert run_config.workflow_campaign_init_checkpoints(config, source_root) == {
+        "transfer": {
+            "a": Path("/gpfs/synth/a/best.pt"),
+            "b": Path("/gpfs/synth/b/best.pt"),
+        }
+    }
+
+
+def test_campaign_init_checkpoint_declarations_fail_before_transfer(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "snapshot"
+    run_root = tmp_path / "runs/test-run"
+    campaign = _write_init_campaign(
+        source_root, {"a": Path("/gpfs/a.pt")}, use={"real-only": None, "ft": "typo"}
+    )
+    config = _ablation_init_config(run_root, run_root / "source", campaign)
+
+    with pytest.raises(ValueError, match="undeclared init_checkpoint"):
+        run_config.workflow_campaign_init_checkpoints(config, source_root)
+
+
+def test_prepare_run_pins_campaign_init_checkpoints(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/transfer"
+    source_root = run_root / "source"
+    _write_pointer(
+        source_root,
+        "data/files/raw.zarr.dvc",
+        md5="raw.dir",
+        output_name="raw.zarr",
+    )
+    _write_pointer(
+        source_root,
+        "data/processed/processed.zarr.dvc",
+        md5="processed.dir",
+        output_name="processed.zarr",
+    )
+    external = tmp_path / "pretrain"
+    external.mkdir()
+    (external / "a.pt").write_bytes(b"synthetic a")
+    (external / "b.pt").write_bytes(b"synthetic b")
+    campaign = _write_init_campaign(
+        source_root,
+        {"a": external / "a.pt", "b": external / "b.pt"},
+        use={"real-only": None, "ft-a": "a", "ft-b": "b"},
+    )
+    config = _ablation_init_config(run_root, source_root, campaign)
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_published_run_contract(run_root, config_path, config)
+    config_path.chmod(0o444)
+    source_root.chmod(0o555)
+
+    try:
+        manifest_path = run_support.prepare_run(config_path, source_root, run_root)
+    finally:
+        source_root.chmod(0o755)
+
+    manifest = yaml.safe_load(manifest_path.read_text())
+    for name, payload in (("a", b"synthetic a"), ("b", b"synthetic b")):
+        pinned = run_root / f"inputs/campaign_init/transfer/{name}.pt"
+        record = manifest["campaign_init_inputs"]["transfer"][name]
+        assert pinned.read_bytes() == payload
+        assert not pinned.stat().st_mode & 0o222
+        assert record["pinned_checkpoint"] == str(pinned)
+        assert record["pinned_checkpoint_relative"] == (
+            f"inputs/campaign_init/transfer/{name}.pt"
+        )
+        assert record["configured_checkpoint"] == str(external / f"{name}.pt")
+        assert record["checkpoint_sha256"] == hashlib.sha256(payload).hexdigest()
+        assert (
+            manifest["identity"]["campaign_init_checkpoint_sha256"]["transfer"][name]
+            == hashlib.sha256(payload).hexdigest()
+        )

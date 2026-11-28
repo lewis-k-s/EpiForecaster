@@ -260,6 +260,44 @@ in memory; the workflow never generates per-run YAML files. A campaign with fold
 indices must declare an existing persisted split manifest, and undeclared
 resolved-config drift fails before a worker starts training.
 
+Fine-tuning conditions declare their pretrained sources once, in a top-level
+`init_checkpoints` mapping of name to absolute GPFS path, and reference one by
+name with the condition's `init_checkpoint`:
+
+```yaml
+init_checkpoints:
+  synth-n400: /gpfs/projects/bsc08/.../synth_n400/checkpoints/best_model.pt
+conditions:
+  - name: real-only
+    overrides: {}
+    allowed_difference_paths: []
+  - name: ft-synth-n400
+    init_checkpoint: synth-n400
+    overrides: {}
+    allowed_difference_paths: [training.init_checkpoint_path]
+```
+
+A campaign fails at load if a condition names an undeclared checkpoint, a
+declared checkpoint is used by no condition, a path is relative, or any override
+or the base config sets `training.init_checkpoint_path` directly. The path change
+is not implicit: it is part of the condition's hydrated difference from the
+baseline, so `training.init_checkpoint_path` must be in that condition's
+`allowed_difference_paths`. Fine-tuning and from-scratch conditions must still
+share `equal_budget_policy.paths`.
+
+`mn5_workflow.sh prepare` pins every declared checkpoint into
+`inputs/campaign_init/<campaign_id>/<name>.pt`, records its SHA-256 in
+`manifest.yaml` (`campaign_init_inputs`, `identity.campaign_init_checkpoint_sha256`),
+and lists the source directories as `checkpoint_input_dir` bindings of the sealed
+dispatch request. Workers pass the pinned in-run path, never the GPFS path, and
+re-verify the SHA-256 at worker start and before every trial; a tampered file
+fails the worker. Scientific identity follows checkpoint content: the hydrated
+training-config hash used for `reuse_receipt` acceptance substitutes
+`sha256:<hash>` for `training.init_checkpoint_path`, reuse records must carry a
+matching `init_checkpoint_sha256`, and the campaign hash covers checkpoint names
+but not paths. The hashes are also recorded in the study journal, each trial's
+`campaign_identity.json`, and `ablation_manifest.json`.
+
 An `ablation_suite` config groups distinct campaigns in one immutable run and
 one four-GPU Slurm allocation. The suite runs each campaign in listed order,
 with four workers per campaign. Each study keeps a separate journal, worker
@@ -457,6 +495,45 @@ rule finishes with `.state/workflow.done`. Direct public targets expose their
 declared artifacts without rewriting that default receipt. Existing run
 directories and promotion destinations are never overwritten. Do not run
 `dvc gc` while any run or promoted artifact may reference the shared cache.
+
+### Training continuation
+
+A `train` run that hits its Slurm time limit can be continued exactly by a new
+immutable run. The run keeps `checkpoint_epoch_NNNN.pt` after every epoch
+(`output.checkpoint_frequency=1` in the synthetic-pretraining template) under
+`outputs/training/<experiment_name>/<model_id>/checkpoints/` on GPFS. Work done
+after the last epoch checkpoint is lost; the continuation restarts at the
+following epoch.
+
+1. Copy the original template and keep every scientific setting identical,
+   including `training.epochs` in the base config, so the cosine schedule
+   continues rather than restarts.
+   Remove `training.init_checkpoint` and `training.require_init_checkpoint`
+   from the copy. A run that needs `training.require_init_checkpoint: true`
+   (the fine-tune template) cannot be continued this way: the workflow
+   contract rejects `training.resume_checkpoint` together with it.
+2. Set both absolute GPFS paths from the timed-out run:
+   `training.resume_checkpoint` to the last `checkpoint_epoch_NNNN.pt` and
+   `training.resume_best_checkpoint` to that run's `best_model.pt`. They must be
+   given together and exclude `training.init_checkpoint`.
+3. `prepare` a new run id with that config and `run` it as usual.
+
+Preparation pins both files under `inputs/` and records their SHA-256 in the
+manifest (`training_resume_input`). The sealed dispatch request lists the
+directory of every out-of-run checkpoint (`training.init_checkpoint`, the resume
+pair, `evaluation.checkpoint`), and the coordinator binds each read-only into its
+contained runtime so `prepare_run` can copy them. After `prepare` is done, a restarted coordinator
+skips these binds and does not need the source directories, because workers read
+the pinned copies under `inputs/`. Before training, the best
+checkpoint must
+not be later than the resume checkpoint and must carry the resume checkpoint's
+best selection score and metric. It seeds the new run's `best_model.pt`, so the
+canonical checkpoint exists even if no later epoch improves. A retried attempt
+restarts from the same pinned pair and replaces any stale `best_model.pt`.
+It also removes the training dynamics artifact and manifest that a failed
+earlier attempt left in the model root.
+Optimizer, scheduler, RNG, epoch, patience, and selection state resume from the
+epoch checkpoint.
 
 ## Research-role evaluation
 

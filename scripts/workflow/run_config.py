@@ -14,6 +14,8 @@ from typing import Any
 
 import yaml
 
+from scripts.hpo.campaign_init import read_campaign_init_checkpoints
+
 
 ALLOCATION_FIELDS = (
     "account",
@@ -428,6 +430,28 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             raise ValueError(
                 "training.init_checkpoint is required by this workflow template"
             )
+        resume_checkpoint = training.get("resume_checkpoint")
+        resume_best_checkpoint = training.get("resume_best_checkpoint")
+        if (resume_checkpoint is None) != (resume_best_checkpoint is None):
+            raise ValueError(
+                "training.resume_checkpoint and training.resume_best_checkpoint "
+                "must be provided together"
+            )
+        if resume_checkpoint is not None:
+            for field, value in (
+                ("resume_checkpoint", resume_checkpoint),
+                ("resume_best_checkpoint", resume_best_checkpoint),
+            ):
+                if not Path(str(value)).is_absolute():
+                    raise ValueError(
+                        f"training.{field} must be an absolute GPFS path when provided"
+                    )
+            if init_checkpoint is not None or require_init_checkpoint:
+                raise ValueError(
+                    "training.resume_checkpoint is mutually exclusive with "
+                    "training.init_checkpoint and "
+                    "training.require_init_checkpoint"
+                )
     elif kind == "evaluate":
         checkpoint = workflow_config["evaluation"].get("checkpoint")
         if checkpoint is None or not Path(str(checkpoint)).is_absolute():
@@ -866,6 +890,7 @@ def render_config(
     validate_code_data_separation(snapshot_root, paths, document)
     validate_workflow_contract(document)
     validate_mn5_allocation(document)
+    workflow_campaign_init_checkpoints(document, snapshot_root)
 
     identity = git_identity(repo_root, snapshot_root=snapshot_root, paths=paths)
     source_root = run_root / "source"
@@ -903,7 +928,7 @@ def render_config(
     output_path.write_text(
         yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
     )
-    write_dispatch_request(output_path, dispatch_file_path)
+    write_dispatch_request(output_path, dispatch_file_path, snapshot_root)
     file_list_path.parent.mkdir(parents=True, exist_ok=True)
     file_list_path.write_bytes(
         b"".join(os.fsencode(path.as_posix()) + b"\0" for path in identity["files"])
@@ -919,7 +944,71 @@ def _dispatch_field(value: object, *, field: str) -> str:
     return rendered
 
 
-def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, str]:
+def workflow_campaign_init_checkpoints(
+    workflow_config: dict[str, Any], source_root: Path
+) -> dict[str, dict[str, Path]]:
+    """Return each ablation campaign's declared init checkpoints by campaign id.
+
+    Campaigns without ``init_checkpoints`` are omitted. Declaration errors
+    (unknown or unused names, relative paths) raise here, before transfer.
+    """
+    kind = workflow_kind(workflow_config)
+    if kind == "ablation":
+        campaigns = [workflow_config["ablation"]["campaign"]]
+    elif kind == "ablation_suite":
+        campaigns = [
+            study["campaign"] for study in workflow_config["ablation_suite"]["studies"]
+        ]
+    else:
+        return {}
+    declarations: dict[str, dict[str, Path]] = {}
+    for campaign in campaigns:
+        campaign_id, declared = read_campaign_init_checkpoints(
+            source_root / _safe_relative_path(str(campaign), field="campaign")
+        )
+        if declared:
+            declarations[campaign_id] = declared
+    return declarations
+
+
+def checkpoint_input_dirs(
+    workflow_config: dict[str, Any], source_root: Path
+) -> list[Path]:
+    """Return the directories of the out-of-run checkpoints a run pins.
+
+    ``prepare_run`` copies these checkpoints into the run inside the contained
+    coordinator, which sees only the run root unless each directory is bound.
+    ``source_root`` locates the campaign files of ablation workflows.
+    """
+    kind = workflow_kind(workflow_config)
+    if kind == "train":
+        training = workflow_config["training"]
+        configured = [
+            training.get(field)
+            for field in (
+                "init_checkpoint",
+                "resume_checkpoint",
+                "resume_best_checkpoint",
+            )
+        ]
+    elif kind == "evaluate":
+        configured = [workflow_config["evaluation"].get("checkpoint")]
+    elif kind in {"ablation", "ablation_suite"}:
+        configured = [
+            path
+            for declared in workflow_campaign_init_checkpoints(
+                workflow_config, source_root
+            ).values()
+            for path in declared.values()
+        ]
+    else:
+        return []
+    return sorted({Path(str(path)).parent for path in configured if path is not None})
+
+
+def write_dispatch_request(
+    config_path: Path, output_path: Path, snapshot_root: Path
+) -> dict[str, str]:
     """Write the immutable, shell-safe bindings needed before Snakemake starts.
 
     The effective YAML remains the scientific workflow request.  This compact
@@ -975,9 +1064,15 @@ def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, st
     ]
     request = {field: _dispatch_field(value, field=field) for field, value in fields}
 
+    checkpoint_lines = [
+        "checkpoint_input_dir\t"
+        f"{_dispatch_field(directory, field='checkpoint_input_dir')}\n"
+        for directory in checkpoint_input_dirs(document, snapshot_root)
+    ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         "".join(f"{field}\t{value}\n" for field, value in request.items())
+        + "".join(checkpoint_lines)
     )
     digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
     output_path.with_suffix(output_path.suffix + ".sha256").write_text(
