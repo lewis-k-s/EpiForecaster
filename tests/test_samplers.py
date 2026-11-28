@@ -321,3 +321,24 @@ def test_iteration_publishes_the_block_plan_to_the_pipeline() -> None:
             0,
         )
     ]
+
+
+def test_real_only_epoch_publishes_no_synthetic_runs() -> None:
+    dataset = _blocked_dataset(with_real=True)
+    sampler = _blocked_sampler(dataset, run_block_size=3, synth_ratio=0.0)
+    recorder = _PlanRecorder()
+    sampler.block_pipeline = recorder
+
+    plan = sampler.plan_epoch_blocks(0)
+    assert plan, "real batches are still planned"
+    assert all(block.synth_dataset_indices == [] for block in plan)
+    assert {
+        _run_index(dataset, i)
+        for block in plan
+        for batch in block.batches
+        for i in batch
+    } == {0}
+
+    list(sampler)
+    ((published, _),) = recorder.plans
+    assert all(runs == [] for runs in published)

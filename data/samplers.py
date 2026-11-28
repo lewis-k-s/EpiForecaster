@@ -604,7 +604,9 @@ class EpidemicCurriculumSampler(BatchSampler):
                 synth_budget=synth_n,
             )
             if batches:
-                planned.append(EpochBlock(block, batches))
+                # A block with no synthetic batches must not publish runs: the
+                # pipeline would build heavy state that no batch activates.
+                planned.append(EpochBlock(block if synth_n > 0 else [], batches))
         return planned
 
     def _build_epoch_batches(self, epoch: int | None = None) -> list[list[int]]:

@@ -50,6 +50,7 @@ def test_build_loader_from_config_full_uses_all_target_nodes(monkeypatch) -> Non
             test=test,
             real_run_id=None,
             region_embedding_store=None,
+            block_pipeline=None,
         ),
     )
 
@@ -89,8 +90,38 @@ def test_build_loader_from_config_full_rejects_curriculum(monkeypatch) -> None:
             test=_DummyDataset([1]),
             real_run_id="real",
             region_embedding_store=None,
+            block_pipeline=None,
         ),
     )
 
     with pytest.raises(ValueError, match="split='full' is not supported"):
         loaders.build_loader_from_config(_make_config(), split="full", device="cpu")
+
+
+@pytest.mark.parametrize("split", ["val", "test", "full"])
+def test_build_loader_from_config_shuts_down_the_builder_pool(
+    monkeypatch, split: str
+) -> None:
+    shutdowns: list[bool] = []
+    pipeline = SimpleNamespace(shutdown=lambda: shutdowns.append(True))
+    train = torch.utils.data.ConcatDataset([_DummyDataset([99])])
+    monkeypatch.setattr(
+        loaders,
+        "build_datasets",
+        lambda config: SimpleNamespace(
+            train=train,
+            val=_DummyDataset([0]),
+            test=_DummyDataset([1]),
+            real_run_id="real",
+            region_embedding_store=None,
+            block_pipeline=pipeline,
+        ),
+    )
+
+    if split == "full":
+        with pytest.raises(ValueError, match="split='full' is not supported"):
+            loaders.build_loader_from_config(_make_config(), split=split, device="cpu")
+    else:
+        loaders.build_loader_from_config(_make_config(), split=split, device="cpu")
+
+    assert shutdowns == [True]

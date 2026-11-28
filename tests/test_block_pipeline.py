@@ -373,3 +373,17 @@ def test_block_build_records_append_as_jsonl(tmp_path: Path):
         {"schema_version": 1, "kind": "block", "block_index": 0},
         {"schema_version": 1, "kind": "epoch", "epoch": 0},
     ]
+
+
+def test_epoch_without_an_activated_block_discards_pending_builds(blocks):
+    pipeline = _pipeline(_all(blocks), prefetch=1)
+    pipeline.begin_epoch(blocks, epoch=0)
+    for run in blocks[0]:
+        assert run.started.wait(5)
+
+    # No batch of the epoch drew from a planned run: nothing calls activate.
+    assert pipeline.end_epoch() is None
+
+    assert pipeline.in_flight_builds == 0
+    assert not any(run.heavy_state_ready for run in _all(blocks))
+    pipeline.shutdown()

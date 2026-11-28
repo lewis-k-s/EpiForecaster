@@ -847,12 +847,6 @@ class EpiDataset(Dataset):
         self._require_heavy_state()
         return self._get_global_to_local_at_time(0)[target_nodes]
 
-    def _build_context_tables(self) -> None:
-        """Prebuild context tables consumed by ``data.context_assembly``."""
-        self._build_context_positions()
-        self._build_context_feature_tables()
-        self._build_context_mobility_tables()
-
     def _build_context_positions(self) -> None:
         """Target positions inside the k-hop context node set (``_graph_node_ids``)."""
         node_ids = self._graph_node_ids  # (N_ctx,) k-hop closure around targets

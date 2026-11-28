@@ -268,9 +268,14 @@ class RunBlockPipeline:
         """Close the epoch: log the last block and return the epoch summary.
 
         A multi-block epoch drops the last block and any unused prefetch; a
-        single-block epoch keeps its runs resident for the next epoch.
+        single-block epoch keeps its runs resident for the next epoch. An epoch
+        that activated no block (no batch drew from a planned run) discards
+        every pending build and resident run of its plan.
         """
         if self._current < 0:
+            for block in self._plan:
+                for run in block:
+                    self._discard(run)
             self._drop_plan()
             return None
         last = self._current
