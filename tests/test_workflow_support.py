@@ -30,7 +30,8 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
-from scripts.workflow import pinned_inputs, run_config, run_support
+from scripts.workflow import dvc_workspace, pinned_inputs, run_config, run_support
+from tests.dvc_test_helpers import publish_pointer, remote_object
 from workflow.common import container_command, slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
@@ -910,11 +911,11 @@ def test_production_workflow_tracks_required_region_embedding() -> None:
     pointer = REPO_ROOT / pointer_relative
 
     assert pointer_relative.as_posix() in workflow["dvc"]["targets"]
-    output = run_support.dvc_output(pointer)
-    assert pointer_relative.parent / output["path"] == Path(
+    output = dvc_workspace.read_pointer(pointer)
+    assert pointer_relative.parent / output.path == Path(
         training["data"]["region2vec_path"]
     )
-    assert output["md5"] == "5205439ed1bd8a079aa57aed37507654"
+    assert output.md5 == "5205439ed1bd8a079aa57aed37507654"
 
 
 def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> None:
@@ -1130,56 +1131,33 @@ def test_single_training_requires_one_task_and_one_gpu(tmp_path: Path) -> None:
         run_config.validate_mn5_allocation(config)
 
 
-def test_stage_dvc_records_bind_roots(monkeypatch, tmp_path: Path) -> None:
+def test_stage_dvc_records_pulled_inputs(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/test-run"
     source_root = run_root / "source"
-    _write_pointer(
+    config = _workflow_config(run_root, source_root)
+    config["dvc"]["targets"] = ["data/files/raw.zarr.dvc"]
+    store = dvc_workspace.DvcStore.from_config(config)
+    published = publish_pointer(
+        store,
+        tmp_path / "scratch",
         source_root,
         "data/files/raw.zarr.dvc",
-        md5="raw.dir",
-        output_name="raw.zarr",
+        {"zarr.json": b"{}"},
     )
-    _write_pointer(
-        source_root,
-        "data/processed/processed.zarr.dvc",
-        md5="processed.dir",
-        output_name="processed.zarr",
-    )
-    config = _workflow_config(run_root, source_root)
     config_path = run_root / "config.yaml"
     config_path.write_text(yaml.safe_dump(config))
 
-    def fake_run(command: list[str], *, cwd: Path | None = None) -> None:
-        assert cwd is not None
-        if command[1:3] == ["init", "--no-scm"]:
-            (cwd / ".dvc").mkdir()
-        elif command[1] == "pull":
-            (cwd / "data/files/raw.zarr").mkdir(parents=True)
-            (cwd / "data/processed/processed.zarr").mkdir(parents=True)
+    run_support.stage_dvc(config_path, source_root, run_root)
 
-    monkeypatch.setattr(run_support, "_run", fake_run)
-
-    outputs = run_support.stage_dvc(config_path, source_root, run_root)
-
-    assert outputs == [
-        Path("data/files/raw.zarr"),
-        Path("data/processed/processed.zarr"),
-    ]
-    assert (run_root / ".state/dvc_bind_roots.txt").read_text().splitlines() == [
-        "data/files",
-        "data/processed",
-    ]
-    data_manifest = json.loads((run_root / ".state/data_manifest.json").read_text())
-    assert data_manifest["targets"] == {
+    marker = json.loads((run_root / ".state/data_staged.done").read_text())
+    assert marker["data_manifest"] == str(run_root / ".state/data_manifest.json")
+    assert marker["targets"] == {
         "data/files/raw.zarr.dvc": {
-            "md5": "raw.dir",
+            "md5": published.md5,
             "output": "data/files/raw.zarr",
-        },
-        "data/processed/processed.zarr.dvc": {
-            "md5": "processed.dir",
-            "output": "data/processed/processed.zarr",
-        },
+        }
     }
+    assert (run_root / ".state/dvc-workspace/data/files/raw.zarr/zarr.json").is_file()
 
 
 def _complete_trial(
@@ -1699,25 +1677,6 @@ def test_retain_training_evidence_publishes_one_dvc_directory(
         )
     )
 
-    def fake_run(command: list[str], *, cwd=None, env=None) -> None:
-        del env
-        if command[:3] == ["dvc", "add", "artifacts"]:
-            assert cwd is not None
-            Path(cwd, "artifacts.dvc").write_text(
-                yaml.safe_dump(
-                    {
-                        "outs": [
-                            {
-                                "md5": "evidence.dir",
-                                "path": "artifacts",
-                            }
-                        ]
-                    }
-                )
-            )
-
-    monkeypatch.setattr(run_support, "_run", fake_run)
-
     retention_path = run_support.retain_training_evidence(
         config_path,
         run_root,
@@ -1726,7 +1685,9 @@ def test_retain_training_evidence_publishes_one_dvc_directory(
 
     retention = json.loads(retention_path.read_text())
     assert retention["retention_class"] == "dvc_retained"
-    assert retention["dvc_md5"] == "evidence.dir"
+    pointer = dvc_workspace.read_pointer(retention_path.parent / "artifacts.dvc")
+    assert retention["dvc_md5"] == pointer.md5
+    assert remote_object(dvc_workspace.DvcStore(remote, cache), pointer.md5).is_file()
     assert set(retention["artifacts"]) == {
         "training_dynamics.jsonl",
         "training_dynamics_manifest.json",
@@ -2716,6 +2677,7 @@ def _make_remote_run_staging(
         "scripts/hpo/__init__.py",
         "scripts/hpo/campaign_init.py",
         "scripts/workflow/__init__.py",
+        "scripts/workflow/dvc_workspace.py",
         "scripts/workflow/pinned_inputs.py",
         "scripts/workflow/run_config.py",
         "scripts/workflow/remote_run.sh",

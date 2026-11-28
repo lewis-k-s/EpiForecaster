@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 
+from scripts.workflow.dvc_workspace import read_pointer
 from scripts.workflow.pinned_inputs import bind_dirs, declared_inputs, run_inputs
 
 
@@ -159,20 +160,7 @@ def dvc_payload_paths(
             raise FileNotFoundError(
                 f"DVC pointer must be a regular file in the source bundle: {target}"
             )
-        pointer_document = yaml.safe_load(pointer.read_text())
-        outputs = (
-            pointer_document.get("outs") if isinstance(pointer_document, dict) else None
-        )
-        if not isinstance(outputs, list) or len(outputs) != 1:
-            raise ValueError(f"Expected one DVC output in {target}")
-        output = outputs[0]
-        if not isinstance(output, dict) or "md5" not in output or "path" not in output:
-            raise ValueError(f"Malformed DVC output in {target}")
-        output_name = _safe_relative_path(
-            str(output["path"]),
-            field=f"DVC output in {target}",
-        )
-        payload = target.parent / output_name
+        payload = target.parent / read_pointer(pointer, label=target).path
         if payload in payloads.values():
             raise ValueError(
                 f"Multiple DVC pointers select the same payload: {payload}"
