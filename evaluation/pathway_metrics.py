@@ -1088,3 +1088,264 @@ class TorchLatentProtocolAccumulator:
                 metrics[f"{prefix}_mae_{task}_horizon_{horizon_index:02d}"] = mae
                 metrics[f"{prefix}_rmse_{task}_horizon_{horizon_index:02d}"] = rmse
         return metrics
+
+
+# Per-window peak prevalence below this fraction (0.1 per 100k) counts as a
+# collapsed infection compartment.
+LATENT_PLAUSIBILITY_I_COLLAPSE_THRESHOLD = 1.0e-6
+_PER_100K = 100_000.0
+_PLAUSIBILITY_PREFIX = "latent_plausibility"
+_PLAUSIBILITY_QUANTILES = (
+    ("q05", 0.05),
+    ("q25", 0.25),
+    ("median", 0.50),
+    ("q75", 0.75),
+    ("q95", 0.95),
+)
+_ASCERTAINMENT_HEADS = ("cases", "hosp", "deaths")
+_NAN = float("nan")
+
+
+def _latent_plausibility_step(
+    trajectories: tuple[torch.Tensor, torch.Tensor],
+    rates: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ascertainment: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None, ...],
+) -> dict[str, torch.Tensor]:
+    """Reduce one batch to per-window scalars; every value has shape ``[B]``.
+
+    ``trajectories`` are ``(S, I)`` with shape ``[B, H+1]``; ``rates`` are
+    ``(beta, gamma, direct I->D mortality, I->H hospitalization)`` with shape
+    ``[B, H]``. ``ascertainment`` holds ``(latent_flow, target, weights)`` per
+    entry of ``_ASCERTAINMENT_HEADS`` (``None`` when the head is unsupervised).
+    Invalid values are NaN so they are excluded when quantiles are taken.
+    """
+    S, infected = (value.float() for value in trajectories)
+    beta, gamma, mortality, hospitalization = (value.float() for value in rates)
+    horizon = beta.shape[1]
+
+    # Effective reproduction number with S_h = S_trajectory[:, h], h = 0..H-1.
+    removal = gamma + hospitalization + mortality
+    positive = removal > 0
+    rt = (
+        beta * S[:, :horizon] / torch.where(positive, removal, torch.ones_like(removal))
+    )
+    rt = torch.where(positive & torch.isfinite(rt), rt, torch.full_like(rt, _NAN))
+    rt_valid = torch.isfinite(rt)
+    rt_count = rt_valid.sum(dim=1)
+    rt_mean = torch.where(
+        rt_count > 0,
+        torch.where(rt_valid, rt, torch.zeros_like(rt)).sum(dim=1)
+        / rt_count.clamp_min(1),
+        torch.full_like(rt[:, 0], _NAN),
+    )
+
+    values = {
+        "i_origin": infected[:, 0],
+        "i_peak": infected.amax(dim=1),
+        "s_depletion_origin": 1.0 - S[:, 0],
+        "forecast_attack": S[:, 0] - S[:, -1],
+        "rt_origin": rt[:, 0],
+        "rt_horizon_mean": rt_mean,
+    }
+
+    for head, inputs in zip(_ASCERTAINMENT_HEADS, ascertainment, strict=True):
+        if inputs is None:
+            continue
+        latent_flow, target, weights = (value.float() for value in inputs)
+        active = weights > 0
+        observed_per_100k = torch.expm1(
+            torch.where(active, target, torch.zeros_like(target))
+        )
+        latent_per_100k = (
+            torch.where(active, latent_flow, torch.zeros_like(latent_flow)) * _PER_100K
+        )
+        numerator = (weights * observed_per_100k).sum(dim=1)
+        denominator = (weights * latent_per_100k).sum(dim=1)
+        has_weight = weights.sum(dim=1) > 0
+        pair = has_weight & torch.isfinite(numerator) & torch.isfinite(denominator)
+        ratio_valid = pair & (denominator > 0)
+        nan = torch.full_like(numerator, _NAN)
+        values[f"{head}_ratio"] = torch.where(
+            ratio_valid,
+            numerator
+            / torch.where(ratio_valid, denominator, torch.ones_like(denominator)),
+            nan,
+        )
+        values[f"{head}_observed_sum"] = torch.where(pair, numerator, nan)
+        values[f"{head}_latent_sum"] = torch.where(pair, denominator, nan)
+        values[f"{head}_zero_latent"] = pair & (denominator <= 0)
+    return values
+
+
+class TorchLatentPlausibilityAccumulator:
+    """Ground-truth-free plausibility indicators for inferred SIRHD latents.
+
+    Each forecast window contributes scalars that stay on the evaluation device
+    until ``finalize``; exact quantiles (``torch.quantile``, non-finite values
+    excluded) are then taken across windows. All windows count, independent of
+    whether latent targets exist, so the indicators apply to real data. All
+    values are fractions of the population (N = 1).
+
+    Metrics (prefix ``latent_plausibility_``; ``<q>`` in q05, q25, median, q75,
+    q95):
+
+    * ``window_count``: windows seen.
+    * ``i_origin_<q>``: ``I_trajectory[:, 0]``, prevalence at the forecast origin.
+    * ``i_peak_<q>``: ``max_h I_trajectory[:, h]`` over the whole trajectory.
+    * ``i_collapse_fraction``: fraction of windows with finite ``i_peak`` below
+      ``LATENT_PLAUSIBILITY_I_COLLAPSE_THRESHOLD`` (1e-6, i.e. 0.1 per 100k).
+    * ``s_depletion_origin_<q>``: ``1 - S_trajectory[:, 0]``.
+    * ``forecast_attack_<q>``: ``S_trajectory[:, 0] - S_trajectory[:, -1]``,
+      the fraction of the population infected over the forecast.
+    * ``rt_origin_<q>``: ``beta_0 S_0 / (gamma_0 + alpha_0 + mu_I_0)`` where
+      ``alpha`` is the I->H rate and ``mu_I`` the direct I->D mortality
+      (``mortality_t``). ``rt_horizon_mean_<q>``: per-window mean over
+      ``h = 0..H-1`` of the same quantity with ``S_h = S_trajectory[:, h]``.
+      Steps with a non-positive denominator or non-finite value are NaN and
+      skipped; a window is NaN only if no step is valid.
+    * ``ascertainment_<head>_*`` for ``head`` in cases, hosp, deaths. The
+      supervised target is absolute ``log1p(per-100k)`` (``delta_forecasting``
+      only anchors predictions, never the targets), so the observed per-100k
+      count is ``expm1(target)``; the latent per-100k count is the aligned
+      latent flow ``* 1e5`` (``infection_flow`` for cases, ``hospitalization_flow``
+      for hosp, ``death_flow`` for deaths). Per window the ratio is
+      ``sum(w * observed) / sum(w * latent)`` over days with weight > 0. It is
+      reported as ``_<q>`` over windows with ``sum(w) > 0`` and latent sum > 0,
+      ``_pooled`` (total observed over total latent across all windows with
+      ``sum(w) > 0`` and finite sums, including zero-latent windows),
+      ``_window_count`` (windows entering the quantiles) and
+      ``_zero_latent_window_fraction`` (windows with ``sum(w) > 0`` and latent
+      sum <= 0, over windows with ``sum(w) > 0`` and finite sums).
+
+    In the real dataset, cases and deaths are daily counts, so their ratios are
+    daily ascertainment (cases use the S->I infection flow, not reported-onset
+    prevalence). Real hospitalization observations are weekly totals placed on
+    the week-start date (``hospitalizations_processor``), so the hosp ratio
+    divides a weekly total by one day's latent flow and is about 7x an
+    admission ascertainment. Synthetic corpora follow their generator's
+    reporting convention.
+    """
+
+    def __init__(self, *, device: torch.device, compile_step: bool = False) -> None:
+        self.device = device
+        self.windows: dict[str, list[torch.Tensor]] = {}
+        self._step = (
+            compiled_metric_step(_latent_plausibility_step)
+            if compile_step
+            else _latent_plausibility_step
+        )
+
+    def update(
+        self,
+        *,
+        model_outputs: dict[str, torch.Tensor],
+        ascertainment: dict[
+            str, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ],
+    ) -> None:
+        """Add one batch.
+
+        ``ascertainment`` maps head name to ``(latent_flow, target, weights)``,
+        all ``[B, H]`` and already aligned to the forecast targets, or ``None``
+        / absent for heads without supervision.
+        """
+        unknown = set(ascertainment) - set(_ASCERTAINMENT_HEADS)
+        if unknown:
+            raise ValueError(f"Unknown ascertainment heads: {sorted(unknown)}")
+        for head, inputs in ascertainment.items():
+            if inputs is not None and not (
+                inputs[0].shape == inputs[1].shape == inputs[2].shape
+            ):
+                raise ValueError(
+                    f"Ascertainment inputs for {head!r} must share one shape, got "
+                    f"{[tuple(value.shape) for value in inputs]}."
+                )
+        batch = self._step(
+            (model_outputs["S_trajectory"], model_outputs["I_trajectory"]),
+            (
+                model_outputs["beta_t"],
+                model_outputs["gamma_t"],
+                model_outputs["mortality_t"],
+                model_outputs["hospitalization_rate_t"],
+            ),
+            tuple(ascertainment.get(head) for head in _ASCERTAINMENT_HEADS),
+        )
+        # Per-window values can alias model outputs (e.g. I_trajectory[:, 0]);
+        # a CUDA-graph forward reuses those buffers on the next batch.
+        for name, value in batch.items():
+            self.windows.setdefault(name, []).append(value.clone())
+
+    def _column(self, name: str) -> torch.Tensor:
+        """All windows of one scalar as a flat float64 CPU tensor."""
+        chunks = self.windows.get(name)
+        if not chunks:
+            return torch.empty(0, dtype=torch.float64)
+        return torch.cat(chunks).detach().cpu().to(torch.float64)
+
+    @staticmethod
+    def _quantiles(prefix: str, values: torch.Tensor) -> dict[str, float]:
+        finite = values[torch.isfinite(values)]
+        if finite.numel() == 0:
+            return {f"{prefix}_{label}": _NAN for label, _ in _PLAUSIBILITY_QUANTILES}
+        levels = torch.tensor(
+            [level for _, level in _PLAUSIBILITY_QUANTILES], dtype=torch.float64
+        )
+        results = torch.quantile(finite, levels).tolist()
+        return {
+            f"{prefix}_{label}": float(value)
+            for (label, _), value in zip(_PLAUSIBILITY_QUANTILES, results, strict=True)
+        }
+
+    def finalize(self) -> dict[str, float | int]:
+        prefix = _PLAUSIBILITY_PREFIX
+        metrics: dict[str, float | int] = {
+            f"{prefix}_window_count": sum(
+                int(chunk.shape[0]) for chunk in self.windows.get("i_origin", [])
+            )
+        }
+        for name in (
+            "i_origin",
+            "i_peak",
+            "s_depletion_origin",
+            "forecast_attack",
+            "rt_origin",
+            "rt_horizon_mean",
+        ):
+            metrics.update(self._quantiles(f"{prefix}_{name}", self._column(name)))
+            if name == "i_peak":
+                # Windows are float32; compare in float32 so a peak stored as the
+                # float32 nearest 1e-6 is not below the threshold.
+                peak = self._column(name).float()
+                peak = peak[torch.isfinite(peak)]
+                threshold = torch.tensor(
+                    LATENT_PLAUSIBILITY_I_COLLAPSE_THRESHOLD, dtype=torch.float32
+                )
+                metrics[f"{prefix}_i_collapse_fraction"] = (
+                    float((peak < threshold).sum()) / peak.numel()
+                    if peak.numel() > 0
+                    else _NAN
+                )
+
+        for head in _ASCERTAINMENT_HEADS:
+            head_prefix = f"{prefix}_ascertainment_{head}"
+            ratio = self._column(f"{head}_ratio")
+            observed_sum = self._column(f"{head}_observed_sum")
+            latent_sum = self._column(f"{head}_latent_sum")
+            zero_latent = self.windows.get(f"{head}_zero_latent")
+            zero_latent_count = (
+                int(torch.cat(zero_latent).sum().item()) if zero_latent else 0
+            )
+            metrics.update(self._quantiles(head_prefix, ratio))
+            metrics[f"{head_prefix}_window_count"] = int(torch.isfinite(ratio).sum())
+            pair = torch.isfinite(observed_sum) & torch.isfinite(latent_sum)
+            pair_count = int(pair.sum())
+            total_latent = float(latent_sum[pair].sum())
+            metrics[f"{head_prefix}_pooled"] = (
+                float(observed_sum[pair].sum()) / total_latent
+                if pair_count > 0 and total_latent > 0
+                else _NAN
+            )
+            metrics[f"{head_prefix}_zero_latent_window_fraction"] = (
+                zero_latent_count / pair_count if pair_count > 0 else _NAN
+            )
+        return metrics

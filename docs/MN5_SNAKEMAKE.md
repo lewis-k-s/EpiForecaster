@@ -352,6 +352,14 @@ endpoint aggregation and to the paired fold/seed deltas. Reused runs must supply
 this aggregate table in the evidence bundle, and the analyzer checks their
 recorded identity against the bundled `config.yaml`.
 
+Each trial also writes `test_summary.json` beside its aggregate tables. It holds
+every run-level test metric, including the `latent_plausibility_*` and
+`latent_info_*` indicators that the aggregate tables omit. Validation passes
+compute the plausibility indicators too, but only this test summary and the CLI
+`--summary-json` file write them. `training.latent_information.enabled=false`
+drops the `latent_info_*` keys. It is not an input to
+endpoint aggregation.
+
 Each data, training, evaluation, cross-validation, HPO, ablation, selection,
 and promotion contract fingerprints the same complete scientific source
 inventory together with its relevant config fragment and SIF digest. This

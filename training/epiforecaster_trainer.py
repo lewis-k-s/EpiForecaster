@@ -41,7 +41,10 @@ from data.latent_supervision import (
     fit_latent_scale_state,
     validate_complete_latent_targets,
 )
-from evaluation.aggregate_export import write_main_model_aggregate_csvs
+from evaluation.aggregate_export import (
+    write_evaluation_summary,
+    write_main_model_aggregate_csvs,
+)
 from evaluation.eval_loop import evaluate_loader
 from evaluation.losses import JointInferenceLoss
 from evaluation.selection_scores import (
@@ -1731,6 +1734,16 @@ class EpiForecasterTrainer:
             split_name="test",
             eval_metrics=test_metrics,
         )
+        if self.experiment_dir is None:
+            raise RuntimeError("experiment_dir not set; call setup_logging() first")
+        # Run-level latent indicators exist only here, not in the aggregate CSVs.
+        self.metric_artifacts["test_summary"] = write_evaluation_summary(
+            self.experiment_dir / "test_summary.json",
+            checkpoint=best_checkpoint_path,
+            split="test",
+            eval_loss=test_loss,
+            metrics=test_metrics,
+        )
         # Shutdown test iterator after evaluation
         self._shutdown_loader_iterator(self.test_loader)
         test_time = time.time() - test_start_time
@@ -3114,6 +3127,12 @@ class EpiForecasterTrainer:
             max_batches=self.config.training.max_batches,
             granular_output_path=granular_output_path,
             granular_eval_format=self.config.output.granular_eval_format,
+            latent_information=(
+                self.config.training.latent_information
+                if split_name.lower() == "test"
+                and self.config.training.latent_information.enabled
+                else None
+            ),
             relevant_source_mapping=(
                 self.config.model.observation_heads.relevant_source_mapping()
             ),

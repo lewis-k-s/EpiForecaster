@@ -329,6 +329,22 @@ def _set_residual_log_location_fraction_buffer(
         buffer.fill_(value)
 
 
+def _require_mechanistic_for_residual_budget(
+    module: nn.Module,
+    max_log_location_fraction: float | None,
+) -> None:
+    """Reject a relative residual budget on a head without a mechanistic path.
+
+    The budget is relative to the mechanistic log location, so on such a head
+    any finite budget would silence the prediction entirely.
+    """
+    if max_log_location_fraction is not None and not module._mechanistic_enabled:
+        raise ValueError(
+            "A residual log-location budget requires the mechanistic path; "
+            f"{type(module).__name__} has it disabled."
+        )
+
+
 def _compose_observation_prediction(
     *,
     mechanistic_raw: torch.Tensor,
@@ -1047,6 +1063,9 @@ class ClinicalObservationHead(nn.Module):
         alpha_init: Initial weight for residual connection
         residual_enabled: When False, retain the residual projection but freeze its
             contribution at zero.
+        mechanistic_enabled: When False, the mechanistic log location is an
+            exact zero, so the prediction is the (anchored) residual alone. The
+            kernel and scale stay present but receive no gradient.
 
     """
 
@@ -1062,6 +1081,7 @@ class ClinicalObservationHead(nn.Module):
         residual_dim: int = 0,
         alpha_init: float = 0.1,
         residual_enabled: bool = True,
+        mechanistic_enabled: bool = True,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
         kernel_mlp: bool = False,
@@ -1115,6 +1135,7 @@ class ClinicalObservationHead(nn.Module):
             self.alpha = None
         # Immutable static disable: survives checkpoint alpha state loading.
         self._residual_location_enabled = residual_enabled
+        self._mechanistic_enabled = mechanistic_enabled
         _register_residual_log_location_fraction_buffer(self)
 
         self.log_distribution_scale = nn.Parameter(
@@ -1195,6 +1216,8 @@ class ClinicalObservationHead(nn.Module):
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
             mechanistic_raw = torch.log1p(scaled)
+            if not self._mechanistic_enabled:
+                mechanistic_raw = torch.zeros_like(mechanistic_raw)
 
         # Pre-bound residual raw: the parameter-side intermediate probed by
         # pathway-gradient telemetry. A statically disabled head contributes
@@ -1282,6 +1305,7 @@ class ClinicalObservationHead(nn.Module):
         head keeps its exact zero contribution even though its projection
         module remains present for structural compatibility.
         """
+        _require_mechanistic_for_residual_budget(self, max_log_location_fraction)
         _set_residual_log_location_fraction_buffer(
             self,
             max_log_location_fraction,
@@ -1333,6 +1357,7 @@ class WastewaterObservationHead(nn.Module):
         learnable_scale: If True, scale is trainable
         residual_dim: Dimension of observation context for residual
         alpha_init: Initial weight for residual connection
+        mechanistic_enabled: See ``ClinicalObservationHead``.
     """
 
     def __init__(
@@ -1347,6 +1372,7 @@ class WastewaterObservationHead(nn.Module):
         residual_dim: int = 0,
         alpha_init: float = 0.1,
         residual_enabled: bool = True,
+        mechanistic_enabled: bool = True,
         strict: bool = True,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
@@ -1405,6 +1431,7 @@ class WastewaterObservationHead(nn.Module):
 
         # Immutable static disable: survives checkpoint alpha state loading.
         self._residual_location_enabled = residual_enabled
+        self._mechanistic_enabled = mechanistic_enabled
         _register_residual_log_location_fraction_buffer(self)
 
         self.log_distribution_scale = nn.Parameter(
@@ -1491,6 +1518,8 @@ class WastewaterObservationHead(nn.Module):
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
             mechanistic_raw = torch.log1p(scaled)
+            if not self._mechanistic_enabled:
+                mechanistic_raw = torch.zeros_like(mechanistic_raw)
 
         # Pre-bound residual raw: the parameter-side intermediate probed by
         # pathway-gradient telemetry. A statically disabled head contributes
@@ -1576,6 +1605,7 @@ class WastewaterObservationHead(nn.Module):
         See
         ``ClinicalObservationHead.set_residual_max_log_location_fraction``.
         """
+        _require_mechanistic_for_residual_budget(self, max_log_location_fraction)
         _set_residual_log_location_fraction_buffer(
             self,
             max_log_location_fraction,

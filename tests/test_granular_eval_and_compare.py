@@ -15,7 +15,7 @@ import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
-from models.configs import ObservationHeadConfig
+from models.configs import LatentInformationConfig, ObservationHeadConfig
 from models.observation_heads import ClinicalObservationHead, WastewaterObservationHead
 from tests.eval_test_helpers import make_granular_row, write_granular_fixture
 
@@ -131,6 +131,14 @@ def _make_batch() -> SimpleNamespace:
                 dtype=torch.float32,
             ),
             "death_flow": torch.zeros((2, 2), dtype=torch.float32),
+            "infection_flow": torch.tensor(
+                [[0.001, 0.002], [0.003, 0.004]],
+                dtype=torch.float32,
+            ),
+            "beta_t": torch.full((2, 2), 0.3, dtype=torch.float32),
+            "gamma_t": torch.full((2, 2), 0.1, dtype=torch.float32),
+            "mortality_t": torch.full((2, 2), 0.01, dtype=torch.float32),
+            "hospitalization_rate_t": torch.full((2, 2), 0.05, dtype=torch.float32),
             "observation_source_hosp": torch.tensor(
                 [[0.0, 0.02, 0.03], [0.0, 0.04, 0.05]],
                 dtype=torch.float32,
@@ -569,6 +577,7 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         ),
         training=SimpleNamespace(
             loss=SimpleNamespace(),
+            latent_information=LatentInformationConfig(),
             node_split_population_bins=5,
             node_split_strategy="random",
             test_split=0.2,
