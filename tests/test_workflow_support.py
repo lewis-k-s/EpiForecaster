@@ -2716,6 +2716,7 @@ def _make_remote_run_staging(
         "scripts/hpo/__init__.py",
         "scripts/hpo/campaign_init.py",
         "scripts/workflow/__init__.py",
+        "scripts/workflow/pinned_inputs.py",
         "scripts/workflow/run_config.py",
         "scripts/workflow/remote_run.sh",
         "scripts/workflow/snakemake_coordinator.sh",
