@@ -38,9 +38,42 @@ ZARR_ENCODING_KEYS_TO_CLEAR = {
 
 # Float32 cumulative-state differencing has small rounding error relative to the
 # continuous generator flow. This tolerance is applied in normalized fraction
-# space after cropping to the configured processing interval.
+# space after cropping to the configured processing interval. The fixed atol
+# covers the flow's own rounding; the stock's float32 quantization is added per
+# element by death_flow_alignment_tolerance.
 LATENT_DEATH_FLOW_ALIGNMENT_ATOL = 1e-8
 LATENT_DEATH_FLOW_ALIGNMENT_RTOL = 1e-5
+FLOAT32_EPS = float(np.finfo(np.float32).eps)
+
+
+def death_flow_alignment_tolerance(
+    earlier_stock: np.ndarray,
+    later_stock: np.ndarray,
+    stock_difference: np.ndarray,
+) -> np.ndarray:
+    """Return the allowed |latent death flow - sirhd_D difference| per element.
+
+    The stock fractions are float32 after the persons -> float32 cast and the
+    population division, so each carries a relative error of up to
+    ``2 * eps / 2``. Their difference therefore has an absolute error that grows
+    with the stock, which a fixed atol cannot bound when a run reaches a large
+    death fraction (13-15% in the n400 corpus). Arguments are the stock fraction
+    at the interval start, at its end, and their difference.
+    """
+    quantization = (
+        2.0
+        * FLOAT32_EPS
+        * np.maximum(
+            np.asarray(earlier_stock, dtype=np.float64),
+            np.asarray(later_stock, dtype=np.float64),
+        )
+    )
+    return (
+        LATENT_DEATH_FLOW_ALIGNMENT_ATOL
+        + quantization
+        + LATENT_DEATH_FLOW_ALIGNMENT_RTOL * np.abs(stock_difference)
+    )
+
 
 # Processed latent target name -> generator model-aligned SIRHD stock. The
 # generator defines sirhd_I as E+A+I+PH+PD and sirhd_H as HR+HD; the primitive
@@ -321,6 +354,18 @@ class SyntheticProcessor:
         Returns:
             Dict with keys: cases, mobility, edar, population, temporal_covariates
         """
+        corpus = self.open_corpus(synthetic_path)
+        run_ids = corpus["run_id"].values
+        if run_filter is not None:
+            run_ids = run_ids[np.isin(run_ids, run_filter)]
+            print(f"Filtered to {len(run_ids)} runs: {run_ids}")
+            print()
+        result = self.extract_runs(corpus, run_ids, check_mobility=True)
+        result["synthetic_corpus_provenance"] = self._corpus_provenance(corpus)
+        return result
+
+    def open_corpus(self, synthetic_path: str) -> xr.Dataset:
+        """Open the corpus lazily, drop the excluded runs and validate the schema."""
         self._validate_temporal_covariates_config()
 
         print(f"Loading synthetic data from {synthetic_path}")
@@ -332,19 +377,36 @@ class SyntheticProcessor:
         print(ds)
         print()
 
-        # Filter runs if specified
-        if run_filter is not None:
-            run_ids = ds["run_id"].values
-            mask = np.isin(run_ids, run_filter)
-            ds = ds.isel(run_id=mask)
-            print(f"Filtered to {len(ds.run_id)} runs: {ds.run_id.values}")
-            print()
-
         ds = self._exclude_runs(ds)
-
-        # Validate schema before extraction
         self._validate_schema(ds)
         self._validate_model_facing_roles(ds)
+        return ds
+
+    def corpus_provenance(self, corpus: xr.Dataset) -> dict[str, Any]:
+        """Corpus identity plus the mobility layout QA over the whole corpus.
+
+        The QA rebuilds a spread sample of runs and dates, so it needs every
+        run of the corpus rather than the runs of one extraction.
+        """
+        self._extract_mobility(corpus, check_parity=True)
+        return self._corpus_provenance(corpus)
+
+    def extract_runs(
+        self,
+        corpus: xr.Dataset,
+        run_ids: np.ndarray | list[str],
+        *,
+        check_mobility: bool,
+    ) -> dict[str, xr.DataArray | xr.Dataset]:
+        """Extract the model inputs and targets of ``run_ids`` from ``corpus``.
+
+        ``check_mobility`` runs the sampled mobility layout QA on these runs; a
+        caller that extracts one run at a time checks the corpus once with
+        ``corpus_provenance`` instead.
+        """
+        ds = corpus
+        if len(run_ids) != corpus.sizes["run_id"]:
+            ds = corpus.isel(run_id=np.isin(corpus["run_id"].values, run_ids))
 
         per_run_metadata = {
             name: ds[name] for name in SYNTHETIC_PER_RUN_METADATA if name in ds
@@ -359,7 +421,7 @@ class SyntheticProcessor:
 
         result = {
             "cases": cases_data,
-            "mobility": self._extract_mobility(ds),
+            "mobility": self._extract_mobility(ds, check_parity=check_mobility),
             "edar_flow": edar_flow,  # Flow/concentration values
             "edar_censor": edar_censor,  # Censor flags
             "population": self._extract_population(ds),
@@ -380,8 +442,6 @@ class SyntheticProcessor:
             result["latent_sird"] = latent_sird
 
         result.update(per_run_metadata)
-        result["synthetic_corpus_provenance"] = self._corpus_provenance(ds)
-
         return result
 
     def _exclude_runs(self, ds: xr.Dataset) -> xr.Dataset:
@@ -1020,7 +1080,9 @@ class SyntheticProcessor:
     def _has_factorized_mobility(ds: xr.Dataset) -> bool:
         return all(name in ds for name in FACTORIZED_MOBILITY_SCHEMA)
 
-    def _extract_mobility(self, ds: xr.Dataset) -> xr.Dataset:
+    def _extract_mobility(
+        self, ds: xr.Dataset, *, check_parity: bool = True
+    ) -> xr.Dataset:
         """Extract mobility data from synthetic dataset.
 
         Supports three formats, in order of preference:
@@ -1038,9 +1100,10 @@ class SyntheticProcessor:
 
         if self._has_factorized_mobility(ds):
             mobility = self._reconstruct_factorized_mobility(ds)
-            self.mobility_provenance["mobility_qa"] = self._check_factorized_mobility(
-                ds, mobility
-            )
+            if check_parity:
+                self.mobility_provenance["mobility_qa"] = (
+                    self._check_factorized_mobility(ds, mobility)
+                )
             print(
                 f"  ✓ Rebuilt mobility lazily for {mobility.sizes['run_id']} runs: "
                 f"{mobility.shape}, chunks {mobility.data.chunksize}"
@@ -1571,35 +1634,30 @@ class SyntheticProcessor:
                 "after float32 population-fraction normalization."
             )
 
-        latent_d_difference = latent_vars["latent_D_true"].diff(TEMPORAL_COORD)
+        latent_d = latent_vars["latent_D_true"]
+        latent_d_difference = latent_d.diff(TEMPORAL_COORD)
         destination_flow = death_flow_fraction.sel(
             {TEMPORAL_COORD: latent_d_difference[TEMPORAL_COORD]}
         )
         destination_values = np.asarray(destination_flow.values)
         latent_difference_values = np.asarray(latent_d_difference.values)
+        allowed = death_flow_alignment_tolerance(
+            np.asarray(latent_d.isel({TEMPORAL_COORD: slice(None, -1)}).values),
+            np.asarray(latent_d.isel({TEMPORAL_COORD: slice(1, None)}).values),
+            latent_difference_values,
+        )
         comparable = np.isfinite(destination_values) & np.isfinite(
             latent_difference_values
         )
-        if comparable.any() and not np.allclose(
-            destination_values[comparable],
-            latent_difference_values[comparable],
-            rtol=LATENT_DEATH_FLOW_ALIGNMENT_RTOL,
-            atol=LATENT_DEATH_FLOW_ALIGNMENT_ATOL,
-        ):
-            max_error = float(
-                np.nanmax(
-                    np.abs(
-                        destination_values[comparable]
-                        - latent_difference_values[comparable]
-                    )
-                )
-            )
+        residual = np.abs(destination_values - latent_difference_values)
+        if comparable.any() and (residual[comparable] > allowed[comparable]).any():
+            max_error = float(np.max(residual[comparable]))
             raise ValueError(
                 f"'{SIRHD_DEATH_FLOW_SOURCE}' must align with destination-dated "
                 "sirhd_D.diff(date) after float32 normalization; "
                 f"maximum absolute error was {max_error:.6g} "
-                f"(atol={LATENT_DEATH_FLOW_ALIGNMENT_ATOL}, "
-                f"rtol={LATENT_DEATH_FLOW_ALIGNMENT_RTOL})."
+                f"(atol={LATENT_DEATH_FLOW_ALIGNMENT_ATOL} plus float32 stock "
+                f"quantization, rtol={LATENT_DEATH_FLOW_ALIGNMENT_RTOL})."
             )
         latent_vars["latent_death_flow_true"] = death_flow_fraction
 

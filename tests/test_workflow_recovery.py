@@ -225,7 +225,7 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
             if len(calls) == 1:
                 path.write_bytes(b"partial")
                 raise RuntimeError("preempted")
-            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path)
             return path
 
     monkeypatch.setattr(data.preprocess, "OfflinePreprocessingPipeline", Pipeline)
@@ -284,7 +284,7 @@ def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monke
         def run(self):
             path = Path(self.config.output_path) / "tiny-dated.zarr.zip"
             path.parent.mkdir(parents=True)
-            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path)
             built.append(path)
             return path
 

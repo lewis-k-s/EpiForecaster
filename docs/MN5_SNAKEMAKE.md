@@ -350,8 +350,9 @@ publication depends on that file as well as its QA evidence.
 
 Processed datasets are sharded Zarr v3 stores packed into one uncompressed
 ZIP64 file (`data/preprocess/zarr_layout.py`, layout `synthetic-zarr-v1`).
-Each per-run variable has one shard per run, so `preprocessing.write_workers`
-processes write runs in parallel and verify each run by read-back. DVC tracks
+Each per-run variable has one shard per run. `preprocessing.write_workers`
+processes each build one synthetic run from the raw corpus, write it and verify
+it by read-back (`data/preprocess/synthetic_runs.py`). DVC tracks
 the packed file as one object. See `docs/SYNTHETIC_ZARR_LAYOUT.md`.
 
 ## Prepare and submit
