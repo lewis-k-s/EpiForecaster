@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 
 import numpy as np
+import pytest
 import xarray as xr
 import yaml
 
@@ -103,6 +104,48 @@ def test_processed_dataset_qa_validates_destination_dated_flow() -> None:
     }
 
 
+def _large_death_fraction_dataset(flow_error: float = 0.0) -> xr.Dataset:
+    # Cumulative deaths are 14% of the population while daily deaths are ~1e-4,
+    # so the float32 stock's own rounding (~1.5e-8) exceeds the fixed atol.
+    rng = np.random.default_rng(11)
+    flow = rng.uniform(5e-5, 2e-4, size=(2, 30, 40))
+    flow[:, 0, :] = 0.0
+    stock = (0.14 + np.cumsum(flow, axis=1)).astype(np.float32)
+    flow = (flow + flow_error).astype(np.float32)
+    dates = np.arange("2020-01-01", "2020-01-31", dtype="datetime64[D]")
+    dims = ("run_id", "date", "region_id")
+    return xr.Dataset(
+        {"latent_D_true": (dims, stock), "latent_death_flow_true": (dims, flow)},
+        coords={"run_id": [0, 1], "date": dates, "region_id": np.arange(40)},
+    )
+
+
+def test_processed_dataset_qa_allows_float32_stock_rounding_at_large_death_fraction() -> (
+    None
+):
+    dataset = _large_death_fraction_dataset()
+    rounding = np.abs(
+        dataset["latent_death_flow_true"].isel(date=slice(1, None)).values
+        - dataset["latent_D_true"].diff("date").values
+    ).max()
+    workflow = _preprocess_workflow()
+    workflow["preprocessing"]["expected_run_count"] = 2
+
+    qa = run_support._processed_dataset_qa(dataset, workflow)
+
+    assert rounding > 1e-8, "fixture must exceed the fixed atol"
+    assert qa["latent_death_flow_alignment"]["max_absolute_error"] == float(rounding)
+
+
+def test_processed_dataset_qa_rejects_misaligned_flow_at_large_death_fraction() -> None:
+    dataset = _large_death_fraction_dataset(flow_error=2e-6)
+    workflow = _preprocess_workflow()
+    workflow["preprocessing"]["expected_run_count"] = 2
+
+    with pytest.raises(ValueError, match="not destination-aligned"):
+        run_support._processed_dataset_qa(dataset, workflow)
+
+
 def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     monkeypatch,
     tmp_path: Path,
@@ -119,13 +162,12 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     dataset.write_bytes(b"fake-netcdf-payload")
     qa = run_root / "outputs/preprocessing/qa.json"
     qa.write_text("{}\n")
-    file_hash = run_support.sha256_file(dataset)
     marker = run_root / "outputs/preprocessing/.preprocessed.done"
     marker.write_text(
         json.dumps(
             {
                 "dataset": str(dataset),
-                "dataset_sha256": file_hash,
+                "dataset_bytes": dataset.stat().st_size,
                 "qa": str(qa),
                 "qa_sha256": run_support.sha256_file(qa),
             }
@@ -190,7 +232,11 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
             )
             (cwd / "synthetic_smoke.zarr.zip.dvc").write_text(
                 yaml.safe_dump(
-                    {"outs": [{"md5": "published.md5", "path": "synthetic_smoke.zarr.zip"}]}
+                    {
+                        "outs": [
+                            {"md5": "published.md5", "path": "synthetic_smoke.zarr.zip"}
+                        ]
+                    }
                 )
             )
 
@@ -227,7 +273,7 @@ def test_publish_preprocessed_dataset_rejects_nonempty_publication(
         json.dumps(
             {
                 "dataset": str(dataset),
-                "dataset_sha256": run_support.sha256_file(dataset),
+                "dataset_bytes": dataset.stat().st_size,
                 "qa": str(qa),
                 "qa_sha256": run_support.sha256_file(qa),
             }

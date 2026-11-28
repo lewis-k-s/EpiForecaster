@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 import hashlib
 import json
 import os
@@ -15,13 +16,21 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def _identity(path: Path, record: dict) -> dict:
+    # Datasets are recorded by size: DVC hashes them once at publication, and
+    # hashing a 200 GB payload at every stage boundary costs minutes.
+    if "bytes" in record:
+        return {"bytes": path.stat().st_size}
+    return {"sha256": file_hash(path)}
+
+
 def new_attempt(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="attempt-", dir=root))
 
 
 def _publish(
-    attempt: Path, record: dict, run_root: Path, *, verify_hashes: bool = True
+    attempt: Path, record: dict, run_root: Path, *, verify: bool = True
 ) -> None:
     # Validate the entire attempt before publishing any file.
     files = []
@@ -30,16 +39,17 @@ def _publish(
         destination = run_root / relative
         source.resolve().relative_to(attempt.resolve())
         destination.resolve().relative_to(run_root.resolve())
-        if source.is_symlink() or (
-            verify_hashes and file_hash(source) != artifact["sha256"]
-        ):
-            raise ValueError(f"Completed attempt failed SHA-256 validation: {source}")
+        expected = {
+            key: artifact[key] for key in ("sha256", "bytes") if key in artifact
+        }
+        if source.is_symlink() or (verify and _identity(source, artifact) != expected):
+            raise ValueError(f"Completed attempt failed validation: {source}")
         if destination.is_symlink():
             raise ValueError(f"Attempt output must not be a symlink: {destination}")
         if (
             destination.exists()
             and not os.path.samefile(source, destination)
-            and file_hash(destination) != artifact["sha256"]
+            and _identity(destination, artifact) != expected
         ):
             raise ValueError(
                 f"Attempt output conflicts with an existing file: {destination}"
@@ -67,14 +77,28 @@ def restore_attempt(root: Path, identity: dict, run_root: Path) -> bool:
 
 
 def complete_attempt(
-    attempt: Path, identity: dict, artifacts: dict[Path, Path], run_root: Path
+    attempt: Path,
+    identity: dict,
+    artifacts: dict[Path, Path],
+    run_root: Path,
+    *,
+    size_only: Collection[Path] = (),
 ) -> None:
+    """Record and publish an attempt's artifacts.
+
+    Artifacts are recorded by SHA-256, except the destinations in
+    ``size_only``, which are recorded by byte size.
+    """
     record = {
         "identity": identity,
         "artifacts": {
             str(destination.relative_to(run_root)): {
                 "path": str(source.relative_to(attempt)),
-                "sha256": file_hash(source),
+                **(
+                    {"bytes": source.stat().st_size}
+                    if destination in size_only
+                    else {"sha256": file_hash(source)}
+                ),
             }
             for destination, source in artifacts.items()
         },
@@ -82,6 +106,6 @@ def complete_attempt(
     temporary = attempt / "complete.json.tmp"
     temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
     temporary.replace(attempt / "complete.json")
-    # This process just hashed its private attempt. Reuse those checksums on
-    # first publication; a later restoration always hashes the files again.
-    _publish(attempt, record, run_root, verify_hashes=False)
+    # This process just recorded its private attempt. Reuse that record on
+    # first publication; a later restoration always checks the files again.
+    _publish(attempt, record, run_root, verify=False)

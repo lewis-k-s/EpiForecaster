@@ -24,7 +24,11 @@ ALLOCATION_FIELDS = (
     "cpus_per_task",
     "gres",
     "runtime",
+    "mps_clients_per_gpu",
 )
+# One MN5 ACC node grants 20 CPUs per GPU and has at most four GPUs.
+ACC_CPUS_PER_GPU = 20
+ACC_MAX_GPUS = 4
 # CPU-only preprocessing may run on one MN5 GPP node (112 cores) or on one
 # Nord4 main node (48 cores). Both clusters share the same GPFS.
 GPP_QOS = {"gp_bscls", "gp_debug"}
@@ -565,8 +569,16 @@ def _validate_cpu_allocation(allocation: dict[str, Any], kind: str) -> dict[str,
             for key, (actual, expected_value) in mismatches.items()
         )
         raise ValueError(f"Invalid {label} allocation: {details}")
+    if allocation.get("mps_clients_per_gpu", 1) != 1:
+        raise ValueError(f"A {short} allocation has no GPUs; MPS clients must be 1")
     return {
-        field: (GPP_GRES if field == "gres" else allocation[field])
+        field: (
+            GPP_GRES
+            if field == "gres"
+            else 1
+            if field == "mps_clients_per_gpu"
+            else allocation[field]
+        )
         for field in ALLOCATION_FIELDS
     }
 
@@ -619,20 +631,52 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     if workload is None and kind in {"hpo", "ablation"}:
         raise ValueError(f"Workflow config must define a {workload_name} mapping")
     expected_tasks = 1 if workload is None else workload.get("workers")
+    mps_clients = allocation.get("mps_clients_per_gpu", 1)
+    if (
+        not isinstance(mps_clients, int)
+        or isinstance(mps_clients, bool)
+        or mps_clients < 1
+    ):
+        raise ValueError(
+            "resources.allocation.mps_clients_per_gpu must be an integer of at least 1"
+        )
+    if mps_clients > 1 and kind not in {"hpo", "ablation"}:
+        raise ValueError(
+            "resources.allocation.mps_clients_per_gpu > 1 is supported only for "
+            "workflow.kind 'hpo' and 'ablation'"
+        )
     if (
         not isinstance(expected_tasks, int)
         or isinstance(expected_tasks, bool)
-        or not 1 <= expected_tasks <= 4
+        or expected_tasks < 1
     ):
-        raise ValueError(f"{workload_name}.workers must be an integer between 1 and 4")
+        raise ValueError(f"{workload_name}.workers must be a positive integer")
+    # Without MPS, one worker owns one GPU. With K MPS clients per GPU, G GPUs
+    # host G * K workers that share the node's 20 CPUs per GPU.
+    if expected_tasks % mps_clients != 0:
+        raise ValueError(
+            f"{workload_name}.workers={expected_tasks} must be a multiple of "
+            f"resources.allocation.mps_clients_per_gpu={mps_clients}"
+        )
+    gpus = expected_tasks // mps_clients
+    if not 1 <= gpus <= ACC_MAX_GPUS:
+        raise ValueError(
+            f"{workload_name}.workers must be an integer between 1 and "
+            f"{ACC_MAX_GPUS * mps_clients} (workers / mps_clients_per_gpu GPUs)"
+        )
+    node_cpus = ACC_CPUS_PER_GPU * gpus
+    if node_cpus % expected_tasks != 0:
+        raise ValueError(
+            f"{node_cpus} CPUs cannot be split evenly across {expected_tasks} workers"
+        )
 
     expected = {
         "account": "bsc08",
         "partition": "acc",
         "nodes": 1,
         "tasks": expected_tasks,
-        "cpus_per_task": 20,
-        "gres": f"gpu:{expected_tasks}",
+        "cpus_per_task": node_cpus // expected_tasks,
+        "gres": f"gpu:{gpus}",
     }
     mismatches = {
         key: (allocation.get(key), value)
@@ -643,10 +687,10 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     qos = allocation.get("qos")
     if qos not in {"acc_bscls", "acc_debug", "acc_interactive"}:
         mismatches["qos"] = (qos, "acc_bscls, acc_debug, or acc_interactive")
-    if qos == "acc_interactive" and expected_tasks > 2:
-        mismatches["tasks"] = (
-            expected_tasks,
-            "at most 2 for acc_interactive's 40-CPU ceiling",
+    if qos == "acc_interactive" and gpus > 2:
+        mismatches["gres"] = (
+            allocation.get("gres"),
+            "at most 2 GPUs for acc_interactive's 40-CPU ceiling",
         )
     if qos == "acc_interactive" and isinstance(runtime, int) and runtime > 120:
         mismatches["runtime"] = (
@@ -679,7 +723,11 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "resources.allocation must use gres='gpu:<tasks>', not gpu/gpus"
         )
-    return {field: allocation[field] for field in ALLOCATION_FIELDS}
+    return {
+        field: allocation[field]
+        for field in ALLOCATION_FIELDS
+        if field != "mps_clients_per_gpu"
+    } | {"mps_clients_per_gpu": mps_clients}
 
 
 def source_snapshot_sha256(source_root: Path, paths: list[Path]) -> str:

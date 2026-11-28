@@ -32,9 +32,15 @@ tasks=N
 gres=gpu:N
 ```
 
-Templates use `acc_bscls`; `acc_debug` is also accepted when its wall-time
-limits fit the run. No `--mem` or `--mem-per-cpu` directive is permitted
-because MN5 derives host memory from the CPU allocation.
+The `mn5_train`, `mn5_crossval`, `mn5_synth_pretrain_control`, and
+synthetic fine-tune templates use `acc_debug`. The other templates (for example
+`mn5`, `mn5_ablation`, and `mn5_evaluate`) use `acc_bscls`. Use `acc_debug` for
+any run that fits its two-hour limit: its QOS priority is 10000 against 100 for `acc_bscls`, but it holds one
+queued or running job per user. Pack many short runs into one `ablation`
+campaign (with `mps_clients_per_gpu` when trials leave the GPU idle) instead of
+submitting one job per run. Size `runtime` from measured wall time with about a
+twofold margin; a shorter limit backfills sooner. No `--mem` or `--mem-per-cpu`
+directive is permitted because MN5 derives host memory from the CPU allocation.
 
 Single training and evaluation use `N=1`. HPO and ablation use their configured
 worker count. Cross-validation uses up to `N` concurrent folds, with ten folds
@@ -324,9 +330,24 @@ coverage, run-context, aggregate table, and artifact manifest. Completion
 markers remain receipts rather than the sole scientific output contract.
 
 `stage_data` materializes the pinned DVC payloads once in the run workspace.
-The first scientific step copies them to an allocation-local cache on the node.
-The key includes the run config and data manifest. A lock protects construction;
-only a complete copy is published. All ranks and later stages mount this copy
+The first scientific step copies them to an allocation-local cache on the node:
+rsync copies files below 1 GiB and `scripts/workflow/parallel_copy.py` copies
+larger files with 16 concurrent 64 MiB block readers, because one stream reads
+about 0.4 GB/s from GPFS. Other jobs share the disk of an ACC node and can
+leave it nearly full (job 48640552 found 165 of 436 GB free for a 204 GB
+dataset and failed after four minutes of copying), so the copy checks the free
+space first and fails at once unless the large files fit with 16 GiB to spare.
+A check alone does not hold the space: two pretrains that started together on
+one 480 GB node both passed it, and one ran out of space after ten minutes of
+copying (jobs 49064430 and 49064484). Under a per-user node lock
+(`/scratch/tmp/epiforecaster-staging-<user>.lock`), the copy therefore checks
+the space and reserves the blocks of every large file with `posix_fallocate`
+before it copies any data. A job that cannot reserve its space releases what it
+reserved and fails within seconds; the copy of a job that has reserved cannot
+run out of space.
+Resubmit to get another node. The key includes the run config and data manifest. A
+lock protects construction; only a complete copy is published. All ranks and
+later stages mount this copy
 read-only. Each process keeps a private temporary directory. Shared leases keep
 the cache alive during execution, and the coordinator removes it on exit when
 no step still uses it. An abrupt allocation loss can leave node-local files;
@@ -339,8 +360,10 @@ progress. The initialization rule creates the journal before workers start.
 
 Preprocessing and cross-validation keep each attempt under `.state/attempts/`.
 Partial attempts remain available for inspection. A completed attempt has a
-receipt with the config identity and file hashes. On retry, the runtime checks
-those hashes and restores missing public outputs without repeating the work.
+receipt with the config identity and file hashes; the processed dataset is
+recorded by byte size, because its DVC MD5 at publication is its only hash. On
+retry, the runtime checks the recorded identities and restores missing public
+outputs without repeating the work.
 Publication uses atomic hard links within the run filesystem, so large payloads
 do not require a second copy. Keep attempt directories for the lifetime of the
 run: they contain the training logs, dynamics, and recovery evidence. Incomplete
@@ -465,3 +488,18 @@ value and alert thresholds, `event_decision_fixed_0_5`, and nullable
 calibration evidence. It is not a negative alert. Summary JSON contains metric
 counts, support reasons, and horizon-band results. Hospitalization event scores
 remain unsupported until source-level aggregation is defined.
+
+## CUDA MPS worker packing
+
+Set `resources.allocation.mps_clients_per_gpu` to K to run K HPO or ablation
+workers on each GPU. The default is 1 and keeps one worker per GPU. For K above
+1, `gres` is `gpu:G`, the worker count is `G * K`, `tasks` equals the worker
+count, and `cpus_per_task` is `20 * G / tasks`. Only `hpo` and `ablation` kinds
+accept K above 1.
+
+All workers run in one Slurm step that sees all G GPUs. Rank r uses GPU `r // K`,
+selected by UUID. The first rank on each GPU starts one MPS daemon for that GPU
+under the job `TMPDIR`, and stops it after all K ranks on that GPU exit. Each
+worker runs with `singularity exec --contain`, because `--containall` makes
+MPS reject the client. K of 1 keeps `--containall`. Daemon logs are copied to
+`logs/mps/` in the run root.
