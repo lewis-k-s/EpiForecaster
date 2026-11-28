@@ -2413,6 +2413,36 @@ def test_train_model_resumes_from_pinned_checkpoint_and_seeds_best(
     assert checkpoint.stat().st_mode & 0o200
 
 
+@pytest.mark.parametrize("failed_status", [None, "failed"])
+def test_train_model_retry_clears_stale_training_dynamics(
+    monkeypatch, tmp_path: Path, failed_status: str | None
+) -> None:
+    config, config_path, run_root, source_root, _ = _resume_training_run(tmp_path)
+    _, model_root = run_support.training_artifact_paths(config, run_root)
+    # A failed earlier attempt leaves its dynamics past the pinned epoch.
+    stale = TrainingDynamicsWriter(
+        model_root,
+        progress_log_frequency=10,
+        grad_norm_log_frequency=10,
+        mobility_enabled=True,
+    )
+    stale.append(step=500, epoch=3, values={"loss_train_step": 1.0})
+    if failed_status is not None:
+        stale.finalize(failed_status)
+
+    def fake_run(command, *, cwd=None, env=None):
+        # The trainer starts a fresh artifact; a stale one makes it raise.
+        _complete_training_dynamics(model_root)
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+
+    run_support.train_model(config_path, source_root, run_root)
+
+    rows = (model_root / "training_dynamics.jsonl").read_text().splitlines()
+    assert len(rows) == 1
+    assert '"step": 0' in rows[0]
+
+
 @pytest.mark.parametrize(
     ("pair_options", "message"),
     [
@@ -3099,6 +3129,18 @@ def test_transferred_runner_attaches_without_sbatch(
 def test_container_coordinator_preserves_capacity_and_completion(
     tmp_path: Path, mode: str, exit_code: int
 ) -> None:
+    _run_container_coordinator(tmp_path, mode, exit_code, prepared=False)
+
+
+def test_container_coordinator_restart_skips_missing_checkpoint_source(
+    tmp_path: Path,
+) -> None:
+    _run_container_coordinator(tmp_path, "batch", 0, prepared=True)
+
+
+def _run_container_coordinator(
+    tmp_path: Path, mode: str, exit_code: int, *, prepared: bool
+) -> None:
     run_root = tmp_path / "run"
     attempt_root = run_root / ".state/executions/attempt"
     source_root = run_root / "source"
@@ -3110,6 +3152,10 @@ def test_container_coordinator_preserves_capacity_and_completion(
     (run_root / ".state/dispatch.tsv").write_text(
         f"run_id\trun\ncheckpoint_input_dir\t{checkpoint_dir}\n"
     )
+    if prepared:
+        # Pinned checkpoints replace the source directory after prepare.
+        (run_root / ".state/prepared.done").write_text("{}\n")
+        checkpoint_dir.rmdir()
     capture = tmp_path / "capacity.txt"
     sif = tmp_path / "runtime.sif"
     sif.touch()
@@ -3163,7 +3209,9 @@ def test_container_coordinator_preserves_capacity_and_completion(
     assert Path(f"{capture}.mode").read_text().strip() == mode
     container_arguments = Path(f"{capture}.container").read_text().splitlines()
     assert f"{sif.parent}:{sif.parent}:ro" in container_arguments
-    assert f"{checkpoint_dir}:{checkpoint_dir}:ro" in container_arguments
+    assert (f"{checkpoint_dir}:{checkpoint_dir}:ro" in container_arguments) is (
+        not prepared
+    )
     arguments = Path(f"{capture}.args").read_text().splitlines()
     assert arguments[arguments.index("--cores") + 1] == "40"
     assert arguments[arguments.index("--jobs") + 1] == "2"

@@ -508,6 +508,10 @@ following epoch.
 1. Copy the original template and keep every scientific setting identical,
    including `training.epochs` in the base config, so the cosine schedule
    continues rather than restarts.
+   Remove `training.init_checkpoint` and `training.require_init_checkpoint`
+   from the copy. A run that needs `training.require_init_checkpoint: true`
+   (the fine-tune template) cannot be continued this way: the workflow
+   contract rejects `training.resume_checkpoint` together with it.
 2. Set both absolute GPFS paths from the timed-out run:
    `training.resume_checkpoint` to the last `checkpoint_epoch_NNNN.pt` and
    `training.resume_best_checkpoint` to that run's `best_model.pt`. They must be
@@ -518,12 +522,16 @@ Preparation pins both files under `inputs/` and records their SHA-256 in the
 manifest (`training_resume_input`). The sealed dispatch request lists the
 directory of every out-of-run checkpoint (`training.init_checkpoint`, the resume
 pair, `evaluation.checkpoint`), and the coordinator binds each read-only into its
-contained runtime so `prepare_run` can copy them. Before training, the best
+contained runtime so `prepare_run` can copy them. After `prepare` is done, a restarted coordinator
+skips these binds and does not need the source directories, because workers read
+the pinned copies under `inputs/`. Before training, the best
 checkpoint must
 not be later than the resume checkpoint and must carry the resume checkpoint's
 best selection score and metric. It seeds the new run's `best_model.pt`, so the
 canonical checkpoint exists even if no later epoch improves. A retried attempt
 restarts from the same pinned pair and replaces any stale `best_model.pt`.
+It also removes the training dynamics artifact and manifest that a failed
+earlier attempt left in the model root.
 Optimizer, scheduler, RNG, epoch, patience, and selection state resume from the
 epoch checkpoint.
 

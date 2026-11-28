@@ -614,8 +614,12 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         _validate_resume_pair(pinned_resume, pinned_best)
         # Every attempt restarts from the pinned resume state, so its best
         # checkpoint restarts from the pinned best, replacing any stale one.
+        # A failed earlier attempt also leaves training dynamics that the new
+        # trainer would append to, past the pinned epoch. Remove them.
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(pinned_best, checkpoint)
+        for name in (DYNAMICS_ARTIFACT_NAME, DYNAMICS_MANIFEST_NAME):
+            (model_root / name).unlink(missing_ok=True)
         overrides.append(f"training.resume_checkpoint_path={pinned_resume}")
     for override in overrides:
         command.extend(["--override", override])
