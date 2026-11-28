@@ -393,8 +393,12 @@ class TestEpiDataset:
             assert torch.isfinite(batch.bio_node).all()
             assert torch.isfinite(batch.temporal_covariates).all()
 
-            from utils.training_utils import inject_context_features
+            from utils.training_utils import (
+                inject_context_features,
+                inject_context_placement,
+            )
 
+            inject_context_placement(batch, ds)
             inject_context_features(batch, ds, torch.device("cpu"))
             assert torch.isfinite(batch.mob_batch.x_dense).all()
             assert batch.hosp_hist.dtype == MODEL_PARAM_DTYPE
@@ -415,27 +419,11 @@ class TestEpiDataset:
             assert batch.deaths_target_mask.dtype == MODEL_PARAM_DTYPE
             assert batch.mob_batch.x_dense.dtype == MODEL_PARAM_DTYPE
 
-    def test_collate_reuses_shared_mob_real_node_idx(self, config, mock_xarray_dataset):
-        with patch.object(
-            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
-        ):
-            ds = EpiDataset(
-                config=config,
-                target_nodes=[0, 1],
-                context_nodes=[0, 1, 2],
-            )
-            item_a = ds[0]
-            item_b = ds[1]
-
-            batch = collate_epiforecaster_batch(
-                [item_a, item_b], require_region_index=False
-            )
-
-            assert batch.mob_batch.mob_real_node_idx is item_a["mob_real_node_idx"]
-
-    def test_collate_rejects_inconsistent_mob_real_node_idx(
+    def test_context_placement_comes_from_heavy_state(
         self, config, mock_xarray_dataset
     ):
+        from utils.training_utils import inject_context_placement
+
         with patch.object(
             EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
         ):
@@ -444,11 +432,15 @@ class TestEpiDataset:
                 target_nodes=[0, 1],
                 context_nodes=[0, 1, 2],
             )
-            item_a = ds[0]
-            item_b = ds[1]
-            item_b["mob_real_node_idx"] = item_b["mob_real_node_idx"].clone()
+            items = [ds[0], ds[1]]
+            assert all("mob_target_node_idx" not in item for item in items)
+            assert all("mob_real_node_idx" not in item for item in items)
 
-            with pytest.raises(ValueError, match="same cached tensor"):
-                collate_epiforecaster_batch(
-                    [item_a, item_b], require_region_index=False
-                )
+            batch = collate_epiforecaster_batch(items, require_region_index=False)
+            assert not hasattr(batch.mob_batch, "target_node")
+            inject_context_placement(batch, ds)
+
+            targets = torch.tensor([item["target_node"] for item in items])
+            expected = ds._get_global_to_local()[targets].repeat_interleave(batch.t)
+            assert torch.equal(batch.mob_batch.target_node, expected)
+            assert batch.mob_batch.mob_real_node_idx is ds.mob_real_node_idx

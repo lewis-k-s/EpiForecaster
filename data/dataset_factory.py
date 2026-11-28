@@ -16,6 +16,7 @@ from data.curriculum_builder import (
     build_curriculum_datasets,
     discover_runs,
 )
+from data.block_pipeline import RunBlockPipeline
 from data.crossval_manifest import load_crossval_fold_manifest
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
@@ -40,6 +41,8 @@ class DatasetSplits:
     real_run_id: str | None = None
     synth_run_ids: list[str] | None = None
     region_embedding_store: RegionEmbeddingStore | None = None
+    # Per-block heavy-state builder of curriculum synthetic runs (else None).
+    block_pipeline: RunBlockPipeline | None = None
 
 
 @dataclass(frozen=True)
@@ -1137,6 +1140,7 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             test_nodes=list(test_nodes),
             real_run=real_run,
             synth_runs=synth_runs,
+            curriculum=config.training.curriculum,
             region_embedding_store=region_embedding_store,
         )
 
@@ -1147,6 +1151,7 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             real_run_id=result.real_run_id,
             synth_run_ids=result.synth_run_ids,
             region_embedding_store=result.region_embedding_store,
+            block_pipeline=result.block_pipeline,
         )
     else:
         if not config.data.run_id:

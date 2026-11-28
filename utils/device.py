@@ -269,8 +269,14 @@ def prepare_batch_for_device(
 ) -> "EpiBatch":
     """Inject mobility and dense context features, then move the batch."""
     if dataset is not None:
-        from utils.training_utils import inject_context_features, inject_gpu_mobility
+        from utils.training_utils import (
+            inject_context_features,
+            inject_context_placement,
+            inject_gpu_mobility,
+        )
 
+        # Placement first: it builds the run's heavy state the others read.
+        inject_context_placement(batch_data, dataset)
         inject_gpu_mobility(batch_data, dataset, device)
         inject_context_features(batch_data, dataset, device)
 

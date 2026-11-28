@@ -330,34 +330,40 @@ def build_loader_from_config(
     # This ensures fair evaluation - same preprocessing as training
     splits = build_datasets(config)
 
-    if split_key == "full":
-        if isinstance(splits.train, ConcatDataset):
-            raise ValueError(
-                "split='full' is not supported for curriculum datasets yet."
-            )
+    try:
+        if split_key == "full":
+            if isinstance(splits.train, ConcatDataset):
+                raise ValueError(
+                    "split='full' is not supported for curriculum datasets yet."
+                )
 
-        train_dataset = splits.train
-        val_dataset = splits.val
-        test_dataset = splits.test
-        all_target_nodes = sorted(
-            set(train_dataset.target_nodes)
-            | set(val_dataset.target_nodes)
-            | set(test_dataset.target_nodes)
-        )
-        dataset = EpiDataset(
-            config=config,
-            target_nodes=all_target_nodes,
-            context_nodes=all_target_nodes,
-            biomarker_preprocessor=val_dataset.biomarker_preprocessor,
-            mobility_preprocessor=val_dataset.mobility_preprocessor,
-            preloaded_mobility=val_dataset.preloaded_mobility,
-            mobility_mask=val_dataset.mobility_mask,
-            run_id=splits.real_run_id,
-            region_embedding_store=splits.region_embedding_store,
-        )
-    else:
-        # Select requested split, discard others
-        dataset = splits.val if split_key == "val" else splits.test
+            train_dataset = splits.train
+            val_dataset = splits.val
+            test_dataset = splits.test
+            all_target_nodes = sorted(
+                set(train_dataset.target_nodes)
+                | set(val_dataset.target_nodes)
+                | set(test_dataset.target_nodes)
+            )
+            dataset = EpiDataset(
+                config=config,
+                target_nodes=all_target_nodes,
+                context_nodes=all_target_nodes,
+                biomarker_preprocessor=val_dataset.biomarker_preprocessor,
+                mobility_preprocessor=val_dataset.mobility_preprocessor,
+                preloaded_mobility=val_dataset.preloaded_mobility,
+                mobility_mask=val_dataset.mobility_mask,
+                run_id=splits.real_run_id,
+                region_embedding_store=splits.region_embedding_store,
+            )
+        else:
+            # Select requested split, discard others
+            dataset = splits.val if split_key == "val" else splits.test
+    finally:
+        # A curriculum config starts the spawned builder pool in build_datasets;
+        # evaluation discards the training runs, so stop it and drop their state.
+        if splits.block_pipeline is not None:
+            splits.block_pipeline.shutdown()
     # splits.train and the other eval split are garbage collected here
 
     # Worker configuration mirrors training defaults:

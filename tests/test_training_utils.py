@@ -36,6 +36,7 @@ class _DummyMobilityDataset(Dataset):
         self.mobility_mask = mobility_mask
         self.spatial_knn_adjacency = spatial_knn_adjacency
         self.static_graph_adjacency = static_graph_adjacency
+        self._temporal_coords = list(range(preloaded_mobility.shape[0]))
         self.config = SimpleNamespace(
             model=SimpleNamespace(
                 graph_adjacency_source=graph_adjacency_source,
@@ -219,7 +220,6 @@ def test_optimized_collate_graphs_attaches_homogeneous_run_id() -> None:
     item = {
         "window_start": 3,
         "temporal_covariates": torch.zeros(2, 0),
-        "mob_target_node_idx": 0,
         "run_id": "synth_2",
     }
     mob_batch = optimized_collate_graphs([item, item])

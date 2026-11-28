@@ -18,6 +18,34 @@ def accelerator_device():
     return torch.device("cpu")
 
 
+@pytest.fixture
+def spawn_builders():
+    """Request the real spawned builder pool instead of the in-process one."""
+
+
+@pytest.fixture(autouse=True)
+def in_process_builder_pool(request, monkeypatch):
+    """Run heavy-state builds in threads of the test process.
+
+    The production pool spawns interpreters that each import torch (seconds per
+    pool); the worker function and its results are identical in a thread, so
+    only tests that request ``spawn_builders`` pay for real processes.
+    """
+    if "spawn_builders" in request.fixturenames:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    from data import block_pipeline
+
+    monkeypatch.setattr(
+        block_pipeline,
+        "spawn_builder_pool",
+        lambda block_builders, builder_threads: ThreadPoolExecutor(
+            max_workers=block_builders
+        ),
+    )
+
+
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line(
