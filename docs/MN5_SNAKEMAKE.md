@@ -331,9 +331,10 @@ share `equal_budget_policy.paths`.
 
 `mn5_workflow.sh prepare` pins every declared checkpoint into
 `inputs/campaign_init/<campaign_id>/<name>.pt`, records its SHA-256 in
-`manifest.yaml` (`campaign_init_inputs`, `identity.campaign_init_checkpoint_sha256`),
-and lists the source directories as `checkpoint_input_dir` bindings of the sealed
-dispatch request. Workers pass the pinned in-run path, never the GPFS path, and
+`manifest.yaml` (`pinned_inputs["campaign_init/<campaign_id>/<name>"]`,
+`identity.campaign_init_checkpoint_sha256`), and lists the source directories
+as `checkpoint_input_dir` bindings of the sealed dispatch request. Workers pass
+the pinned in-run path, never the GPFS path, and
 re-verify the SHA-256 at worker start and before every trial; a tampered file
 fails the worker. Scientific identity follows checkpoint content: the hydrated
 training-config hash used for `reuse_receipt` acceptance substitutes
@@ -564,10 +565,15 @@ following epoch.
 3. `prepare` a new run id with that config and `run` it as usual.
 
 Preparation pins both files under `inputs/` and records their SHA-256 in the
-manifest (`training_resume_input`). The sealed dispatch request lists the
-directory of every out-of-run checkpoint (`training.init_checkpoint`, the resume
-pair, `evaluation.checkpoint`), and the coordinator binds each read-only into its
-contained runtime so `prepare_run` can copy them. Before training, the best
+manifest (`pinned_inputs.training_resume` and
+`pinned_inputs.training_resume_best`). `scripts/workflow/pinned_inputs.py` owns
+every out-of-run checkpoint (`training.init_checkpoint`, the resume pair,
+`evaluation.checkpoint`, campaign `init_checkpoints`): its declaration checks,
+in-run location, pinning, manifest record and verification before use. Run
+manifests from schema 2 hold all of them in one `pinned_inputs` section. The
+sealed dispatch request lists the directory of every such checkpoint, and the
+coordinator binds each read-only into its contained runtime so `prepare_run`
+can copy them. Before training, the best
 checkpoint must
 not be later than the resume checkpoint and must carry the resume checkpoint's
 best selection score and metric. It seeds the new run's `best_model.pt`, so the

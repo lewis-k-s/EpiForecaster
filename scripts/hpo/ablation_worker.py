@@ -35,12 +35,16 @@ from scripts.hpo.campaign_init import (
     condition_init_checkpoint,
     init_checkpoint_identity_value,
     parse_init_checkpoints,
-    pinned_init_checkpoint_relative,
     validate_init_checkpoint_references,
 )
 from scripts.hpo.file_lock import file_lock
 from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
-from scripts.workflow.run_support import _verify_pinned_checkpoint
+from scripts.workflow.pinned_inputs import (
+    PinnedFile,
+    campaign_init_input,
+    verified_input,
+    verify_file,
+)
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 
@@ -71,14 +75,6 @@ class CampaignCondition:
     overrides: dict[str, Any]
     allowed_difference_paths: tuple[str, ...]
     init_checkpoint: str | None = None
-
-
-@dataclass(frozen=True)
-class PinnedInitCheckpoint:
-    """An init checkpoint pinned into the run, verified against its recorded hash."""
-
-    path: Path
-    sha256: str
 
 
 @dataclass(frozen=True)
@@ -117,7 +113,7 @@ class AblationCampaign:
     provenance_requirements: dict[str, Any]
     allowed_reuse_code_identities: tuple[str, ...] = ()
     init_checkpoints: Mapping[str, Path] = dataclass_field(default_factory=dict)
-    pinned_init_checkpoints: Mapping[str, PinnedInitCheckpoint] = dataclass_field(
+    pinned_init_checkpoints: Mapping[str, PinnedFile] = dataclass_field(
         default_factory=dict
     )
 
@@ -718,45 +714,20 @@ def load_campaign(path: Path) -> AblationCampaign:
 
 def load_pinned_init_checkpoints(
     manifest_path: Path, campaign: AblationCampaign
-) -> dict[str, PinnedInitCheckpoint]:
+) -> dict[str, PinnedFile]:
     """Resolve and verify the run-pinned copies of the campaign's init checkpoints.
 
-    The manifest written at prepare records each checkpoint's SHA-256. Every
-    pinned file is re-hashed here, so a tampered or substituted file is rejected
-    before it can initialize a model. Paths are anchored at the manifest's run
-    root, which is the in-container run root for workers.
+    Every pinned file is re-hashed against the SHA-256 that prepare recorded,
+    so a tampered or substituted file is rejected before it can initialize a
+    model. Paths are anchored at the manifest's run root, which is the
+    in-container run root for workers.
     """
-    if not campaign.init_checkpoints:
-        return {}
-    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-    recorded = _mapping(
-        _mapping(
-            manifest.get("campaign_init_inputs"), field="manifest.campaign_init_inputs"
-        ).get(campaign.campaign_id),
-        field=f"manifest.campaign_init_inputs.{campaign.campaign_id}",
-    )
-    if set(recorded) != set(campaign.init_checkpoints):
-        raise ValueError(
-            "run manifest pins init checkpoints "
-            f"{sorted(recorded)} but the campaign declares "
-            f"{sorted(campaign.init_checkpoints)}"
+    return {
+        name: verified_input(
+            manifest_path, campaign_init_input(campaign.campaign_id, name, declared)
         )
-    pins: dict[str, PinnedInitCheckpoint] = {}
-    for name, declared in campaign.init_checkpoints.items():
-        record = _mapping(recorded[name], field=f"manifest pinned checkpoint {name}")
-        label = f"campaign {campaign.campaign_id} init checkpoint {name}"
-        if record.get("configured_checkpoint") != str(declared):
-            raise ValueError(f"Pinned {label} does not match the campaign declaration")
-        sha256 = _string(record.get("checkpoint_sha256"), field=f"{label} sha256")
-        if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
-            raise ValueError(f"Pinned {label} has an invalid recorded SHA-256")
-        relative = pinned_init_checkpoint_relative(campaign.campaign_id, name)
-        if record.get("pinned_checkpoint_relative") != str(relative):
-            raise ValueError(f"Pinned {label} is not at {relative}")
-        path = manifest_path.parent / relative
-        _verify_pinned_checkpoint(path, sha256, label=label)
-        pins[name] = PinnedInitCheckpoint(path=path, sha256=sha256)
-    return pins
+        for name, declared in campaign.init_checkpoints.items()
+    }
 
 
 def bind_pinned_init_checkpoints(
@@ -1541,13 +1512,12 @@ def objective(
     overrides = _as_cli_overrides(campaign.fixed_overrides) + _as_cli_overrides(
         condition.overrides
     )
-    init_pin: PinnedInitCheckpoint | None = None
+    init_pin: PinnedFile | None = None
     if condition.init_checkpoint is not None:
         _require_pinned_init_checkpoints(campaign)
         init_pin = campaign.pinned_init_checkpoints[condition.init_checkpoint]
-        _verify_pinned_checkpoint(
-            init_pin.path,
-            init_pin.sha256,
+        verify_file(
+            init_pin,
             label=(
                 f"campaign {campaign.campaign_id} init checkpoint "
                 f"{condition.init_checkpoint}"

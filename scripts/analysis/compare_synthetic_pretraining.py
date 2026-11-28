@@ -15,6 +15,15 @@ from typing import Any
 
 import yaml
 
+from scripts.workflow.pinned_inputs import (
+    EVALUATION,
+    RUN_MANIFEST_SCHEMA_VERSION,
+    TRAINING_INIT,
+    recorded_inputs,
+)
+
+# Prepared runs are immutable; manifests before schema 2 stay valid evidence.
+RUN_MANIFEST_SCHEMA_VERSIONS = {1, RUN_MANIFEST_SCHEMA_VERSION}
 
 SCHEMA_VERSION = 1
 DATASET_ROLE_POINTERS = {
@@ -266,7 +275,7 @@ def _validate_evaluation_dataset(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_manifest = _load_yaml_mapping(run.evaluation_run_manifest)
     data_manifest = _load_mapping(run.evaluation_data_manifest)
-    if run_manifest.get("schema_version") != 1:
+    if run_manifest.get("schema_version") not in RUN_MANIFEST_SCHEMA_VERSIONS:
         raise ValueError(
             f"Unsupported evaluation run manifest: {run.evaluation_run_manifest}"
         )
@@ -339,7 +348,7 @@ def _validate_training_run_manifest(
     provenance: dict[str, Any],
 ) -> dict[str, Any]:
     run_manifest = _load_yaml_mapping(run.training_run_manifest)
-    if run_manifest.get("schema_version") != 1:
+    if run_manifest.get("schema_version") not in RUN_MANIFEST_SCHEMA_VERSIONS:
         raise ValueError(
             f"Unsupported training run manifest: {run.training_run_manifest}"
         )
@@ -394,7 +403,7 @@ def _validate_training_run_manifest(
         )
 
     configured_init = run_manifest.get("training", {}).get("init_checkpoint")
-    training_input = run_manifest.get("training_input")
+    training_input = recorded_inputs(run_manifest).get(TRAINING_INIT)
     identity_init_sha256 = identity.get("init_checkpoint_sha256")
     if configured_init is None:
         if training_input is not None or identity_init_sha256 is not None:
@@ -585,7 +594,7 @@ def _validate_run_artifacts(
         raise ValueError(
             f"Training manifest dynamics row count mismatch for stage {run.stage}"
         )
-    evaluation_input = evaluation_run_manifest.get("evaluation_input")
+    evaluation_input = recorded_inputs(evaluation_run_manifest).get(EVALUATION)
     if isinstance(evaluation_input, dict):
         if evaluation_input.get("checkpoint_sha256") != checkpoint_sha256:
             raise ValueError(
