@@ -644,7 +644,6 @@ def generate_input_series_plots(
     config = EpiForecasterConfig.from_file(config_path)
 
     # Get all node IDs from dataset
-
     from data.epi_dataset import EpiDataset
 
     zarr_path = Path(config.data.dataset_path).resolve()

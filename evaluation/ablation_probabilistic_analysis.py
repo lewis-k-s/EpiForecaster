@@ -356,7 +356,6 @@ def _mobility_context(
     if not path.exists():
         raise ValueError(f"mobility context data does not exist: {path}")
 
-
     dataset = open_zarr_store(path)
     variable = str(context.get("variable", "mobility"))
     if variable not in dataset:

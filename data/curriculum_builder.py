@@ -73,9 +73,9 @@ def load_sparsity_mapping(dataset_path: Path) -> dict[str, float]:
         return {}
 
     try:
-        from data.epi_dataset import open_processed_dataset
+        from data.preprocess.zarr_layout import open_zarr_store
 
-        ds = open_processed_dataset(dataset_path, chunks=None)  # type: ignore[arg-type]
+        ds = open_zarr_store(dataset_path, chunks=None)  # type: ignore[arg-type]
         if "synthetic_sparsity_level" not in ds:
             logger.warning(
                 f"Variable 'synthetic_sparsity_level' not found in {dataset_path}. "

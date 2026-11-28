@@ -8,9 +8,8 @@ import xarray as xr
 import pandas as pd
 
 from data.preprocess.config import PreprocessingConfig, REGION_COORD
-from data.epi_dataset import open_processed_dataset
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
-from data.preprocess.zarr_layout import RunWriteResult
+from data.preprocess.zarr_layout import RunWriteResult, open_zarr_store
 
 
 @pytest.fixture
@@ -317,7 +316,7 @@ class TestPipelineStorage:
 
         saved_path = pipeline._save_aligned_dataset(ds)
         assert saved_path.name == "test_chunk_schema.zarr.zip"
-        saved_ds = open_processed_dataset(saved_path)
+        saved_ds = open_zarr_store(saved_path)
 
         # The in-memory Dask chunks do not set the stored layout.
         assert saved_ds.cases.encoding["shards"] == (1, 20, 10)
@@ -378,7 +377,7 @@ class TestPipelineStorage:
 
         saved_path = pipeline._save_aligned_dataset(dataset)
 
-        saved = open_processed_dataset(saved_path)
+        saved = open_zarr_store(saved_path)
         try:
             assert saved.attrs["continuous_storage_dtype"] == "float32"
             assert saved["cases"].dtype == np.float32

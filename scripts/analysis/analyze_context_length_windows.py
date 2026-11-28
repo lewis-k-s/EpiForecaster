@@ -165,7 +165,9 @@ def compute_counts(
     config: EpiForecasterConfig,
     context_lengths: list[int],
 ) -> list[SplitCounts]:
-    dataset = _select_run_id(open_zarr_store(config.data.dataset_path), config.data.run_id)
+    dataset = _select_run_id(
+        open_zarr_store(config.data.dataset_path), config.data.run_id
+    )
     valid_targets = _valid_targets(dataset, config)
 
     if config.training.split_strategy == "node":

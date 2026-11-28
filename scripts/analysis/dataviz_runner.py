@@ -68,7 +68,6 @@ def check_dataset_variables(dataset_path: str | None) -> dict[str, bool]:
         return available
 
     try:
-
         ds = open_zarr_store(dataset_path)
         data_vars = list(ds.data_vars)
 
@@ -118,7 +117,6 @@ def dataset_has_run_id_dimension(dataset_path: str | None) -> bool:
     if not dataset_path:
         return False
     try:
-
         ds = open_zarr_store(dataset_path)
         has_run_id = "run_id" in ds.dims or "run_id" in ds.coords
         ds.close()

@@ -5,9 +5,6 @@
 # and wastewater CSVs, population, holidays, edar_muni_edges.nc and
 # input_manifest.json) and mobility at data/files/mobility.zarr.zip.
 # parameter_fit_end_date stays unset, as in production.
-#
-# Cases-only preprocessing configuration for Catalan COVID-19 epidemiological data
-# Base model configuration: cases only (no wastewater, no mobility)
 
 # Data source paths - all available sources enabled
 data_dir: "data/files/catalonia_real_raw_inputs_v1"
@@ -89,7 +86,7 @@ smoothing:
   holt_phi: 0.90
   holt_missing_trend_decay: 0.85
 
-# Graph construction options - minimal for cases-only model
+# Graph construction options
 graph_options:
   edge_strategy: "knn"
   k_neighbors: 8

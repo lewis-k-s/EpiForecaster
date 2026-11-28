@@ -10,12 +10,12 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from data.epi_dataset import open_processed_dataset
 from data.preprocess.zarr_layout import (
     LAYOUT_VERSION,
     MOBILITY_DATE_CHUNK,
     bitround,
     build_encoding,
+    open_zarr_store,
     open_zarr_zip,
     write_dataset,
 )
@@ -142,11 +142,11 @@ def test_write_dataset_requires_packed_suffix(tmp_path):
         write_dataset(_dataset(), tmp_path / "tiny.zarr", workers=1)
 
 
-def test_open_processed_dataset_dispatches_packed_zarr(tmp_path):
+def test_open_zarr_store_dispatches_packed_zarr(tmp_path):
     destination = tmp_path / "tiny.zarr.zip"
     write_dataset(_dataset(), destination, workers=1)
 
-    saved = open_processed_dataset(destination)
+    saved = open_zarr_store(destination)
     assert saved.mobility.encoding["shards"] == (1, 130, 6, 6)
 
 
