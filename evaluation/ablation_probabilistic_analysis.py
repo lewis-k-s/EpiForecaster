@@ -11,9 +11,10 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from data.crossval_manifest import load_manifest_region_sets
+from data.preprocess.zarr_layout import open_zarr_store
 from evaluation.granular_export import GRANULAR_KEY_COLUMNS
 from scripts.hpo.ablation_worker import AblationCampaign
-from data.preprocess.zarr_layout import open_zarr_store
 
 REQUIRED_HEADS = ("wastewater", "hospitalizations", "cases", "deaths")
 PROBABILISTIC_METRICS = ("wis", "crps", "nll", "abs_error")
@@ -250,7 +251,10 @@ def _run_aggregate_scores(run: Any) -> pd.DataFrame:
         raise ValueError(
             f"{run.run_dir}: aggregate table missing columns: {', '.join(missing)}"
         )
-    if set(table["target"]) != set(REQUIRED_HEADS) or table["target"].duplicated().any():
+    if (
+        set(table["target"]) != set(REQUIRED_HEADS)
+        or table["target"].duplicated().any()
+    ):
         raise ValueError(f"{run.run_dir}: aggregate table must hold each required head")
     values = table[required[1:]].apply(pd.to_numeric, errors="coerce")
     if not np.isfinite(values.to_numpy(dtype=float)).all():
@@ -388,6 +392,128 @@ def _mobility_context(
     )
 
 
+def _region_set_endpoints(
+    run: Any, region_sets: Mapping[str, frozenset[str]]
+) -> pd.DataFrame:
+    """Read each region set's run-level WIS endpoint from the aggregate table.
+
+    A set without valid support for some head in this fold (for example no
+    member region in the held-out fold) has a NaN endpoint.
+    """
+    table = pd.read_csv(run.run_dir / AGGREGATE_FILENAME)
+    records = []
+    for name in sorted(region_sets):
+        column = f"region_set_{name}_{PRIMARY_METRIC}"
+        if column not in table.columns:
+            raise ValueError(f"{run.run_dir}: aggregate table lacks {column}")
+        values = pd.to_numeric(table[column], errors="coerce").to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size and not np.allclose(finite, finite[0]):
+            raise ValueError(f"{run.run_dir}: {column} differs between heads")
+        records.append(
+            {
+                "region_set": name,
+                PRIMARY_METRIC: float(values[0]) if finite.size else float("nan"),
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
+def _region_set_tables(
+    *,
+    region_sets: Mapping[str, frozenset[str]],
+    ablation_runs: Mapping[str, list[Any]],
+    baseline_name: str,
+    paired_regions: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Paired run-level and equal-region effects within each manifest region set."""
+    frames = []
+    for condition, runs in sorted(ablation_runs.items()):
+        for run in runs:
+            scores = _region_set_endpoints(run, region_sets)
+            scores["condition"] = condition
+            scores["seed"] = run.seed
+            scores["fold"] = -1 if run.fold is None else run.fold
+            frames.append(scores)
+    endpoints = pd.concat(frames, ignore_index=True)
+    keys = ["region_set", "seed", "fold"]
+    baseline = endpoints[endpoints["condition"] == baseline_name][
+        [*keys, PRIMARY_METRIC]
+    ]
+    fold_seed = []
+    for condition in sorted(set(endpoints["condition"]) - {baseline_name}):
+        candidate = endpoints[endpoints["condition"] == condition][
+            [*keys, PRIMARY_METRIC]
+        ]
+        paired = _paired_metrics(
+            baseline,
+            candidate,
+            keys=keys,
+            condition=condition,
+            metrics=(PRIMARY_METRIC,),
+        )
+        fold_seed.append(
+            paired.rename(
+                columns={
+                    f"{PRIMARY_METRIC}_baseline": f"baseline_{PRIMARY_METRIC}",
+                    f"{PRIMARY_METRIC}_candidate": f"candidate_{PRIMARY_METRIC}",
+                }
+            )[
+                [
+                    "condition",
+                    "region_set",
+                    "fold",
+                    "seed",
+                    f"baseline_{PRIMARY_METRIC}",
+                    f"candidate_{PRIMARY_METRIC}",
+                    f"{PRIMARY_METRIC}_delta",
+                ]
+            ]
+        )
+    paired_fold_seed = pd.concat(fold_seed, ignore_index=True)
+    delta = f"{PRIMARY_METRIC}_delta"
+    records = []
+    for (condition, name), group in paired_fold_seed.groupby(
+        ["condition", "region_set"], sort=True
+    ):
+        values = group[delta].to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        regional = paired_regions[
+            (paired_regions["condition"] == condition)
+            & paired_regions["region_id"].isin(region_sets[name])
+        ][delta].to_numpy(dtype=float)
+        records.append(
+            {
+                "condition": condition,
+                "region_set": name,
+                "region_count": len(region_sets[name]),
+                "fold_seed_pairs": int(finite.size),
+                "fold_seed_pairs_without_support": int(values.size - finite.size),
+                f"{delta}_mean": float(finite.mean()) if finite.size else np.nan,
+                f"{delta}_std": float(finite.std(ddof=1))
+                if finite.size > 1
+                else np.nan,
+                "region_seed_pairs": int(regional.size),
+                f"equal_region_{delta}_mean": float(regional.mean())
+                if regional.size
+                else np.nan,
+                f"equal_region_{delta}_median": float(np.median(regional))
+                if regional.size
+                else np.nan,
+                "improved_region_fraction": float((regional < -1e-12).mean())
+                if regional.size
+                else np.nan,
+                "worsened_region_fraction": float((regional > 1e-12).mean())
+                if regional.size
+                else np.nan,
+            }
+        )
+    return {
+        "paired_fold_seed_region_set_deltas": paired_fold_seed,
+        "region_set_summary": pd.DataFrame.from_records(records),
+    }
+
+
 def build_probabilistic_campaign_outputs(
     campaign: AblationCampaign,
     ablation_runs: Mapping[str, list[Any]],
@@ -456,9 +582,9 @@ def build_probabilistic_campaign_outputs(
             scores["run_id"] = run.run_dir.name
             aggregate_frames.append(scores)
     run_scores = pd.concat(aggregate_frames, ignore_index=True)
-    run_endpoint = run_scores.drop_duplicates(
-        ["condition", "seed", "fold", "run_id"]
-    )[["condition", "seed", "fold", "run_id", PRIMARY_METRIC]]
+    run_endpoint = run_scores.drop_duplicates(["condition", "seed", "fold", "run_id"])[
+        ["condition", "seed", "fold", "run_id", PRIMARY_METRIC]
+    ]
     coverage = pd.DataFrame.from_records(coverage_records).sort_values(
         ["condition", "seed", "fold"]
     )
@@ -698,4 +824,18 @@ def build_probabilistic_campaign_outputs(
     }
     if block_deltas is not None:
         outputs["paired_temporal_block_horizon_deltas"] = block_deltas
+    region_sets = (
+        load_manifest_region_sets(campaign.split_manifest)
+        if campaign.split_manifest is not None
+        else {}
+    )
+    if region_sets:
+        outputs.update(
+            _region_set_tables(
+                region_sets=region_sets,
+                ablation_runs=ablation_runs,
+                baseline_name=baseline_name,
+                paired_regions=paired_regions,
+            )
+        )
     return outputs

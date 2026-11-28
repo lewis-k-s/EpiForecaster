@@ -47,7 +47,7 @@ def test_cases_smoothing_non_negative_finite(mock_config):
         "cases": [10.0, 0.0, 15.0, 0.0, 20.0, 5.0, 10.0, 0.0, 5.0, 10.0]
     })
     
-    smoothed = proc._apply_kalman_smoothing(daily_df)
+    smoothed = proc._fill_gaps(daily_df)
     
     assert np.all(np.isfinite(smoothed["cases"]))
     assert np.all(smoothed["cases"] >= 0)
@@ -66,7 +66,7 @@ def test_cases_mask_age_semantics(mock_config):
         "date": dates,
         "municipality_code": "08019",
         "cases": [np.nan, np.nan, 10.0, 11.0, np.nan, 12.0, 13.0, np.nan, np.nan, np.nan],
-        "missing_flag": [2, 2, 0, 0, 2, 0, 0, 2, 2, 2]
+        "cases_observed": [0, 0, 1, 1, 0, 1, 1, 0, 0, 0]
     })
     
     result = proc._create_mask_and_age_channels(daily_df)
@@ -109,7 +109,7 @@ def test_cases_holt_damped_preserves_mask_age_semantics(mock_config):
         }
     )
 
-    smoothed = proc._apply_kalman_smoothing(daily_df)
+    smoothed = proc._fill_gaps(daily_df)
     result = proc._create_mask_and_age_channels(smoothed)
 
     expected_mask = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0]
@@ -123,8 +123,8 @@ def test_cases_holt_damped_preserves_mask_age_semantics(mock_config):
     assert result.iloc[3]["cases_age"] == 1.0
 
 
-@pytest.mark.parametrize("method", ["kalman_v2", "holt_damped"])
-def test_cases_leading_missing_days_are_nan_and_unmasked(mock_config, method):
+@pytest.mark.parametrize("method", ["locf", "kalman_v2", "holt_damped"])
+def test_cases_zero_counts_are_observed(mock_config, method):
     mock_config.smoothing.clinical_method = method
     proc = CataloniaCasesProcessor(mock_config)
     dates = pd.date_range("2022-01-01", periods=6)
@@ -135,13 +135,56 @@ def test_cases_leading_missing_days_are_nan_and_unmasked(mock_config, method):
             "cases": [0.0, 0.0, 10.0, np.nan, 12.0, 11.0],
         }
     )
-    smoothed = proc._apply_kalman_smoothing(daily_df)
-    assert smoothed["cases"].iloc[:2].isna().all()
-    assert smoothed["missing_flag"].iloc[:2].tolist() == [2, 2]
-    assert np.isfinite(smoothed["cases"].iloc[2:]).all()
-    result = proc._create_mask_and_age_channels(smoothed)
-    assert result["cases_mask"].tolist() == [0.0, 0.0, 1.0, 0.0, 1.0, 1.0]
-    assert result["cases_age"].iloc[:2].tolist() == [14.0, 14.0]
+    filled = proc._fill_gaps(daily_df)
+    assert filled["cases"].iloc[:3].tolist() == [0.0, 0.0, 10.0]
+    assert filled["cases"].iloc[4:].tolist() == [12.0, 11.0]
+    assert np.isfinite(filled["cases"].iloc[3])
+    result = proc._create_mask_and_age_channels(filled)
+    assert result["cases_mask"].tolist() == [1.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+    assert result["cases_age"].tolist() == [1.0, 1.0, 1.0, 2.0, 1.0, 1.0]
+
+
+def test_cases_locf_carries_the_last_observation_including_zero(mock_config):
+    mock_config.smoothing.clinical_method = "locf"
+    proc = CataloniaCasesProcessor(mock_config)
+    daily_df = pd.DataFrame(
+        {
+            "date": pd.date_range("2022-01-01", periods=7),
+            "municipality_code": "08019",
+            "cases": [np.nan, 5.0, 0.0, np.nan, np.nan, 3.0, np.nan],
+        }
+    )
+    filled = proc._fill_gaps(daily_df)
+    assert np.isnan(filled["cases"].iloc[0])
+    assert filled["cases"].iloc[1:].tolist() == [5.0, 0.0, 0.0, 0.0, 3.0, 3.0]
+    assert filled["cases_observed"].tolist() == [0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+
+
+def test_cases_dataset_marks_days_without_rows_inside_the_span_as_observed_zero(
+    mock_config,
+):
+    proc = CataloniaCasesProcessor(mock_config)
+    dates = pd.date_range("2022-01-01", periods=5)
+    aggregated = pd.DataFrame(
+        {
+            "date": [dates[1], dates[3], dates[2]],
+            "municipality_code": ["A", "A", "B"],
+            "cases": [4.0, 6.0, 2.0],
+        }
+    )
+    ds = proc._build_cases_dataset(aggregated, dates)
+    cases = ds["cases"].sel(run_id="real", region_id="A").values
+    mask = ds["cases_mask"].sel(run_id="real", region_id="A").values
+    # The registry spans days 1-3: day 2 is an observed zero, days 0 and 4 lie
+    # outside the span.
+    assert np.isnan(cases[0])
+    assert cases[1:4].tolist() == [4.0, 0.0, 6.0]
+    assert mask.tolist() == [0.0, 1.0, 1.0, 1.0, 0.0]
+    assert ds["cases"].sel(run_id="real", region_id="B").values[1:4].tolist() == [
+        0.0,
+        2.0,
+        0.0,
+    ]
 
 
 def test_cases_dataset_keeps_leading_nan(mock_config):

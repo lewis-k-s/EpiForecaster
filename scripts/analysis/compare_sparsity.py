@@ -75,7 +75,7 @@ def analyze_dataset(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--synth", type=str, default="data/processed/synthetic_full.zarr")
-    parser.add_argument("--real", type=str, default="data/processed/real_with_id.zarr.zip")
+    parser.add_argument("--real", type=str, default="data/processed/real_with_id_v2.zarr.zip")
     args = parser.parse_args()
     
     print(f"Analyzing Synthetic: {args.synth}")

@@ -125,7 +125,7 @@ class TestProcessorsKalmanFallback:
         )
 
         # Should not raise - uses fallback variance values
-        result = proc._apply_kalman_smoothing(daily_df)
+        result = proc._fill_gaps(daily_df)
 
         # Verify result is returned and has expected columns
         assert not result.empty
@@ -143,7 +143,7 @@ class TestProcessorsKalmanFallback:
         )
 
         # Should not raise - uses fallback variance values
-        result = proc._apply_kalman_smoothing(daily_df)
+        result = proc._fill_gaps(daily_df)
 
         # Verify result is returned and has expected columns
         assert not result.empty
@@ -190,7 +190,7 @@ class TestSmoothedDataValidity:
             {"date": dates, "municipality_code": "001", "cases": cases}
         )
 
-        smoothed = proc._apply_kalman_smoothing(daily_df)
+        smoothed = proc._fill_gaps(daily_df)
 
         assert np.all(np.isfinite(smoothed["cases"])), "Smoothed cases must be finite"
         assert np.all(smoothed["cases"] >= 0), "Smoothed cases must be non-negative"
@@ -215,7 +215,7 @@ class TestSmoothedDataValidity:
             {"date": dates, "municipality_code": "001", "hospitalizations": hosp}
         )
 
-        smoothed = proc._apply_kalman_smoothing(daily_df)
+        smoothed = proc._fill_gaps(daily_df)
 
         assert np.all(np.isfinite(smoothed["hospitalizations"])), (
             "Smoothed hosp must be finite"
@@ -403,7 +403,7 @@ def test_processor_parameter_fit_uses_only_declared_training_dates(
         }
         frame = pd.DataFrame({"date": dates, "municipality_code": "001", head: values})
         processor = classes[head](minimal_config)
-        apply = processor._apply_kalman_smoothing
+        apply = processor._fill_gaps
         column = head
     changed = frame.copy()
     changed.loc[20:, column] *= 1000

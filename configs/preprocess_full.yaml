@@ -22,11 +22,11 @@ vaccination_file: "data/files/vaccination_municipality.csv"
 wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
 region_metadata_file: "data/files/edar_muni_edges.nc"
 population_file: "data/files/fl_population_por_municipis.csv"
-mobility_path: "data/files/mobility.zarr.zip"
+mobility_path: "data/files/dasymetric_mob_full-20261104b/mobility/mobility_catalonia.zarr"
 
 # Temporal processing parameters - maximum coverage
 start_date: "2020-03-01" # Earliest case data available
-end_date: "2021-05-09" # Latest mobility data available
+end_date: "2021-05-09" # Canonical window end; mobility extends to 2023-06-30
 
 # Feature processing options
 min_flow_threshold: 10
@@ -41,7 +41,7 @@ generate_alignment_report: true
 
 # Output configuration
 output_path: "data/processed"
-dataset_name: "real_with_id"
+dataset_name: "real_with_id_v2"
 compression: "blosc"
 
 # Processing configuration
@@ -58,22 +58,28 @@ memory_limit_gb: 8.0
 hospitalizations_reporting_lag_days: 7
 continuous_storage_dtype: "float32"
 
+# Target regions are selected by population alone, never by case history, so
+# membership cannot depend on outcomes. 3000 keeps 280 of 768 municipalities
+# (93.6% of the population), including every former density-selected target.
+valid_target_min_population: 3000
+
 temporal_covariates:
   include_day_of_week: true
   include_holidays: true
   include_lockdown_severity: true
   holiday_calendar_file: data/files/catalonia_holidays.csv
 
-# Offline causal smoothing configuration
+# Offline causal gap filling. Observed days keep the raw observation.
 smoothing:
-  clinical_method: "kalman_v2" # "kalman_v2" or "holt_damped"
-  wastewater_method: "tobit_kalman_v2"
+  clinical_method: "locf" # "locf", "kalman_v2" or "holt_damped"
+  wastewater_method: "locf" # "locf" or "tobit_kalman_v2"
   missing_policy: "predict" # "predict" (default) or "momentum"
   momentum_decay: 0.5
   momentum_max_steps: 4
   innovation_clip_sigma: 2.5
   reentry_gain_cap: 0.35
   reentry_steps: 2
+  reentry_min_gap: 14 # above the weekly/biweekly wastewater sampling interval
   process_var_floor: 1.0e-6
   measurement_var_floor: 1.0e-6
   holt_alpha: 0.30

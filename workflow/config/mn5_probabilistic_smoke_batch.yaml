@@ -1,6 +1,6 @@
-# Batch-QoS fallback for the short Normal-NLL probabilistic smoke when the
-# account-level acc_debug submit slot is unavailable. The default smoke remains
-# workflow/config/mn5_probabilistic_smoke.yaml on acc_debug.
+# Batch-QoS fallback for the short censored-Normal NLL probabilistic smoke when
+# the account-level acc_debug submit slot is unavailable. The default smoke
+# remains workflow/config/mn5_probabilistic_smoke.yaml on acc_debug.
 extends: mn5_probabilistic_smoke.yaml
 
 resources:

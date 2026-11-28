@@ -36,6 +36,7 @@ def _build_config(
     crossval_num_folds: int = 5,
     crossval_fold_index: int = 0,
     crossval_manifest_path: Path | None = None,
+    crossval_region_set: str | None = None,
 ) -> EpiForecasterConfig:
     return EpiForecasterConfig(
         model=ModelConfig(
@@ -73,6 +74,7 @@ def _build_config(
                 if crossval_manifest_path is not None
                 else None
             ),
+            crossval_region_set=crossval_region_set,
             loss=LossConfig(name="joint_inference"),
             curriculum=CurriculumConfig(enabled=False),
             enable_mixed_precision=False,
@@ -331,6 +333,53 @@ def test_crossval_manifest_owns_exact_fold_membership(tmp_path: Path) -> None:
         if fold_index not in {2, 3}
         for region_id in fold
     )
+
+
+@pytest.mark.epiforecaster
+def test_crossval_region_set_limits_training_but_keeps_full_test_fold(
+    tmp_path: Path,
+) -> None:
+    dataset_path, _strata_by_node, _valid_targets = _write_node_split_dataset(tmp_path)
+    region_ids = [f"{index:03d}" for index in range(100)]
+    folds = [region_ids[offset::5] for offset in range(5)]
+    base = region_ids[:60]
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "num_folds": 5,
+                "run_id": "real",
+                "split_seed": 42,
+                "region_id_hash": hash_region_ids(region_ids),
+                "region_sets": {"base": base},
+                "folds": [
+                    {"fold_index": index, "region_ids": fold}
+                    for index, fold in enumerate(folds)
+                ],
+            }
+        )
+    )
+    common = {
+        "node_split_strategy": "crossval",
+        "crossval_enabled": True,
+        "crossval_num_folds": 5,
+        "crossval_fold_index": 2,
+        "crossval_manifest_path": manifest_path,
+    }
+    full = split_nodes_by_ratio(_build_config(dataset_path, seed=1, **common))
+    limited = split_nodes_by_ratio(
+        _build_config(dataset_path, seed=1, crossval_region_set="base", **common)
+    )
+
+    base_nodes = {int(region_id) for region_id in base}
+    assert limited[2] == full[2]
+    assert set(limited[0]) == set(full[0]) & base_nodes
+    assert set(limited[1]) == set(full[1]) & base_nodes
+    with pytest.raises(ValueError, match="not a region set"):
+        split_nodes_by_ratio(
+            _build_config(dataset_path, seed=1, crossval_region_set="other", **common)
+        )
 
 
 @pytest.mark.epiforecaster

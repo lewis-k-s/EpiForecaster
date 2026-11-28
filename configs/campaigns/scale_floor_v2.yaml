@@ -1,0 +1,84 @@
+schema_version: 1
+campaign_id: epiforecaster_scale_floor_v2
+stage: ablation
+hypothesis: >-
+  A cases scale floor proportional to the log1p(per-100k) value of one count,
+  log1p(100000 / population), removes the confident-zero NLL tail in small
+  municipalities without constraining large ones. scale_floor_v1 showed that a
+  constant floor helps cases as it grows and hurts deaths above 0.05; cases are
+  the only head whose targets are integer counts of the municipality. Every
+  condition keeps the constant 0.05 floor on all heads and trains on the 280
+  population-floor targets of real_with_id_v2.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: uniform-0p05
+fixed_overrides:
+  data:
+    dataset_path: data/processed/real_with_id_v2.zarr.zip
+  model:
+    observation_heads:
+      distribution_scale_floor: 0.05
+      count_step_scale_floor_cases: 0.0
+      censored_location: false
+  # The campaign ran before the censored WIS objective; pin its Normal NLL.
+  training:
+    loss:
+      joint:
+        observation_loss: nll
+smoke_overrides:
+  training:
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
+conditions:
+  - name: uniform-0p05
+    hypothesis: The constant 0.05 floor on every head is the paired reference.
+    overrides: {}
+    allowed_difference_paths: []
+  - name: cases-step-0p05
+    hypothesis: A cases floor of 0.05 count steps (0.18 at 3000 residents) bounds a single-count miss at 20 standard deviations.
+    overrides: {model: {observation_heads: {count_step_scale_floor_cases: 0.05}}}
+    allowed_difference_paths: [model.observation_heads.count_step_scale_floor_cases]
+  - name: cases-step-0p10
+    hypothesis: A cases floor of 0.1 count steps (0.35 at 3000 residents) bounds a single-count miss at 10 standard deviations.
+    overrides: {model: {observation_heads: {count_step_scale_floor_cases: 0.1}}}
+    allowed_difference_paths: [model.observation_heads.count_step_scale_floor_cases]
+  - name: cases-step-0p20
+    hypothesis: A cases floor of 0.2 count steps (0.71 at 3000 residents) bounds a single-count miss at 5 standard deviations.
+    overrides: {model: {observation_heads: {count_step_scale_floor_cases: 0.2}}}
+    allowed_difference_paths: [model.observation_heads.count_step_scale_floor_cases]
+paired_model_seeds: [42, 43]
+cross_validation:
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
+  fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  smoke_fold_indices: [1, 4]
+metrics:
+  primary: {name: mean_target_wis, direction: minimize}
+  secondary: [mae_median, rmse_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+  require_full_manifest_folds: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true
+analysis:
+  kind: probabilistic_full_coverage
+  granular_filename: test_granular.parquet
+  required_heads: [wastewater, hospitalizations, cases, deaths]
+  evaluation_design: spatial
+  temporal_evaluation:
+    scored_role: all_dates
+    calibration_control: C0
+    confirmation: included
+  mobility_context:
+    kind: incoming_flow_raw_tertiles
+    path: data/files/mobility.zarr.zip
+    variable: mobility
+    date_start: "2020-03-01"
+    date_end: "2021-05-09"

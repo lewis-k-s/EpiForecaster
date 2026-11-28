@@ -110,6 +110,50 @@ class TestKalmanSmoother:
         capped_jump = abs(capped[5] - capped[4])
         assert capped_jump < loose_jump
 
+    @pytest.mark.parametrize("kind", ["kalman", "tobit"])
+    def test_reentry_cap_is_not_armed_by_the_regular_sampling_interval(self, kind):
+        # Weekly samples: six missing days between observations.
+        values = np.full(29, np.nan)
+        values[::7] = [2.0, 8.0, 3.0, 9.0, 4.0]
+
+        def run(**reentry: float) -> list[float]:
+            common = dict(
+                process_var=0.05,
+                measurement_var=0.5,
+                innovation_clip_sigma=100.0,
+                **reentry,
+            )
+            if kind == "kalman":
+                return KalmanSmoother(**common).filter_series(values)[0]
+            return TobitKalmanSmoother(**common).filter_series(
+                values, np.zeros_like(values)
+            )[0]
+
+        uncapped = run(reentry_gain_cap=1.0)
+        cadence_aware = run(reentry_gain_cap=0.1, reentry_min_gap=14)
+        every_sample_capped = run(reentry_gain_cap=0.1, reentry_min_gap=1)
+
+        np.testing.assert_allclose(cadence_aware, uncapped)
+        assert abs(every_sample_capped[7] - every_sample_capped[6]) < abs(
+            uncapped[7] - uncapped[6]
+        )
+
+    def test_reentry_cap_still_applies_after_a_gap_longer_than_the_interval(self):
+        values = np.full(36, np.nan)
+        values[[0, 7, 14, 35]] = [2.0, 2.1, 2.0, 9.0]
+        common = dict(
+            process_var=0.05,
+            measurement_var=0.5,
+            innovation_clip_sigma=100.0,
+            reentry_min_gap=14,
+        )
+        uncapped, _ = KalmanSmoother(reentry_gain_cap=1.0, **common).filter_series(
+            values
+        )
+        capped, _ = KalmanSmoother(reentry_gain_cap=0.1, **common).filter_series(values)
+        np.testing.assert_allclose(capped[:35], uncapped[:35])
+        assert abs(capped[35] - capped[34]) < abs(uncapped[35] - uncapped[34])
+
     def test_filter_series_all_nan(self):
         values = np.full(10, np.nan)
         kf = KalmanSmoother(process_var=0.05, measurement_var=0.5)

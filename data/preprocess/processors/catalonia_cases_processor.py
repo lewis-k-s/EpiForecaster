@@ -11,12 +11,11 @@ https://datos.gob.es/ca/catalogo/a09002970-registro-de-test-de-covid-19-realizad
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import xarray as xr
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from ..smoothing import DampedHoltSmoother, KalmanSmoother, fit_kalman_params
+from ..smoothing import fill_clinical_gaps
 
 
 class CataloniaCasesProcessor:
@@ -33,8 +32,8 @@ class CataloniaCasesProcessor:
     - NumCasos: Number of cases
 
     Features:
-    - Kalman smoothing for noise reduction
-    - Mask channel (1.0 for observed, 0.0 for missing/interpolated)
+    - Registry zeros kept as observations; unobserved days filled causally
+    - Mask channel (1.0 for observed, 0.0 for unobserved)
     - Age channel (days since last observation, normalized)
     - Optional PCR/TAR breakdown by test type
     """
@@ -131,122 +130,30 @@ class CataloniaCasesProcessor:
 
         return aggregated
 
-    def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
-        """Apply configured causal filtering for case data.
-
-        Observed positive counts are preserved in the output value channel, while
-        the filter is used to fill timesteps treated as missing by the current
-        preprocessing semantics.
-        """
+    def _fill_gaps(self, daily_df: pd.DataFrame) -> pd.DataFrame:
+        """Fill unobserved days causally; every finite count is an observation."""
         method = self.config.smoothing.clinical_method
-        print(f"  Applying causal smoothing to cases (method={method})...")
-
-        fallback_process = float(
-            self.config.validation_options.get("process_var", 0.05)
+        print(f"  Filling unobserved case days (method={method})...")
+        return fill_clinical_gaps(
+            daily_df,
+            "cases",
+            self.config.smoothing,
+            fallback_process_var=float(
+                self.config.validation_options.get("process_var", 0.05)
+            ),
+            fallback_measurement_var=float(
+                self.config.validation_options.get("measurement_var", 0.5)
+            ),
         )
-        fallback_measure = float(
-            self.config.validation_options.get("measurement_var", 0.5)
-        )
-
-        smoothed_records = []
-
-        for muni_code in daily_df["municipality_code"].unique():
-            muni_data = daily_df[daily_df["municipality_code"] == muni_code].copy()
-            muni_data = muni_data.set_index("date").sort_index()
-
-            # Get values as numpy array
-            values = muni_data["cases"].values
-
-            if method == "kalman_v2":
-                # Fit Kalman parameters from data (mask zero/negative for fitting)
-                fit_series = pd.Series(values, index=muni_data.index)
-                fit_series = fit_series.where(fit_series > 0)
-
-                process_var = fallback_process
-                measurement_var = fallback_measure
-                if self.config.smoothing.parameter_fit_mode == "per_series":
-                    try:
-                        process_var, measurement_var = fit_kalman_params(
-                            fit_series,
-                            fit_end_date=self.config.smoothing.parameter_fit_end_date,
-                        )
-                    except Exception as e:
-                        print(
-                            f"    ! Falling back to configured variances for {muni_code}: {e}"
-                        )
-
-                smoother = KalmanSmoother(
-                    process_var=process_var,
-                    measurement_var=measurement_var,
-                    missing_policy=self.config.smoothing.missing_policy,
-                    momentum_decay=self.config.smoothing.momentum_decay,
-                    momentum_max_steps=self.config.smoothing.momentum_max_steps,
-                    innovation_clip_sigma=self.config.smoothing.innovation_clip_sigma,
-                    reentry_gain_cap=self.config.smoothing.reentry_gain_cap,
-                    reentry_steps=self.config.smoothing.reentry_steps,
-                    process_var_floor=self.config.smoothing.process_var_floor,
-                    measurement_var_floor=self.config.smoothing.measurement_var_floor,
-                )
-            elif method == "holt_damped":
-                smoother = DampedHoltSmoother(
-                    alpha=self.config.smoothing.holt_alpha,
-                    beta=self.config.smoothing.holt_beta,
-                    phi=self.config.smoothing.holt_phi,
-                    missing_trend_decay=self.config.smoothing.holt_missing_trend_decay,
-                )
-            else:
-                raise ValueError(f"Unsupported clinical smoothing method: {method}")
-
-            # Apply causal smoother
-            filtered_values, flags = smoother.filter_series(values)
-
-            observed_mask = np.asarray(flags) < 1.5
-
-            # Preserve recorded values at observed timesteps; use filtered values for gaps.
-            for i, date in enumerate(muni_data.index):
-                filtered_value = float(np.exp(filtered_values[i]))
-                case_value = float(values[i]) if observed_mask[i] else filtered_value
-                smoothed_records.append(
-                    {
-                        "date": date,
-                        "municipality_code": muni_code,
-                        "cases": case_value,
-                        "cases_log": filtered_values[i],
-                        "missing_flag": flags[i],  # 0=normal, 2=missing
-                    }
-                )
-
-        smoothed_df = pd.DataFrame(smoothed_records)
-
-        # Check for non-finite values
-        non_finite = (~np.isfinite(smoothed_df["cases"])).sum()
-        if non_finite > 0:
-            print(f"  Warning: {non_finite} non-finite values after smoothing")
-            smoothed_df["cases"] = smoothed_df["cases"].replace(
-                [np.inf, -np.inf], np.nan
-            )
-
-        print(
-            f"  Smoothing complete for {smoothed_df['municipality_code'].nunique()} municipalities"
-        )
-
-        return smoothed_df
 
     def _create_mask_and_age_channels(self, daily_df: pd.DataFrame) -> pd.DataFrame:
         """Create mask and age channels for cases.
 
-        Mask: 1.0 if case count is observed (not missing), 0.0 if missing.
+        Mask: 1.0 if the case count is observed, zero counts included.
         Age: Days since last observation, normalized to [0, 1] (max 14 days).
         """
         daily_df = daily_df.copy()
-
-        # Mask: 1.0 for actual observations (not marked as missing by Kalman)
-        if "missing_flag" in daily_df.columns:
-            is_not_missing = daily_df["missing_flag"] < 1.5
-        else:
-            is_not_missing = daily_df["cases"].notna()
-
-        daily_df["cases_mask"] = is_not_missing.astype(float)
+        daily_df["cases_mask"] = (daily_df["cases_observed"] > 0.5).astype(float)
 
         # Age: Days since last actual observation
         age_series_list = []
@@ -278,7 +185,10 @@ class CataloniaCasesProcessor:
         aggregated: pd.DataFrame,
         date_range: pd.DatetimeIndex,
     ) -> xr.Dataset:
-        """Build cases dataset with filtered gap filling and mask/age channels.
+        """Build cases dataset with gap filling and mask/age channels.
+
+        The registry lists positive counts only. Inside its date span a day
+        without a row is an observed zero; days outside the span are unobserved.
 
         Args:
             aggregated: DataFrame with columns [date, municipality_code, cases]
@@ -296,8 +206,8 @@ class CataloniaCasesProcessor:
             fill_value=0,
         )
 
-        # Reindex to complete date range
-        pivot = pivot.reindex(date_range, fill_value=0)
+        source_span = pd.date_range(pivot.index.min(), pivot.index.max(), freq="D")
+        pivot = pivot.reindex(source_span, fill_value=0).reindex(date_range)
 
         # Rename for compatibility
         pivot.columns.name = REGION_COORD
@@ -310,7 +220,7 @@ class CataloniaCasesProcessor:
             value_name="cases",
         )
 
-        daily_df = self._apply_kalman_smoothing(daily_df)
+        daily_df = self._fill_gaps(daily_df)
 
         # Create mask and age channels
         daily_df = self._create_mask_and_age_channels(daily_df)

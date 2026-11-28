@@ -26,7 +26,7 @@ conditions:
     allowed_difference_paths: [model.observation_heads.residual_scale]
 paired_model_seeds: [42, 43]
 cross_validation:
-  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
   fold_indices: [0, 1]
 metrics:
   primary: {name: mae_median, direction: minimize}

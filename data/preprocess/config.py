@@ -51,7 +51,11 @@ class SmoothingConfig:
     parameter_fit_end_date: str | None = None
     # Fixed variances avoid learning preprocessing parameters from held-out regions.
     parameter_fit_mode: str = "per_series"
+    # "locf" carries the last observation forward and represents observed zeros;
+    # "kalman_v2" and "holt_damped" are log-space filters that skip zeros.
     clinical_method: str = "kalman_v2"
+    # "locf" carries each sample forward; "tobit_kalman_v2" fills the days
+    # between samples with a censoring-aware filter level.
     wastewater_method: str = "tobit_kalman_v2"
     missing_policy: str = "predict"
     momentum_decay: float = 0.5
@@ -59,6 +63,9 @@ class SmoothingConfig:
     innovation_clip_sigma: float = 2.5
     reentry_gain_cap: float = 0.35
     reentry_steps: int = 2
+    # Consecutive missing days that arm the re-entry gain cap. Set it above the
+    # sampling interval of non-daily series, or every observation is capped.
+    reentry_min_gap: int = 1
     process_var_floor: float = 1e-6
     measurement_var_floor: float = 1e-6
     holt_alpha: float = 0.30
@@ -71,8 +78,8 @@ class SmoothingConfig:
             datetime.strptime(self.parameter_fit_end_date, "%Y-%m-%d")
         if self.parameter_fit_mode not in {"per_series", "fixed"}:
             raise ValueError("parameter_fit_mode must be 'per_series' or 'fixed'")
-        valid_clinical = {"kalman_v2", "holt_damped"}
-        valid_wastewater = {"tobit_kalman_v2"}
+        valid_clinical = {"kalman_v2", "holt_damped", "locf"}
+        valid_wastewater = {"tobit_kalman_v2", "locf"}
         valid_missing = {"predict", "momentum"}
 
         if self.clinical_method not in valid_clinical:
@@ -100,6 +107,8 @@ class SmoothingConfig:
             raise ValueError("reentry_gain_cap must be in (0, 1]")
         if self.reentry_steps < 0:
             raise ValueError("reentry_steps must be >= 0")
+        if self.reentry_min_gap < 1:
+            raise ValueError("reentry_min_gap must be >= 1")
         if self.process_var_floor <= 0.0:
             raise ValueError("process_var_floor must be positive")
         if self.measurement_var_floor <= 0.0:
@@ -230,11 +239,18 @@ class PreprocessingConfig:
 
     # Region filtering
     min_density_threshold: float = (
-        0.5  # Minimum data density (non-NaN fraction) for a region to be valid
+        0.5  # Minimum data density (fraction of dates) for a region to be valid
     )
+    # Days that count toward the density: "observed" (cases_mask) or "positive"
+    # (observed with a positive count). Use "positive" when zeros are observed.
+    valid_target_density_basis: str = "observed"
     valid_target_rolling_days: int | None = None
     valid_target_min_observed_days: int | None = None
     valid_target_qualifying_end_date: str | None = None
+    # Static target selection: regions whose population is at least this value.
+    # It reads no case data, so target membership cannot depend on outcomes. When
+    # set it replaces the density rule (min_density_threshold and its basis).
+    valid_target_min_population: float | None = None
 
     # Output configuration
     compression: str = "blosc"
@@ -298,6 +314,10 @@ class PreprocessingConfig:
             )
         if self.hospitalizations_reporting_lag_days < 0:
             raise ValueError("hospitalizations_reporting_lag_days must be non-negative")
+        if self.valid_target_density_basis not in {"observed", "positive"}:
+            raise ValueError(
+                "valid_target_density_basis must be 'observed' or 'positive'"
+            )
         rolling = self.valid_target_rolling_days
         minimum = self.valid_target_min_observed_days
         if (rolling is None) != (minimum is None):
@@ -308,6 +328,13 @@ class PreprocessingConfig:
             if rolling is None:
                 raise ValueError("Rolling target selection is required for an end date")
             datetime.strptime(self.valid_target_qualifying_end_date, "%Y-%m-%d")
+        if self.valid_target_min_population is not None:
+            if self.valid_target_min_population <= 0:
+                raise ValueError("valid_target_min_population must be positive")
+            if rolling is not None:
+                raise ValueError(
+                    "valid_target_min_population replaces rolling target selection"
+                )
         if isinstance(self.smoothing, dict):
             self.smoothing = SmoothingConfig(**self.smoothing)
         if not isinstance(self.source_provenance, dict):

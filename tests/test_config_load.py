@@ -91,23 +91,30 @@ def test_load_config_without_overrides():
     assert cfg.training.num_workers == 1
     assert cfg.training.val_workers == 1
     assert cfg.training.test_workers == 1
-    assert cfg.training.loss.joint.observation_loss == "nll"
+    assert cfg.training.loss.joint.observation_loss == "wis"
     assert cfg.training.loss.joint.distribution_family == "normal"
+    assert cfg.model.observation_heads.censored_location is True
 
 
 @pytest.mark.epiforecaster
-@pytest.mark.parametrize(
-    "config_path",
-    [
-        "configs/production_only/train_epifor_mn5_full.yaml",
-        "configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml",
-    ],
-)
-def test_production_training_configs_default_to_normal_nll(config_path: str) -> None:
-    cfg = EpiForecasterConfig.load(config_path)
+def test_production_training_config_defaults_to_censored_wis() -> None:
+    cfg = EpiForecasterConfig.load("configs/production_only/train_epifor_mn5_full.yaml")
+
+    assert cfg.data.dataset_path == "data/processed/real_with_id_v2.zarr.zip"
+    assert cfg.training.loss.joint.observation_loss == "wis"
+    assert cfg.training.loss.joint.distribution_family == "normal"
+    assert cfg.model.observation_heads.censored_location is True
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_pretraining_config_defaults_to_normal_nll() -> None:
+    cfg = EpiForecasterConfig.load(
+        "configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml"
+    )
 
     assert cfg.training.loss.joint.observation_loss == "nll"
     assert cfg.training.loss.joint.distribution_family == "normal"
+    assert cfg.model.observation_heads.censored_location is False
 
 
 @pytest.mark.epiforecaster

@@ -64,6 +64,29 @@ def test_distribution_metric_accumulator_preserves_negative_nll() -> None:
     assert summary.nll == pytest.approx(expected)
 
 
+def test_distribution_metric_accumulator_clips_intervals_at_zero() -> None:
+    accumulator = TorchDistributionMetricAccumulator(device=torch.device("cpu"))
+
+    batch_metrics = accumulator.update(
+        loc=torch.tensor([[0.0, 5.0]]),
+        scale=torch.ones((1, 2)),
+        targets=torch.tensor([[0.0, 5.0]]),
+        observed_mask=torch.ones((1, 2)),
+    )
+    summary = accumulator.finalize()
+
+    half_width = 1.959964
+    low, high = batch_metrics.intervals["95"]
+    assert low[0].tolist() == pytest.approx([0.0, 5.0 - half_width])
+    assert high[0].tolist() == pytest.approx([half_width, 5.0 + half_width])
+    assert summary.interval_width_by_level["95"] == pytest.approx(1.5 * half_width)
+    assert summary.coverage_by_level["95"] == 1.0
+    # A zero forecast of an observed zero pays only for the half above zero.
+    assert batch_metrics.wis[0, 0].item() == pytest.approx(
+        0.5 * batch_metrics.wis[0, 1].item()
+    )
+
+
 def _make_batch(*, with_residuals: bool = False) -> SimpleNamespace:
     batch = SimpleNamespace(
         target_node=torch.tensor([0, 1], dtype=torch.long),
@@ -285,3 +308,27 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
         expm1(1.0) / 0.1, rel=1e-4
     )
     assert metrics[f"{prefix}ascertainment_deaths_zero_latent_window_fraction"] == 0.0
+
+
+def test_evaluate_loader_emits_region_set_metrics_for_member_regions_only():
+    loader = _DummyLoader([_make_batch()])
+    loader.dataset = SimpleNamespace(_region_ids=["r0", "r1"])
+    kwargs = {
+        "model": _DummyModel(),
+        "criterion": JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0),
+        "horizon": 2,
+        "device": torch.device("cpu"),
+    }
+    _loss, metrics, _ = evaluate_loader(
+        loader=loader, region_sets={"core": frozenset({"r1"})}, **kwargs
+    )
+
+    # The second window is the only member of "core" (target node 1).
+    assert metrics["region_set_core_probabilistic_effective_count_hosp"] == 2
+    assert metrics["region_set_core_probabilistic_effective_count_cases"] == 2
+    assert metrics["region_set_core_wis_hosp_log1p_per_100k"] > 0.0
+    assert metrics["region_set_core_mean_target_wis"] > 0.0
+    assert metrics["probabilistic_effective_count_hosp"] == 4
+
+    _loss, plain, _ = evaluate_loader(loader=loader, **kwargs)
+    assert not any(key.startswith("region_set_") for key in plain)

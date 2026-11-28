@@ -1,4 +1,5 @@
 import json
+from typing import Any
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,7 @@ from evaluation.selection_scores import (
     compute_mean_target_nll,
     compute_validation_selection_score,
 )
+import training.epiforecaster_trainer as trainer_module
 from training.epiforecaster_trainer import (
     EpiForecasterTrainer,
     normalize_training_history,
@@ -28,6 +30,7 @@ from models.configs import (
     ObservationHeadConfig,
     LossConfig,
     CurriculumConfig,
+    LatentInformationConfig,
 )
 from data.latent_supervision import LATENT_SCALE_TASKS, LatentScaleState
 
@@ -689,3 +692,59 @@ def test_block_build_records_carry_the_global_step(tmp_path) -> None:
         "block_index": 2,
         "global_step": 17,
     }
+
+
+@pytest.mark.parametrize(
+    ("split_name", "expects_region_sets"), [("Val", False), ("Test", True)]
+)
+def test_evaluate_split_loads_region_sets_only_for_test(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    split_name: str,
+    expects_region_sets: bool,
+) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "folds": [{"fold_index": 0, "region_ids": ["a", "b"]}],
+                "region_sets": {"core": ["a"]},
+            }
+        )
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_evaluate_loader(**kwargs: Any) -> tuple[float, dict, dict]:
+        captured.update(kwargs)
+        return 0.0, {}, {}
+
+    monkeypatch.setattr(trainer_module, "evaluate_loader", _fake_evaluate_loader)
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.config = SimpleNamespace(
+        output=SimpleNamespace(
+            write_granular_eval=False,
+            granular_eval_format="csv",
+            experiment_name="exp",
+        ),
+        training=SimpleNamespace(
+            max_batches=None,
+            crossval_manifest_path=str(manifest_path),
+            latent_information=LatentInformationConfig(),
+        ),
+        model=SimpleNamespace(
+            forecast_horizon=2,
+            input_window_length=3,
+            observation_heads=SimpleNamespace(relevant_source_mapping=lambda: {}),
+        ),
+        data=SimpleNamespace(window_stride=7),
+    )
+    trainer.model = object()
+    trainer.criterion = object()
+    trainer.device = torch.device("cpu")
+    trainer.region_embeddings = None
+    trainer.experiment_dir = None
+
+    trainer._evaluate_split(SimpleNamespace(batch_size=2), split_name)
+
+    expected = {"core": frozenset({"a"})} if expects_region_sets else None
+    assert captured["region_sets"] == expected

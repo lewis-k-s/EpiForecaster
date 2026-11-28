@@ -763,6 +763,19 @@ class ObservationHeadConfig:
     # Predictive distribution scale in the existing log1p(per-100k) target space.
     distribution_scale_init: float = 0.3
     distribution_scale_floor: float = 1.0e-3
+    # Population-dependent scale floor per clinical head, as a fraction of the
+    # log1p(per-100k) value of one count in the target region,
+    # log1p(100000 / population). Zero keeps distribution_scale_floor alone; a
+    # positive fraction applies max(distribution_scale_floor, fraction * step).
+    # Only meaningful for a head whose targets are integer counts of the region.
+    count_step_scale_floor_hosp: float = 0.0
+    count_step_scale_floor_cases: float = 0.0
+    count_step_scale_floor_deaths: float = 0.0
+    # When true every head's predictive distribution is a Normal censored at
+    # zero: `dist_<head>_loc` is the latent location and may be negative,
+    # `pred_<head>` is the censored median max(location, 0), and NLL and CRPS are
+    # the scores of the censored distribution. Requires the normal family.
+    censored_location: bool = False
 
     # Residual connection settings
     residual_mode: str = "additive"  # "additive" | "modulation"
@@ -942,6 +955,15 @@ class ObservationHeadConfig:
                 "distribution_scale_floor must be positive, "
                 f"got {self.distribution_scale_floor}"
             )
+        for name, fraction in (
+            ("count_step_scale_floor_hosp", self.count_step_scale_floor_hosp),
+            ("count_step_scale_floor_cases", self.count_step_scale_floor_cases),
+            ("count_step_scale_floor_deaths", self.count_step_scale_floor_deaths),
+        ):
+            if not math.isfinite(float(fraction)) or fraction < 0:
+                raise ValueError(
+                    f"{name} must be finite and non-negative, got {fraction}"
+                )
 
         valid_relevant_sources = {
             "hosp": {"hospitalization_flow", "H"},
@@ -1293,6 +1315,11 @@ class TrainingParams:
     # Optional persisted exactly-once region membership. Production cross-validation
     # should use a checked-in manifest rather than regenerating folds per model seed.
     crossval_manifest_path: str | None = None
+    # Optional manifest region set (a key of the manifest's region_sets) that
+    # limits training and validation regions. Every fold region stays in the
+    # test role, so conditions with different training populations are scored
+    # on identical held-out support.
+    crossval_region_set: str | None = None
     # Which held-out fold the configured crossval_fold_index represents.
     # Validation always uses the next fold cyclically.
     crossval_holdout_role: str = "test"

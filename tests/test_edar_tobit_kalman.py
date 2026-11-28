@@ -187,6 +187,8 @@ def test_edar_processor_applies_tobit_kalman(
     _write_wastewater_csv(wastewater_path, include_ld=True)
 
     config = _make_config(tmp_path, wastewater_path)
+    # The expected-output helper covers sampled days only: end on the last sample.
+    config.end_date = datetime(2022, 1, 3)
     processor = EDARProcessor(config)
 
     # Patch fit_kalman_params in the smoothing module
@@ -224,3 +226,60 @@ def test_edar_processor_skips_tobit_without_limits(
     finally:
         # Restore original function
         smoothing.fit_kalman_params = original_fit_kalman_params
+
+
+@pytest.mark.epiforecaster
+def test_tobit_kalman_keeps_reported_values_on_sample_days(tmp_path: Path):
+    wastewater_path = tmp_path / "wastewater.csv"
+    wastewater_path.write_text("dummy\n")
+    config = _make_config(tmp_path, wastewater_path)
+    config.smoothing.parameter_fit_mode = "fixed"
+    config.end_date = datetime(2022, 1, 7)
+    processor = EDARProcessor(config)
+
+    values = np.array([100.0, np.nan, np.nan, 50.0, np.nan, 400.0, np.nan])
+    daily = pd.DataFrame(
+        {
+            "date": pd.date_range("2022-01-01", periods=7),
+            "edar_id": "EDAR1",
+            "variant": "N1",
+            "total_covid_flow": values,
+            "limit_flow": 80.0,
+        }
+    )
+    result = processor._apply_tobit_kalman(daily)
+    flow = result["total_covid_flow"].to_numpy()
+    sampled = np.isfinite(values)
+
+    # Sample days keep the reported value, the non-detect (50 <= 80) included.
+    np.testing.assert_array_equal(flow[sampled], values[sampled])
+    assert result["censor_flag"].tolist() == [0, 2, 2, 1, 2, 0, 2]
+    # Days between samples carry the filter level, which lags the last sample.
+    assert np.isfinite(flow[~sampled]).all()
+    assert 100.0 < flow[6] < 400.0
+
+
+@pytest.mark.epiforecaster
+def test_locf_carries_samples_to_the_range_end_and_flags_non_detects(tmp_path: Path):
+    wastewater_path = tmp_path / "wastewater.csv"
+    wastewater_path.write_text("dummy\n")
+    config = _make_config(tmp_path, wastewater_path)
+    config.smoothing.wastewater_method = "locf"
+    processor = EDARProcessor(config)
+
+    daily = pd.DataFrame(
+        {
+            "date": pd.date_range("2022-01-01", periods=7),
+            "edar_id": "EDAR1",
+            "variant": "N1",
+            "total_covid_flow": [np.nan, 100.0, np.nan, 50.0, np.nan, np.nan, 400.0],
+            "limit_flow": 80.0,
+        }
+    )
+    result = processor._fill_gaps(daily)
+
+    # The series stops on Jan 7; the configured range ends on Jan 10.
+    flow = result["total_covid_flow"].to_numpy()
+    assert np.isnan(flow[0])
+    assert flow[1:].tolist() == [100.0, 100.0, 50.0, 50.0, 50.0] + [400.0] * 4
+    assert result["censor_flag"].tolist() == [2, 0, 2, 1, 2, 2, 0, 2, 2, 2]

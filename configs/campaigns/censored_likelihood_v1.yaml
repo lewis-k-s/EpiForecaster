@@ -1,0 +1,86 @@
+schema_version: 1
+campaign_id: epiforecaster_censored_likelihood_v1
+stage: ablation
+hypothesis: >-
+  Targets are log1p values with many exact zeros in small municipalities, and
+  the uncensored Normal can give a day with a case at most the mass above one
+  count step. Training on the forecast censored at zero, with a location that
+  may go below zero, lets the model state a probability of zero above one half
+  and should improve the zero-clipped WIS. The clipped WIS objective tests the
+  same idea on the selection metric, with and without the censored location.
+  Every condition trains on the 280 population-floor targets of
+  real_with_id_v2 with the production scale floors.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: nll
+fixed_overrides:
+  data:
+    dataset_path: data/processed/real_with_id_v2.zarr.zip
+  # The campaign selected the production objective; pin the Normal NLL
+  # reference it ran against.
+  model:
+    observation_heads:
+      censored_location: false
+  training:
+    loss:
+      joint:
+        observation_loss: nll
+smoke_overrides:
+  training:
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
+conditions:
+  - name: nll
+    hypothesis: The former production Normal NLL with the zero-clamped anchored location is the paired reference.
+    overrides: {}
+    allowed_difference_paths: []
+  - name: wis
+    hypothesis: Training on the zero-clipped WIS removes the density reward on observed zeros while the location stays clamped at zero.
+    overrides: {training: {loss: {joint: {observation_loss: wis}}}}
+    allowed_difference_paths: [training.loss.joint.observation_loss]
+  - name: wis-censored
+    hypothesis: With the location free below zero the clipped WIS can place every quantile on zero for a quiet region.
+    overrides:
+      training: {loss: {joint: {observation_loss: wis}}}
+      model: {observation_heads: {censored_location: true}}
+    allowed_difference_paths: [training.loss.joint.observation_loss, model.observation_heads.censored_location]
+  - name: nll-censored
+    hypothesis: The censored Normal likelihood scores an observed zero by its probability mass and is defined on the whole distribution, not on 23 quantiles.
+    overrides: {model: {observation_heads: {censored_location: true}}}
+    allowed_difference_paths: [model.observation_heads.censored_location]
+paired_model_seeds: [42, 43]
+cross_validation:
+  split_manifest: configs/crossval/representative_10fold_pop3000.json
+  fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  smoke_fold_indices: [1, 4]
+metrics:
+  primary: {name: mean_target_wis, direction: minimize}
+  secondary: [mae_median, rmse_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+  require_full_manifest_folds: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true
+analysis:
+  kind: probabilistic_full_coverage
+  granular_filename: test_granular.parquet
+  required_heads: [wastewater, hospitalizations, cases, deaths]
+  evaluation_design: spatial
+  temporal_evaluation:
+    scored_role: all_dates
+    calibration_control: C0
+    confirmation: included
+  mobility_context:
+    kind: incoming_flow_raw_tertiles
+    path: data/files/mobility.zarr.zip
+    variable: mobility
+    date_start: "2020-03-01"
+    date_end: "2021-05-09"

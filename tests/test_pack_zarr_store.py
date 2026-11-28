@@ -139,6 +139,39 @@ def test_mobility_processor_reads_zip_like_directory(tmp_path: Path) -> None:
     assert from_zip["mobility"].dims == from_dir["mobility"].dims
 
 
+def test_mobility_processor_reads_destination_layout_and_drops_provenance(
+    tmp_path: Path,
+) -> None:
+    legacy = _mobility_dataset()
+    ids = legacy["origin"].values
+    municipal = xr.Dataset(
+        {
+            "mobility": (
+                ("date", "origin", "destination"),
+                legacy["mobility"].values,
+            ),
+            "source_version": (("date",), np.full(10, "v1")),
+        },
+        coords={"date": legacy["date"].values, "origin": ids, "destination": ids},
+    )
+    store = tmp_path / "municipal.zarr"
+    municipal.to_zarr(store, mode="w", zarr_format=3)
+    config = SimpleNamespace(
+        run_id_chunk_size=1, start_date="2020-03-02", end_date="2020-03-05"
+    )
+
+    result = MobilityProcessor(config).process(str(store))  # type: ignore[arg-type]
+
+    assert list(result.data_vars) == ["mobility"]
+    assert result["mobility"].dims == ("run_id", "date", "origin", "destination")
+    assert result.sizes["date"] == 4
+    assert np.array_equal(
+        result["mobility"].values[0],
+        legacy["mobility"].values[1:5],
+        equal_nan=True,
+    )
+
+
 def test_open_zarr_store_dispatches_on_suffix(tmp_path: Path) -> None:
     source = tmp_path / "mobility.zarr"
     _write_directory(source)
