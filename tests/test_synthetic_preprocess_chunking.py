@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 
 import dask.array as da
 import numpy as np
@@ -1172,3 +1173,14 @@ def test_split_attr_list_accepts_netcdf_strings_and_zarr_lists():
     assert _split_attr_list(["cases", " deaths"]) == ["cases", "deaths"]
     assert _split_attr_list("S") == _split_attr_list(["S"]) == ["S"]
     assert _split_attr_list(None) == []
+
+
+@pytest.mark.epiforecaster
+def test_spawned_worker_has_single_thread_environment(monkeypatch):
+    """Workers start on submit, so they must see the single-thread variables."""
+    from data.preprocess.synthetic_runs import _worker_pool
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    with _worker_pool(1) as pool:
+        assert pool.submit(os.getenv, "OMP_NUM_THREADS").result() == "1"
+    assert os.environ["OMP_NUM_THREADS"] == "8"

@@ -131,7 +131,8 @@ A worker holds one run: 1.6 GB of mobility plus about 1.4 GB of other arrays
 and interpreter. Size `preprocessing.write_workers` from the memory of the
 allocation; the CPUs are shared out as `cpus // write_workers` Zarr codec
 threads per worker, which compress the inner chunks of a run in parallel.
-Spawned workers have one BLAS/OpenMP thread each.
+Spawned workers have one BLAS/OpenMP thread each and build their run with
+Dask's synchronous scheduler.
 
 ## 4. BitRound
 

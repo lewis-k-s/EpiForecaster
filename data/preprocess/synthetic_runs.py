@@ -12,13 +12,15 @@ Workers are spawned, not forked: Zarr keeps an event-loop thread, and a
 spawned worker starts without the parent's open stores or task graphs. The
 CPUs of the allocation are shared out between the workers: each worker's Zarr
 codec pool gets ``cpus // write_workers`` threads, which compress the inner
-chunks of a run in parallel. ``write_workers`` therefore sets the peak memory
-(about one run of mobility per worker) and the threads fill the CPUs.
+chunks of a run in parallel. Each worker has one BLAS/OpenMP thread and builds
+its run with Dask's synchronous scheduler, so no other thread pool is sized to
+all CPUs of the node. ``write_workers`` therefore sets the peak memory (about
+one run of mobility per worker) and the codec threads fill the CPUs.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import contextlib
 from dataclasses import dataclass, replace
@@ -91,6 +93,8 @@ def _quiet() -> Iterator[None]:
 
 @contextlib.contextmanager
 def _single_thread_environment() -> Iterator[None]:
+    # The executor starts spawned workers when work is submitted, not when it
+    # is created, so this must stay in effect until the last submit.
     previous = {name: os.environ.get(name) for name in SINGLE_THREAD_ENVIRONMENT}
     os.environ.update(SINGLE_THREAD_ENVIRONMENT)
     try:
@@ -101,6 +105,28 @@ def _single_thread_environment() -> Iterator[None]:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+@contextlib.contextmanager
+def _worker_pool(
+    workers: int,
+    initializer: Callable[..., None] | None = None,
+    initargs: tuple[Any, ...] = (),
+) -> Iterator[ProcessPoolExecutor]:
+    """Yield a spawn pool whose workers start with one BLAS/OpenMP thread."""
+    with _single_thread_environment():
+        pool = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=initializer,
+            initargs=initargs,
+        )
+        try:
+            yield pool
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
 
 
 def _init_worker(setup: _WorkerSetup) -> None:
@@ -135,7 +161,7 @@ def _build_run(index: int) -> SyntheticRunResult:
     setup: _WorkerSetup = _WORKER["setup"]
     pipeline: OfflinePreprocessingPipeline = _WORKER["pipeline"]
     run_id = setup.run_ids[index]
-    with _quiet():
+    with _quiet(), dask.config.set(scheduler="synchronous"):
         dataset = pipeline.build_synthetic_runs(_WORKER["corpus"], [run_id])
         if [str(value) for value in dataset[RUN_DIM].values] != [run_id]:
             raise ValueError(f"Run {run_id!r} built a dataset for other runs")
@@ -208,21 +234,10 @@ def _run_workers(setup: _WorkerSetup, workers: int) -> list[SyntheticRunResult]:
             _WORKER.clear()
         return results
 
-    with _single_thread_environment():
-        pool = ProcessPoolExecutor(
-            max_workers=workers,
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_init_worker,
-            initargs=(setup,),
-        )
-    try:
+    with _worker_pool(workers, _init_worker, (setup,)) as pool:
         futures = [pool.submit(_build_run, index) for index in range(count)]
         for future in as_completed(futures):
             record(future.result())
-    except BaseException:
-        pool.shutdown(wait=True, cancel_futures=True)
-        raise
-    pool.shutdown(wait=True)
     return sorted(results, key=lambda result: result.write.run_index)
 
 

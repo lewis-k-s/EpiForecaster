@@ -331,7 +331,8 @@ def write_run(
     computed = {name: np.asarray(values) for name, values in computed.items()}
 
     region = {RUN_DIM: slice(run_index, run_index + 1)}
-    group = zarr.open_group(store, mode="r", zarr_format=3)
+    # chunks=None reads only the requested slice, without Dask.
+    written = xr.open_zarr(store, consolidated=False, chunks=None)
     non_null: dict[str, int] = {}
 
     def write(names: list[str], values: dict[str, np.ndarray]) -> None:
@@ -342,7 +343,8 @@ def write_run(
         write(per_run, computed)
         for name in per_run:
             if not _values_equal(
-                computed[name], group[name][run_index : run_index + 1]
+                computed[name],
+                written[name][run_index : run_index + 1].values,
             ):
                 raise ValueError(
                     f"Zarr read-back of {name!r} differs for run index {run_index}"
@@ -352,7 +354,7 @@ def write_run(
     for name in large:
         values = _compute_into(dataset[name])
         write([name], {name: values})
-        array = group[name]
+        array = written[name]
         date_axis = dataset[name].dims.index(DATE_DIM)
         count = 0
         for start in range(0, values.shape[date_axis], MOBILITY_DATE_CHUNK):
@@ -361,7 +363,7 @@ def write_run(
             index[date_axis] = window
             expected = values[tuple(index)]
             index[0] = slice(run_index, run_index + 1)
-            if not _values_equal(expected, array[tuple(index)]):
+            if not _values_equal(expected, array[tuple(index)].values):
                 raise ValueError(
                     f"Zarr read-back of {name!r} differs for run index {run_index}"
                 )
