@@ -169,6 +169,8 @@ cleanup() {
   local status=$?
 
   trap - EXIT
+  # A scheduler TERM must not skip the MPS quit and the daemon log copy.
+  trap '' TERM INT
   if [ -n "$MPS_ROOT" ]; then
     mps_finish "$status" || true
   fi

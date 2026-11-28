@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +102,7 @@ def _release_trial_resources() -> None:
     run hpo-core-mps-20261102 later trials trained 10x slower and worker host
     memory grew until the step ran out of memory.
     """
-    torch._dynamo.reset()
+    torch.compiler.reset()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -536,8 +537,10 @@ def objective(
         # Check if this is an Optuna TrialPruned exception
         if hasattr(exc, "__class__") and exc.__class__.__name__ == "TrialPruned":
             logger.info("Trial %d pruned by Optuna", trial.number)
-            raise
-        # Re-raise other exceptions
+        # The propagating traceback keeps every frame's locals, including the
+        # trainer's `self`, alive. Drop those locals (line numbers stay) so the
+        # release below can free the model and optimizer.
+        traceback.clear_frames(exc.__traceback__)
         raise
     finally:
         del trainer

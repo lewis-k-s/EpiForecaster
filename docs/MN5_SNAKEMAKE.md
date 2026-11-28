@@ -32,8 +32,10 @@ tasks=N
 gres=gpu:N
 ```
 
-Templates use `acc_bscls`. Use `acc_debug` for any run that fits its two-hour
-limit: its QOS priority is 10000 against 100 for `acc_bscls`, but it holds one
+The `mn5_train`, `mn5_crossval`, `mn5_synth_pretrain_control`, and
+synthetic fine-tune templates use `acc_debug`. The other templates (for example
+`mn5`, `mn5_ablation`, and `mn5_evaluate`) use `acc_bscls`. Use `acc_debug` for
+any run that fits its two-hour limit: its QOS priority is 10000 against 100 for `acc_bscls`, but it holds one
 queued or running job per user. Pack many short runs into one `ablation`
 campaign (with `mps_clients_per_gpu` when trials leave the GPU idle) instead of
 submitting one job per run. Size `runtime` from measured wall time with about a

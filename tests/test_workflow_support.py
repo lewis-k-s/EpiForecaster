@@ -29,7 +29,7 @@ from scripts.hpo.trial_artifacts import (
     trial_directory,
 )
 from scripts.workflow import run_config, run_support
-from workflow.common import container_command, slurm_step
+from workflow.common import container_command, hpo_worker_arguments, slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
     load_training_dynamics_identity,
@@ -3250,3 +3250,23 @@ def test_snapshot_rejects_dvc_mount_parent_missing_from_inventory(
     assert run_config.validate_code_data_separation(
         tmp_path, [relative], {"dvc": {"targets": [str(relative)]}}
     ) == {relative: Path("inputs/raw/data")}
+
+
+def test_hpo_worker_arguments_emit_pruning_startup_trials() -> None:
+    options = {
+        "study_name": "study",
+        "base_config": "configs/train.yaml",
+        "trials_per_worker": 1,
+        "timeout_s": 60,
+        "epochs": 1,
+        "seed": 42,
+        "sampler": "random",
+        "pruning_start_epoch": 3,
+        "pruning_startup_trials": 7,
+        "search_space": "core",
+    }
+
+    arguments = hpo_worker_arguments({"optuna": options})
+
+    flag = arguments.index("--pruning-startup-trials")
+    assert arguments[flag + 1] == 7

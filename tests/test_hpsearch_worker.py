@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import optuna
 import pytest
+from click.testing import CliRunner
 
+from scripts.hpo import hpsearch_worker
 from scripts.hpo.hpsearch_worker import (
     _categorical_choices,
     _decode_categorical_value,
     _overrides_to_dotlist,
     _remaining_worker_trials,
     _worker_outcome_error,
+    main,
     objective,
     suggest_epiforecaster_params,
 )
@@ -538,3 +544,136 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     assert summary["training_loss_objective"] == "mae"
     assert summary["best_model_path"] == str(checkpoint)
     assert summary["best_model_sha256"] == checkpoint_sha256
+
+
+def test_core_search_space_rejects_training_loss_objective() -> None:
+    trial = _StubTrial()
+    with pytest.raises(ValueError, match="core search space"):
+        suggest_epiforecaster_params(
+            trial=trial,
+            base_cfg=_base_cfg_stub(),
+            sample_training_loss_objective=True,
+            search_space="core",
+        )
+    assert trial.suggest_calls == []
+
+
+def test_pruning_startup_trials_reach_percentile_pruner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _RecordingPruner(optuna.pruners.PercentilePruner):
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(optuna.pruners, "PercentilePruner", _RecordingPruner)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--study-name",
+            "study",
+            "--journal-file",
+            str(tmp_path / "study.journal"),
+            "--run-root",
+            str(tmp_path / "trials"),
+            "--n-trials",
+            "0",
+            "--sampler",
+            "random",
+            "--pruning-start-epoch",
+            "5",
+            "--pruning-startup-trials",
+            "7",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["n_startup_trials"] == 7
+    assert captured["n_warmup_steps"] == 5
+
+
+@pytest.mark.parametrize("outcome", ["complete", "fail", "prune"])
+def test_objective_releases_trial_resources_after_trainer_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    cfg = _joint_loss_cfg_stub(joint={"observation_loss": "mae"})
+    cfg.output = SimpleNamespace(log_dir=str(tmp_path), experiment_name="study")
+    trainer_refs: list[weakref.ReferenceType] = []
+    released: list[bool] = []
+
+    class _FakeConfig:
+        @staticmethod
+        def from_file(_path: str):
+            return cfg
+
+        @staticmethod
+        def load(_path: str, overrides: list[str]):
+            return cfg
+
+    class _FakeTrainer:
+        def __init__(self, config, trial=None, pruning_start_epoch=10, model_id=None):
+            self.model_id = model_id
+            self.experiment_dir = (
+                Path(config.output.log_dir) / config.output.experiment_name / model_id
+            )
+            self.experiment_dir.mkdir(parents=True)
+            trainer_refs.append(weakref.ref(self))
+
+        def _train_epoch(self):
+            if outcome == "fail":
+                raise RuntimeError("out of memory")
+            raise optuna.TrialPruned()
+
+        def run(self):
+            if outcome != "complete":
+                self._train_epoch()
+            checkpoint = self.experiment_dir / "checkpoints/best_model.pt"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"checkpoint")
+            return {"best_val_selection_score": 0.5}
+
+    def _release() -> None:
+        gc.collect()
+        released.append(trainer_refs[0]() is None)
+
+    monkeypatch.setattr(hpsearch_worker, "EpiForecasterConfig", _FakeConfig)
+    monkeypatch.setattr(hpsearch_worker, "EpiForecasterTrainer", _FakeTrainer)
+    monkeypatch.setattr(
+        hpsearch_worker,
+        "suggest_epiforecaster_params",
+        lambda **_kwargs: {"training.learning_rate": 1.0e-3},
+    )
+    monkeypatch.setattr(
+        hpsearch_worker, "_record_training_dynamics_attrs", lambda *_args: {}
+    )
+    monkeypatch.setattr(hpsearch_worker, "_release_trial_resources", _release)
+
+    def _run() -> float:
+        return objective(
+            _StubTrial(),
+            base_config_path=tmp_path / "config.yaml",
+            study_name="study",
+            run_root=tmp_path,
+            fixed_epochs=1,
+            fixed_max_batches=None,
+            seed=None,
+            cli_overrides=[],
+        )
+
+    if outcome == "complete":
+        assert _run() == pytest.approx(0.5)
+    else:
+        expected = RuntimeError if outcome == "fail" else optuna.TrialPruned
+        with pytest.raises(expected):
+            _run()
+
+    # The release ran once, and no frame still held the trainer when it ran.
+    assert released == [True]
