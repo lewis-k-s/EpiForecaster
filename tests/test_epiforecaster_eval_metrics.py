@@ -11,6 +11,7 @@ from evaluation.losses import JointInferenceLoss
 from evaluation.metrics import TorchDistributionMetricAccumulator
 from evaluation.epiforecaster_eval import evaluate_loader
 from models.configs import LatentInformationConfig
+from models.sir_rollforward import SIRRollForward
 
 
 class _DummyLoader:
@@ -160,6 +161,72 @@ def test_latent_information_uses_stored_true_latents_of_the_relevant_source():
     assert not any(key.startswith("latent_info_hosp_true") for key in metrics)
     # A two-day horizon holds no complete week.
     assert metrics["latent_info_hosp_week_total_window_count"] == 0
+
+
+def test_evaluate_loader_emits_regularizer_metrics():
+    batch = _make_batch(with_residuals=True)
+    for head in ("hosp", "ww", "cases", "deaths"):
+        batch.model_outputs[f"residual_{head}"] = torch.full((2, 2), 0.5)
+        batch.model_outputs[f"mechanistic_history_{head}"] = torch.zeros((2, 3))
+    batch.model_outputs["beta_rollforward"] = torch.tensor(
+        [[0.1, 0.2, 0.4], [0.3, 0.3, 0.3]]
+    )
+    batch.ww_hist = torch.ones((2, 4))
+    batch.ww_hist_mask = torch.ones((2, 4))
+    for head in ("hosp", "cases", "deaths"):
+        setattr(batch, f"{head}_hist", torch.ones((2, 4, 2)))
+
+    _loss, metrics, _node_mae = _evaluate(batch)
+
+    for name in ("history_reconstruction", "residual_penalty", "beta_smoothness"):
+        assert math.isfinite(metrics[f"loss_{name}"])
+    # Prediction 0 against target 1 on every observed history day.
+    assert metrics["loss_history_reconstruction"] == pytest.approx(1.0)
+    assert metrics["loss_residual_penalty"] == pytest.approx(0.25)
+    # Row 0 has two log-differences of ln 2; row 1 is constant.
+    assert metrics["loss_beta_smoothness"] == pytest.approx(
+        math.log(2.0) ** 2 / 2.0, rel=1e-5
+    )
+
+
+@pytest.mark.parametrize("renewal", [False, True])
+def test_evaluate_loader_latent_diagnostics_follow_force_of_infection(renewal):
+    batch = _make_batch()
+    rates = {
+        "beta_t": torch.full((2, 2), 0.3),
+        "gamma_t": torch.full((2, 2), 0.1),
+        "mortality_t": torch.zeros(2, 2),
+        "hospitalization_rate_t": torch.full((2, 2), 0.05),
+        "hospital_recovery_t": torch.full((2, 2), 0.05),
+        "hospital_mortality_t": torch.zeros(2, 2),
+    }
+    batch.model_outputs.update(rates)
+    state = torch.tensor([[0.5, 0.4, 0.3], [0.5, 0.4, 0.3]])
+    batch.targets_dict.update(
+        {
+            "S_target": state,
+            "I_target": state,
+            "H_target": state,
+            "R_target": state,
+            "death_flow_target": torch.zeros(2, 2),
+        }
+    )
+    model = _DummyModel()
+    model.sir_rollforward = SIRRollForward(
+        generation_interval=torch.tensor([0.6, 0.4]) if renewal else None
+    )
+
+    _loss, metrics, _node_mae = evaluate_loader(
+        model=model,
+        loader=_DummyLoader([batch]),
+        criterion=JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0),
+        horizon=2,
+        device=torch.device("cpu"),
+    )
+
+    assert metrics["latent_diag_oracle_x0_count_i"] > 0
+    teacher_keys = [k for k in metrics if "teacher_forced_one_step" in k]
+    assert bool(teacher_keys) is not renewal
 
 
 def test_evaluate_loader_emits_cases_and_deaths_metrics():

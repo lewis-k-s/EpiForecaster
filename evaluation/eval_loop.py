@@ -576,6 +576,8 @@ def evaluate_loader(
         )
         for protocol in ("oracle_x0", "teacher_forced_one_step")
     }
+    # Protocols the builder omits (missing targets, renewal) report no keys.
+    updated_latent_diagnostics: set[str] = set()
     latent_information_metrics = (
         TorchLatentInformationAccumulator(
             latent_information,
@@ -786,6 +788,7 @@ def evaluate_loader(
                         predictions=diagnostic_predictions,
                         targets=diagnostic_targets,
                     )
+                    updated_latent_diagnostics.add(protocol)
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",
@@ -1347,7 +1350,8 @@ def evaluate_loader(
     latent_plausibility_summary = latent_plausibility_metrics.finalize()
     latent_diagnostic_summary = {
         key: value
-        for accumulator in latent_diagnostic_metrics.values()
+        for protocol, accumulator in latent_diagnostic_metrics.items()
+        if protocol in updated_latent_diagnostics
         for key, value in accumulator.finalize().items()
     }
 
