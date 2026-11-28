@@ -30,7 +30,7 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
-from scripts.workflow import run_config, run_support
+from scripts.workflow import pinned_inputs, run_config, run_support
 from workflow.common import container_command, slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
@@ -465,14 +465,6 @@ def test_dispatch_request_lists_checkpoint_input_directories(tmp_path: Path) -> 
         "checkpoint_input_dir\t/gpfs/prev/checkpoints"
     ]
 
-    config["workflow"]["kind"] = "evaluate"
-    config["evaluation"] = {"checkpoint": "/gpfs/eval/model/best_model.pt"}
-    assert run_config.checkpoint_input_dirs(config, tmp_path) == [
-        Path("/gpfs/eval/model")
-    ]
-    config["workflow"]["kind"] = "hpo"
-    assert run_config.checkpoint_input_dirs(config, tmp_path) == []
-
 
 def test_copied_source_snapshot_verifies_after_worktree_changes(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
@@ -619,12 +611,13 @@ def test_prepare_run_pins_evaluation_checkpoint_bytes(
     manifest = yaml.safe_load(manifest_path.read_text())
     assert pinned.read_bytes() == b"original checkpoint"
     assert not pinned.stat().st_mode & 0o222
-    assert manifest["evaluation_input"]["pinned_checkpoint"] == str(pinned)
-    assert (
-        manifest["evaluation_input"]["pinned_checkpoint_relative"]
-        == "inputs/evaluation_checkpoint.pt"
-    )
-    assert manifest["evaluation_input"]["checkpoint_sha256"] == expected_hash
+    assert manifest["schema_version"] == 2
+    record = manifest["pinned_inputs"]["evaluation"]
+    assert record["configured_checkpoint"] == str(external_checkpoint)
+    assert record["pinned_checkpoint"] == str(pinned)
+    assert record["pinned_checkpoint_relative"] == "inputs/evaluation_checkpoint.pt"
+    assert record["checkpoint_sha256"] == expected_hash
+    assert manifest["identity"]["input_checkpoint_sha256"] == expected_hash
 
     external_checkpoint.write_bytes(b"later mutation")
     captured: dict[str, Path] = {}
@@ -653,6 +646,7 @@ def test_evaluation_resolves_pinned_checkpoint_in_runtime_run_namespace(
             {
                 "workflow": {"kind": "evaluate"},
                 "evaluation": {
+                    "checkpoint": "/gpfs/project/models/best_model.pt",
                     "split": "test",
                     "overrides": [],
                     "granular": True,
@@ -663,13 +657,17 @@ def test_evaluation_resolves_pinned_checkpoint_in_runtime_run_namespace(
     (run_root / "manifest.yaml").write_text(
         yaml.safe_dump(
             {
-                "evaluation_input": {
-                    "pinned_checkpoint": (
-                        "/gpfs/project/runs/evaluate/inputs/evaluation_checkpoint.pt"
-                    ),
-                    "pinned_checkpoint_relative": "inputs/evaluation_checkpoint.pt",
-                    "checkpoint_sha256": run_support.sha256_file(pinned),
-                }
+                "schema_version": 2,
+                "pinned_inputs": {
+                    "evaluation": {
+                        "configured_checkpoint": "/gpfs/project/models/best_model.pt",
+                        "pinned_checkpoint": (
+                            "/gpfs/project/runs/evaluate/inputs/evaluation_checkpoint.pt"
+                        ),
+                        "pinned_checkpoint_relative": "inputs/evaluation_checkpoint.pt",
+                        "checkpoint_sha256": run_support.sha256_file(pinned),
+                    }
+                },
             }
         )
     )
@@ -733,7 +731,9 @@ def test_prepare_run_pins_training_initialization_checkpoint(
     manifest = yaml.safe_load(manifest_path.read_text())
     assert pinned.read_bytes() == b"pretrained checkpoint"
     assert not pinned.stat().st_mode & 0o222
-    assert manifest["training_input"]["pinned_checkpoint"] == str(pinned)
+    assert manifest["pinned_inputs"]["training_init"]["pinned_checkpoint"] == str(
+        pinned
+    )
     assert manifest["identity"]["init_checkpoint_sha256"] == (
         run_support.sha256_file(pinned)
     )
@@ -822,16 +822,19 @@ def test_prepare_run_pins_training_resume_checkpoints(tmp_path: Path) -> None:
     assert pinned_best.read_bytes() == external_best.read_bytes()
     assert not pinned_resume.stat().st_mode & 0o222
     assert not pinned_best.stat().st_mode & 0o222
-    resume_input = manifest["training_resume_input"]
-    assert resume_input["resume"]["pinned_checkpoint"] == str(pinned_resume)
-    assert resume_input["best"]["pinned_checkpoint"] == str(pinned_best)
+    assert set(manifest["pinned_inputs"]) == {
+        "training_resume",
+        "training_resume_best",
+    }
+    resume_input = manifest["pinned_inputs"]
+    assert resume_input["training_resume"]["pinned_checkpoint"] == str(pinned_resume)
+    assert resume_input["training_resume_best"]["pinned_checkpoint"] == str(pinned_best)
     assert manifest["identity"]["resume_checkpoint_sha256"] == (
         run_support.sha256_file(pinned_resume)
     )
     assert manifest["identity"]["resume_best_checkpoint_sha256"] == (
         run_support.sha256_file(pinned_best)
     )
-    assert "training_input" not in manifest
     assert "init_checkpoint_sha256" not in manifest["identity"]
 
 
@@ -2244,13 +2247,14 @@ def test_train_model_records_deterministic_checkpoint(
     base_config.parent.mkdir(parents=True)
     base_config.write_text("env: test\n")
     config = {
+        "workflow": {"kind": "train"},
         "training": {
             "base_config": "configs/train.yaml",
             "experiment_name": "single",
             "model_id": "model",
             "max_batches": 2,
             "overrides": ["training.epochs=1"],
-        }
+        },
     }
     config_path = run_root / "config.yaml"
     config_path.parent.mkdir(parents=True)
@@ -2300,25 +2304,23 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
     base_config = source_root / "configs/train.yaml"
     base_config.parent.mkdir(parents=True)
     base_config.write_text("env: test\n")
-    pinned = run_root / "inputs/training_init_checkpoint.pt"
-    pinned.parent.mkdir(parents=True)
-    pinned.write_bytes(b"pretrained")
+    source = tmp_path / "pretrain/best_model.pt"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"pretrained")
     config = {
+        "workflow": {"kind": "train"},
         "training": {
             "base_config": "configs/train.yaml",
             "experiment_name": "fine-tune",
             "model_id": "model",
-            "init_checkpoint": "/gpfs/pretrain/best_model.pt",
+            "init_checkpoint": str(source),
             "overrides": [],
-        }
+        },
     }
     config_path = run_root / "config.yaml"
+    _pin_run_inputs(config, run_root)
     config_path.write_text(yaml.safe_dump(config))
-    (run_root / "manifest.yaml").write_text(
-        yaml.safe_dump(
-            {"training_input": {"checkpoint_sha256": run_support.sha256_file(pinned)}}
-        )
-    )
+    pinned = run_root / "inputs/training_init_checkpoint.pt"
     captured: dict[str, object] = {}
 
     def fake_run(command, *, cwd=None, env=None):
@@ -2337,6 +2339,19 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
     assert expected_override in command
 
 
+def _pin_run_inputs(config: dict, run_root: Path) -> None:
+    """Pin the config's out-of-run checkpoints and write the manifest prepare would."""
+    pinned = pinned_inputs.pin_inputs(pinned_inputs.run_inputs(config), run_root)
+    (run_root / "manifest.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": pinned_inputs.RUN_MANIFEST_SCHEMA_VERSION,
+                pinned_inputs.MANIFEST_SECTION: pinned.records,
+            }
+        )
+    )
+
+
 def _resume_training_run(
     tmp_path: Path, **pair_options: object
 ) -> tuple[dict, Path, Path, Path, Path]:
@@ -2345,37 +2360,22 @@ def _resume_training_run(
     base_config = source_root / "configs/train.yaml"
     base_config.parent.mkdir(parents=True)
     base_config.write_text("env: test\n")
-    pinned_resume, pinned_best = _write_resume_pair(run_root / "inputs", **pair_options)
-    pinned_resume = pinned_resume.rename(
-        run_root / "inputs/training_resume_checkpoint.pt"
-    )
-    pinned_best = pinned_best.rename(
-        run_root / "inputs/training_resume_best_checkpoint.pt"
-    )
+    resume, best = _write_resume_pair(tmp_path / "previous", **pair_options)
     config = {
+        "workflow": {"kind": "train"},
         "training": {
             "base_config": "configs/train.yaml",
             "experiment_name": "pretrain",
             "model_id": "model",
-            "resume_checkpoint": "/gpfs/previous/checkpoint_epoch_0002.pt",
-            "resume_best_checkpoint": "/gpfs/previous/best_model.pt",
+            "resume_checkpoint": str(resume),
+            "resume_best_checkpoint": str(best),
             "overrides": [],
-        }
+        },
     }
+    _pin_run_inputs(config, run_root)
     config_path = run_root / "config.yaml"
     config_path.write_text(yaml.safe_dump(config))
-    (run_root / "manifest.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "training_resume_input": {
-                    "resume": {
-                        "checkpoint_sha256": run_support.sha256_file(pinned_resume)
-                    },
-                    "best": {"checkpoint_sha256": run_support.sha256_file(pinned_best)},
-                }
-            }
-        )
-    )
+    pinned_best = run_root / "inputs/training_resume_best_checkpoint.pt"
     return config, config_path, run_root, source_root, pinned_best
 
 
@@ -3640,12 +3640,6 @@ def test_dispatch_request_lists_campaign_init_checkpoint_directories(
         "checkpoint_input_dir\t/gpfs/synth/a",
         "checkpoint_input_dir\t/gpfs/synth/b",
     ]
-    assert run_config.workflow_campaign_init_checkpoints(config, source_root) == {
-        "transfer": {
-            "a": Path("/gpfs/synth/a/best.pt"),
-            "b": Path("/gpfs/synth/b/best.pt"),
-        }
-    }
 
 
 def test_campaign_init_checkpoint_declarations_fail_before_transfer(
@@ -3659,7 +3653,7 @@ def test_campaign_init_checkpoint_declarations_fail_before_transfer(
     config = _ablation_init_config(run_root, run_root / "source", campaign)
 
     with pytest.raises(ValueError, match="undeclared init_checkpoint"):
-        run_config.workflow_campaign_init_checkpoints(config, source_root)
+        pinned_inputs.declared_inputs(config, source_root)
 
 
 def test_prepare_run_pins_campaign_init_checkpoints(tmp_path: Path) -> None:
@@ -3702,7 +3696,7 @@ def test_prepare_run_pins_campaign_init_checkpoints(tmp_path: Path) -> None:
     manifest = yaml.safe_load(manifest_path.read_text())
     for name, payload in (("a", b"synthetic a"), ("b", b"synthetic b")):
         pinned = run_root / f"inputs/campaign_init/transfer/{name}.pt"
-        record = manifest["campaign_init_inputs"]["transfer"][name]
+        record = manifest["pinned_inputs"][f"campaign_init/transfer/{name}"]
         assert pinned.read_bytes() == payload
         assert not pinned.stat().st_mode & 0o222
         assert record["pinned_checkpoint"] == str(pinned)

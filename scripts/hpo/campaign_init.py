@@ -2,9 +2,10 @@
 
 A campaign declares named fine-tuning sources once (``init_checkpoints``) and
 conditions reference them by name (``init_checkpoint``). This module holds only
-the declaration contract and the pinned-input layout, using nothing beyond the
-standard library and PyYAML, so render, prepare and the Snakefile can share it
-with the campaign loader without importing the training stack.
+the declaration contract, using nothing beyond the standard library and PyYAML,
+so render, prepare and the Snakefile can share it with the campaign loader
+without importing the training stack. ``scripts.workflow.pinned_inputs`` owns
+where a run pins these checkpoints.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from typing import Any
 
 import yaml
 
-CAMPAIGN_INIT_DIR = Path("inputs/campaign_init")
 INIT_CHECKPOINT_PATH_KEY = "training.init_checkpoint_path"
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -107,11 +107,6 @@ def read_campaign_init_checkpoints(campaign_path: Path) -> tuple[str, dict[str, 
         },
     )
     return campaign_id, declared
-
-
-def pinned_init_checkpoint_relative(campaign_id: str, name: str) -> Path:
-    """Run-relative location of a pinned campaign checkpoint."""
-    return CAMPAIGN_INIT_DIR / campaign_id / f"{name}.pt"
 
 
 def init_checkpoint_identity_value(sha256: str) -> str:

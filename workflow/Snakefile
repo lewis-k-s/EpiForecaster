@@ -7,15 +7,14 @@ import yaml
 
 sys.path.insert(0, str(Path(config["run"]["source_root"])))
 
-from scripts.hpo.campaign_init import pinned_init_checkpoint_relative
 from scripts.workflow.run_config import (
     RESEARCH_OUTPUT_FILES,
     preprocessing_dataset_name,
     validate_mn5_allocation,
-    workflow_campaign_init_checkpoints,
     workflow_kind,
     workflow_target,
 )
+from scripts.workflow.pinned_inputs import EVALUATION, declared_inputs
 from workflow.common import (
     CONTAINER_RUN,
     CONTAINER_SOURCE,
@@ -58,34 +57,11 @@ HOST_PYTHON = Path(sys.executable)
 
 PREPARED = RUN_ROOT / ".state/prepared.done"
 MANIFEST = RUN_ROOT / "manifest.yaml"
-PINNED_EVALUATION_CHECKPOINT = RUN_ROOT / "inputs/evaluation_checkpoint.pt"
-PINNED_TRAINING_INIT_CHECKPOINT = RUN_ROOT / "inputs/training_init_checkpoint.pt"
-PINNED_TRAINING_RESUME_CHECKPOINT = RUN_ROOT / "inputs/training_resume_checkpoint.pt"
-PINNED_TRAINING_RESUME_BEST_CHECKPOINT = (
-    RUN_ROOT / "inputs/training_resume_best_checkpoint.pt"
-)
-PREPARE_OUTPUTS = [str(PREPARED), str(MANIFEST)]
-if WORKFLOW_KIND == "evaluate":
-    PREPARE_OUTPUTS.append(str(PINNED_EVALUATION_CHECKPOINT))
-if WORKFLOW_KIND == "train" and config["training"].get("init_checkpoint") is not None:
-    PREPARE_OUTPUTS.append(str(PINNED_TRAINING_INIT_CHECKPOINT))
-if (
-    WORKFLOW_KIND == "train"
-    and config["training"].get("resume_checkpoint") is not None
-):
-    PREPARE_OUTPUTS.extend(
-        [
-            str(PINNED_TRAINING_RESUME_CHECKPOINT),
-            str(PINNED_TRAINING_RESUME_BEST_CHECKPOINT),
-        ]
-    )
-for _campaign_id, _declared in workflow_campaign_init_checkpoints(
-    config, SOURCE_ROOT
-).items():
-    PREPARE_OUTPUTS.extend(
-        str(RUN_ROOT / pinned_init_checkpoint_relative(_campaign_id, _name))
-        for _name in _declared
-    )
+PINNED_INPUTS = {
+    pinned.key: RUN_ROOT / pinned.relative
+    for pinned in declared_inputs(config, SOURCE_ROOT)
+}
+PREPARE_OUTPUTS = [str(PREPARED), str(MANIFEST), *map(str, PINNED_INPUTS.values())]
 DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
 DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"
 WORKERS_COMPLETE = RUN_ROOT / ".state/workers_complete.done"
@@ -178,7 +154,7 @@ if WORKFLOW_KIND == "train":
         else EVALUATION_MANIFEST
     )
 elif WORKFLOW_KIND == "evaluate":
-    EVALUATION_CHECKPOINT = PINNED_EVALUATION_CHECKPOINT
+    EVALUATION_CHECKPOINT = PINNED_INPUTS[EVALUATION]
     EVALUATION_PREREQUISITES = []
     EVALUATION_CONTAINER_CHECKPOINT = (
         CONTAINER_RUN / EVALUATION_CHECKPOINT.relative_to(RUN_ROOT)

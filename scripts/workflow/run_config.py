@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-from scripts.hpo.campaign_init import read_campaign_init_checkpoints
+from scripts.workflow.pinned_inputs import bind_dirs, declared_inputs, run_inputs
 
 
 ALLOCATION_FIELDS = (
@@ -449,6 +449,8 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             "workflow.kind='train'"
         )
 
+    run_inputs(workflow_config)
+
     if kind == "train":
         training = workflow_config["training"]
         for field in ("base_config", "experiment_name", "model_id"):
@@ -458,47 +460,6 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             value = str(training[field])
             if Path(value).name != value or value in {".", ".."}:
                 raise ValueError(f"training.{field} must be one safe path component")
-        init_checkpoint = training.get("init_checkpoint")
-        if init_checkpoint is not None and not Path(str(init_checkpoint)).is_absolute():
-            raise ValueError(
-                "training.init_checkpoint must be an absolute GPFS path when provided"
-            )
-        require_init_checkpoint = training.get("require_init_checkpoint", False)
-        if not isinstance(require_init_checkpoint, bool):
-            raise ValueError("training.require_init_checkpoint must be a boolean")
-        if require_init_checkpoint and init_checkpoint is None:
-            raise ValueError(
-                "training.init_checkpoint is required by this workflow template"
-            )
-        resume_checkpoint = training.get("resume_checkpoint")
-        resume_best_checkpoint = training.get("resume_best_checkpoint")
-        if (resume_checkpoint is None) != (resume_best_checkpoint is None):
-            raise ValueError(
-                "training.resume_checkpoint and training.resume_best_checkpoint "
-                "must be provided together"
-            )
-        if resume_checkpoint is not None:
-            for field, value in (
-                ("resume_checkpoint", resume_checkpoint),
-                ("resume_best_checkpoint", resume_best_checkpoint),
-            ):
-                if not Path(str(value)).is_absolute():
-                    raise ValueError(
-                        f"training.{field} must be an absolute GPFS path when provided"
-                    )
-            if init_checkpoint is not None or require_init_checkpoint:
-                raise ValueError(
-                    "training.resume_checkpoint is mutually exclusive with "
-                    "training.init_checkpoint and "
-                    "training.require_init_checkpoint"
-                )
-    elif kind == "evaluate":
-        checkpoint = workflow_config["evaluation"].get("checkpoint")
-        if checkpoint is None or not Path(str(checkpoint)).is_absolute():
-            raise ValueError(
-                "evaluation.checkpoint must be an absolute GPFS path for an "
-                "evaluation-only workflow"
-            )
     elif kind == "ablation":
         ablation = workflow_config["ablation"]
         closeout_signal_seconds = ablation.get("closeout_signal_seconds")
@@ -930,7 +891,8 @@ def render_config(
     validate_code_data_separation(snapshot_root, paths, document)
     validate_workflow_contract(document)
     validate_mn5_allocation(document)
-    workflow_campaign_init_checkpoints(document, snapshot_root)
+    # Campaign init declarations need the snapshot; they fail here, before transfer.
+    declared_inputs(document, snapshot_root)
 
     identity = git_identity(repo_root, snapshot_root=snapshot_root, paths=paths)
     source_root = run_root / "source"
@@ -982,68 +944,6 @@ def _dispatch_field(value: object, *, field: str) -> str:
     if not rendered or "\t" in rendered or "\n" in rendered or "\r" in rendered:
         raise ValueError(f"Dispatch field {field} must be one non-empty TSV value")
     return rendered
-
-
-def workflow_campaign_init_checkpoints(
-    workflow_config: dict[str, Any], source_root: Path
-) -> dict[str, dict[str, Path]]:
-    """Return each ablation campaign's declared init checkpoints by campaign id.
-
-    Campaigns without ``init_checkpoints`` are omitted. Declaration errors
-    (unknown or unused names, relative paths) raise here, before transfer.
-    """
-    kind = workflow_kind(workflow_config)
-    if kind == "ablation":
-        campaigns = [workflow_config["ablation"]["campaign"]]
-    elif kind == "ablation_suite":
-        campaigns = [
-            study["campaign"] for study in workflow_config["ablation_suite"]["studies"]
-        ]
-    else:
-        return {}
-    declarations: dict[str, dict[str, Path]] = {}
-    for campaign in campaigns:
-        campaign_id, declared = read_campaign_init_checkpoints(
-            source_root / _safe_relative_path(str(campaign), field="campaign")
-        )
-        if declared:
-            declarations[campaign_id] = declared
-    return declarations
-
-
-def checkpoint_input_dirs(
-    workflow_config: dict[str, Any], source_root: Path
-) -> list[Path]:
-    """Return the directories of the out-of-run checkpoints a run pins.
-
-    ``prepare_run`` copies these checkpoints into the run inside the contained
-    coordinator, which sees only the run root unless each directory is bound.
-    ``source_root`` locates the campaign files of ablation workflows.
-    """
-    kind = workflow_kind(workflow_config)
-    if kind == "train":
-        training = workflow_config["training"]
-        configured = [
-            training.get(field)
-            for field in (
-                "init_checkpoint",
-                "resume_checkpoint",
-                "resume_best_checkpoint",
-            )
-        ]
-    elif kind == "evaluate":
-        configured = [workflow_config["evaluation"].get("checkpoint")]
-    elif kind in {"ablation", "ablation_suite"}:
-        configured = [
-            path
-            for declared in workflow_campaign_init_checkpoints(
-                workflow_config, source_root
-            ).values()
-            for path in declared.values()
-        ]
-    else:
-        return []
-    return sorted({Path(str(path)).parent for path in configured if path is not None})
 
 
 def write_dispatch_request(
@@ -1107,7 +1007,7 @@ def write_dispatch_request(
     checkpoint_lines = [
         "checkpoint_input_dir\t"
         f"{_dispatch_field(directory, field='checkpoint_input_dir')}\n"
-        for directory in checkpoint_input_dirs(document, snapshot_root)
+        for directory in bind_dirs(declared_inputs(document, snapshot_root))
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(

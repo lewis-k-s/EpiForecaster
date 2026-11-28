@@ -36,11 +36,20 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
-from scripts.hpo.campaign_init import pinned_init_checkpoint_relative
+from scripts.workflow.pinned_inputs import (
+    MANIFEST_SECTION,
+    RUN_MANIFEST_SCHEMA_VERSION,
+    TRAINING_INIT,
+    TRAINING_RESUME,
+    TRAINING_RESUME_BEST,
+    declared_inputs,
+    pin_inputs,
+    run_inputs,
+    verified_input,
+)
 from scripts.workflow.run_config import (
     preprocessing_dataset_name,
     validate_workflow_contract,
-    workflow_campaign_init_checkpoints,
 )
 from training.training_dynamics import (
     DYNAMICS_ARTIFACT_NAME,
@@ -51,8 +60,6 @@ from training.training_dynamics import (
 # Packed sharded Zarr store (data.preprocess.zarr_layout.ZARR_ZIP_SUFFIX).
 # Kept local so host-side commands do not import the scientific stack.
 PROCESSED_DATASET_SUFFIX = ".zarr.zip"
-TRAINING_RESUME_CHECKPOINT = Path("inputs/training_resume_checkpoint.pt")
-TRAINING_RESUME_BEST_CHECKPOINT = Path("inputs/training_resume_best_checkpoint.pt")
 
 
 def sha256_file(path: Path) -> str:
@@ -314,116 +321,11 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     if isinstance(crossval_config, dict):
         identity["crossval_campaign_id"] = crossval_config["campaign_id"]
 
-    def pin_checkpoint(
-        configured_checkpoint: Path,
-        pinned_checkpoint: Path,
-        *,
-        label: str,
-    ) -> dict[str, str]:
-        if configured_checkpoint.is_symlink():
-            raise ValueError(
-                f"{label} input checkpoint must not be a symlink: "
-                f"{configured_checkpoint}"
-            )
-        resolved_checkpoint = configured_checkpoint.resolve(strict=True)
-        if not resolved_checkpoint.is_file():
-            raise ValueError(
-                f"{label} input checkpoint must resolve to a regular file: "
-                f"{configured_checkpoint}"
-            )
-        checkpoint_sha256 = sha256_file(resolved_checkpoint)
-        pinned_checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        if pinned_checkpoint.exists():
-            if pinned_checkpoint.is_symlink() or not pinned_checkpoint.is_file():
-                raise ValueError(
-                    f"Pinned {label.lower()} checkpoint must be a regular "
-                    f"non-symlink file: {pinned_checkpoint}"
-                )
-            if sha256_file(pinned_checkpoint) != checkpoint_sha256:
-                raise ValueError(
-                    f"Pinned {label.lower()} checkpoint conflicts with configured "
-                    f"input: {pinned_checkpoint}"
-                )
-        else:
-            temporary_checkpoint = pinned_checkpoint.with_suffix(".pt.partial")
-            shutil.copyfile(resolved_checkpoint, temporary_checkpoint)
-            if sha256_file(temporary_checkpoint) != checkpoint_sha256:
-                temporary_checkpoint.unlink(missing_ok=True)
-                raise ValueError(f"{label} checkpoint changed while being pinned")
-            temporary_checkpoint.chmod(0o444)
-            temporary_checkpoint.replace(pinned_checkpoint)
-        return {
-            "configured_checkpoint": str(configured_checkpoint),
-            "resolved_checkpoint": str(resolved_checkpoint),
-            "pinned_checkpoint": str(pinned_checkpoint),
-            "pinned_checkpoint_relative": str(pinned_checkpoint.relative_to(run_root)),
-            "checkpoint_sha256": checkpoint_sha256,
-        }
-
-    training_input = None
-    training_resume_input = None
-    if workflow_kind == "train":
-        configured_init_checkpoint = config["training"].get("init_checkpoint")
-        if configured_init_checkpoint is not None:
-            training_input = pin_checkpoint(
-                Path(str(configured_init_checkpoint)),
-                run_root / "inputs/training_init_checkpoint.pt",
-                label="Training initialization",
-            )
-            identity["init_checkpoint_sha256"] = training_input["checkpoint_sha256"]
-
-        configured_resume = config["training"].get("resume_checkpoint")
-        if configured_resume is not None:
-            training_resume_input = {
-                "resume": pin_checkpoint(
-                    Path(str(configured_resume)),
-                    run_root / TRAINING_RESUME_CHECKPOINT,
-                    label="Training resume",
-                ),
-                "best": pin_checkpoint(
-                    Path(str(config["training"]["resume_best_checkpoint"])),
-                    run_root / TRAINING_RESUME_BEST_CHECKPOINT,
-                    label="Training resume best",
-                ),
-            }
-            identity["resume_checkpoint_sha256"] = training_resume_input["resume"][
-                "checkpoint_sha256"
-            ]
-            identity["resume_best_checkpoint_sha256"] = training_resume_input["best"][
-                "checkpoint_sha256"
-            ]
-
-    evaluation_input = None
-    if workflow_kind == "evaluate":
-        evaluation_input = pin_checkpoint(
-            Path(str(config["evaluation"]["checkpoint"])),
-            run_root / "inputs/evaluation_checkpoint.pt",
-            label="Evaluation",
-        )
-        identity["input_checkpoint_sha256"] = evaluation_input["checkpoint_sha256"]
-
-    campaign_init_inputs: dict[str, dict[str, dict[str, str]]] = {}
-    for campaign_id, declared in workflow_campaign_init_checkpoints(
-        config, source_root
-    ).items():
-        campaign_init_inputs[campaign_id] = {
-            name: pin_checkpoint(
-                path,
-                run_root / pinned_init_checkpoint_relative(campaign_id, name),
-                label=f"Campaign {campaign_id} init checkpoint {name}",
-            )
-            for name, path in declared.items()
-        }
-    if campaign_init_inputs:
-        identity["campaign_init_checkpoint_sha256"] = {
-            campaign_id: {
-                name: pinned["checkpoint_sha256"] for name, pinned in inputs.items()
-            }
-            for campaign_id, inputs in campaign_init_inputs.items()
-        }
+    pinned = pin_inputs(declared_inputs(config, source_root), run_root)
+    identity.update(pinned.identity)
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": config["run"]["id"],
         "created_at": datetime.now(UTC).isoformat(),
         "identity": identity,
@@ -472,14 +374,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     ):
         if section in config:
             manifest[section] = config[section]
-    if evaluation_input is not None:
-        manifest["evaluation_input"] = evaluation_input
-    if training_input is not None:
-        manifest["training_input"] = training_input
-    if training_resume_input is not None:
-        manifest["training_resume_input"] = training_resume_input
-    if campaign_init_inputs:
-        manifest["campaign_init_inputs"] = campaign_init_inputs
+    manifest[MANIFEST_SECTION] = pinned.records
     manifest_path = run_root / "manifest.yaml"
     write_yaml(manifest_path, manifest)
     prepared_path = run_root / ".state/prepared.done"
@@ -521,11 +416,6 @@ def training_artifact_paths(
     model_id = _safe_component(training["model_id"], field="training.model_id")
     model_root = run_root / "outputs/training" / experiment_name / model_id
     return model_root / "checkpoints/best_model.pt", model_root
-
-
-def _verify_pinned_checkpoint(path: Path, expected_sha256: str, *, label: str) -> None:
-    if not path.is_file() or path.is_symlink() or sha256_file(path) != expected_sha256:
-        raise ValueError(f"Pinned {label} checkpoint failed validation")
 
 
 def _validate_resume_pair(resume_path: Path, best_path: Path) -> None:
@@ -588,29 +478,15 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "output.save_checkpoints=true",
         "training.run_final_evaluation=false",
     ]
-    if training.get("init_checkpoint") is not None:
-        pinned_init_checkpoint = run_root / "inputs/training_init_checkpoint.pt"
-        manifest = load_yaml(run_root / "manifest.yaml")
-        _verify_pinned_checkpoint(
-            pinned_init_checkpoint,
-            str(manifest["training_input"]["checkpoint_sha256"]),
-            label="training initialization",
-        )
-        overrides.append(f"training.init_checkpoint_path={pinned_init_checkpoint}")
-    if training.get("resume_checkpoint") is not None:
-        pinned_resume = run_root / TRAINING_RESUME_CHECKPOINT
-        pinned_best = run_root / TRAINING_RESUME_BEST_CHECKPOINT
-        resume_input = load_yaml(run_root / "manifest.yaml")["training_resume_input"]
-        _verify_pinned_checkpoint(
-            pinned_resume,
-            str(resume_input["resume"]["checkpoint_sha256"]),
-            label="training resume",
-        )
-        _verify_pinned_checkpoint(
-            pinned_best,
-            str(resume_input["best"]["checkpoint_sha256"]),
-            label="training resume best",
-        )
+    pins = {
+        pinned.key: verified_input(run_root / "manifest.yaml", pinned)
+        for pinned in run_inputs(config)
+    }
+    if TRAINING_INIT in pins:
+        overrides.append(f"training.init_checkpoint_path={pins[TRAINING_INIT].path}")
+    if TRAINING_RESUME in pins:
+        pinned_resume = pins[TRAINING_RESUME].path
+        pinned_best = pins[TRAINING_RESUME_BEST].path
         _validate_resume_pair(pinned_resume, pinned_best)
         # Every attempt restarts from the pinned resume state, so its best
         # checkpoint restarts from the pinned best, replacing any stale one.
@@ -1839,35 +1715,13 @@ def evaluate_configured_model(
             f"Evaluation checkpoint must be a regular file: {checkpoint_path}"
         )
     if str(config["workflow"]["kind"]) == "evaluate":
-        manifest = load_yaml(run_root / "manifest.yaml")
-        evaluation_input = manifest.get("evaluation_input")
-        if not isinstance(evaluation_input, dict):
-            raise ValueError("Run manifest is missing the pinned evaluation input")
-        expected_relative = Path(str(evaluation_input["pinned_checkpoint_relative"]))
-        if expected_relative.is_absolute() or ".." in expected_relative.parts:
-            raise ValueError(
-                "Pinned evaluation checkpoint must be run-relative: "
-                f"{expected_relative}"
-            )
-        expected_path = run_root / expected_relative
-        if expected_path.is_symlink():
-            raise ValueError(
-                "Pinned evaluation checkpoint must be a regular non-symlink file: "
-                f"{expected_path}"
-            )
-        expected_resolved = expected_path.resolve(strict=True)
-        if not expected_resolved.is_file():
-            raise ValueError(
-                f"Pinned evaluation checkpoint must be a regular file: {expected_path}"
-            )
-        if resolved_checkpoint != expected_resolved:
+        (evaluation_input,) = run_inputs(config)
+        pinned = verified_input(run_root / "manifest.yaml", evaluation_input)
+        if resolved_checkpoint != pinned.path.resolve(strict=True):
             raise ValueError(
                 "Evaluation-only workflow must consume its pinned checkpoint: "
-                f"expected {expected_path}, got {resolved_checkpoint}"
+                f"expected {pinned.path}, got {resolved_checkpoint}"
             )
-        expected_sha256 = str(evaluation_input["checkpoint_sha256"])
-        if sha256_file(resolved_checkpoint) != expected_sha256:
-            raise ValueError("Pinned evaluation checkpoint failed SHA-256 validation")
     if evaluation.get("research_outputs", False):
         return evaluate_research_model(config_path, run_root, resolved_checkpoint)
     return evaluate_best(

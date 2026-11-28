@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from scripts.hpo import ablation_worker as worker
+from scripts.workflow import pinned_inputs
 
 
 @dataclass
@@ -729,21 +730,23 @@ def _init_campaign(tmp_path: Path, **kwargs: object) -> worker.AblationCampaign:
 def _write_run_manifest(
     run_root: Path, campaign: worker.AblationCampaign, payloads: dict[str, bytes]
 ) -> Path:
-    """Write pinned checkpoints and the manifest section prepare would record."""
-    recorded: dict[str, object] = {}
+    """Pin the payloads as prepare would and write the run manifest."""
+    inputs = []
     for name, payload in payloads.items():
-        relative = Path("inputs/campaign_init") / campaign.campaign_id / f"{name}.pt"
-        pinned = run_root / relative
-        pinned.parent.mkdir(parents=True, exist_ok=True)
-        pinned.write_bytes(payload)
-        recorded[name] = {
-            "configured_checkpoint": str(campaign.init_checkpoints[name]),
-            "pinned_checkpoint_relative": str(relative),
-            "checkpoint_sha256": hashlib.sha256(payload).hexdigest(),
-        }
+        source = campaign.init_checkpoints[name]
+        source.write_bytes(payload)
+        inputs.append(
+            pinned_inputs.campaign_init_input(campaign.campaign_id, name, source)
+        )
+    pinned = pinned_inputs.pin_inputs(inputs, run_root)
     manifest = run_root / "manifest.yaml"
     manifest.write_text(
-        yaml.safe_dump({"campaign_init_inputs": {campaign.campaign_id: recorded}}),
+        yaml.safe_dump(
+            {
+                "schema_version": pinned_inputs.RUN_MANIFEST_SCHEMA_VERSION,
+                pinned_inputs.MANIFEST_SECTION: pinned.records,
+            }
+        ),
         encoding="utf-8",
     )
     return manifest
@@ -855,7 +858,7 @@ def test_pinned_checkpoints_must_match_declared_names(tmp_path: Path) -> None:
         tmp_path / "run", campaign, {"synth-a": b"checkpoint a"}
     )
 
-    with pytest.raises(ValueError, match="run manifest pins init checkpoints"):
+    with pytest.raises(ValueError, match="does not pin the campaign"):
         worker.load_pinned_init_checkpoints(manifest, campaign)
 
 
@@ -944,7 +947,9 @@ def test_objective_rejects_a_tampered_pinned_checkpoint(
         {"synth-a": b"checkpoint a", "synth-b": b"checkpoint b"},
     )
     bound = worker.bind_pinned_init_checkpoints(campaign, manifest)
-    bound.pinned_init_checkpoints["synth-a"].path.write_bytes(b"tampered")
+    tampered = bound.pinned_init_checkpoints["synth-a"].path
+    tampered.chmod(0o644)
+    tampered.write_bytes(b"tampered")
 
     with pytest.raises(ValueError, match="failed validation"):
         _capture_objective(monkeypatch, bound, tmp_path, "ft-a")
